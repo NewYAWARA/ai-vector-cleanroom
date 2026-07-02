@@ -1,0 +1,11 @@
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.cff text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.gitkeep text eol=lf
+*.bat text eol=crlf
+LICENSE text eol=lf
+.gitattributes text eol=lf

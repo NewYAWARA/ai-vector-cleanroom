@@ -1,0 +1,8 @@
+# Optional packages for rendering SVG previews and self-check scores.
+# The core SVG conversion still works if these fail to install, but the
+# preview PNG falls back to the cleaned source image (clearly labeled) and
+# self-check scores are skipped.
+svglib>=1.5
+reportlab>=4
+rlPyCairo>=0.3
+pycairo>=1.25

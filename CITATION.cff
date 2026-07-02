@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this project, please cite it as AI Vector Cleanroom by 張進逸 (Shinichi Chang)."
+title: "AI Vector Cleanroom"
+authors:
+  - family-names: "Chang"
+    given-names: "Shinichi"
+date-released: "2026-07-03"
+version: "0.1.0-alpha"
+license: "MIT"

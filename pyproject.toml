@@ -1,0 +1,35 @@
+[project]
+name = "ai-vector-cleanroom"
+version = "0.1.0a1"
+description = "Convert flat bitmap logos and icons into editable, grouped SVG drafts with palette flattening and geometry regularization. Alpha / technical preview."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Shinichi Chang (張進逸)" }]
+keywords = ["svg", "vectorization", "logo", "tracing", "vtracer", "cleanup"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
+dependencies = [
+    "pillow>=10,<13",
+    "numpy>=1.26,<3",
+    "vtracer>=0.6.10,<0.7",
+]
+
+[project.optional-dependencies]
+preview = [
+    "svglib>=1.5",
+    "reportlab>=4",
+    "rlPyCairo>=0.3",
+    "pycairo>=1.25",
+]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/NewYAWARA/ai-vector-cleanroom"
+Repository = "https://github.com/NewYAWARA/ai-vector-cleanroom"
+Changelog = "https://github.com/NewYAWARA/ai-vector-cleanroom/blob/main/CHANGELOG.md"

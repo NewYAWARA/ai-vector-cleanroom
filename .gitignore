@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+venv/
+env/
+
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+*.zip
+*.log
+.DS_Store
+Thumbs.db
