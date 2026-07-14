@@ -20,6 +20,24 @@ AI 生成的 logo 只有 PNG，設計師拿到後常常只能整張重畫：
 無損還原不存在。它做的是把重畫的起點從 0 分拉到高分底稿，並在每個環節
 用外部渲染器逐像素把關、低品質就明確標示或判失敗，不把爛結果偽裝成完成品。
 
+## 從 v0.1 到 v0.3（重點變更）
+
+v0.1 是「壓乾淨顏色 + 描邊 + 圓弄正 + 分色層」的底稿工具；v0.3 把它升級成
+設計師能真正接手編輯的結構化向量。逐版細節見 `CHANGELOG.md`。
+
+| 能力 | v0.1 | v0.3 |
+|---|---|---|
+| 線條（心跳線／細線） | 一堆錨點的填色外框，難改 | 真筆畫 `stroke`，可調線寬與端點 |
+| 圓與幾何 | 圓／鉚釘規則化，仍是 path | 原生 `<circle>` / `<line>` / `<polyline>`；圓環為可調線寬 stroked circle |
+| 漸層 | 壓成單色色帶 | 真 `<linearGradient>` |
+| 透明度 | 無 | `fill-opacity` / `stroke-opacity` |
+| 大路徑 | 一整塊，難單選 | 安全拆成可單選零件 + 穩定 ID + 場景群組 |
+| 換色 | 無 | 離線全域換色頁（OKLCH，一鍵改品牌色） |
+| 品質分數 | flat + source 兩分數 | 加 foreground 墨水 ROI、候選自動回退、<60 分判失敗、三軸可編輯性稽核 |
+| 介面 | 靜態疊圖頁 | 拖放工作台（1600% 縮放／物件清單／問題熱區／逐圖重跑）+ 盲測 + Stage 2 計時 |
+| 正確性保證 | 基本 | 每個後處理階段外部渲染器逐像素驗證 + rollback + 原子寫入 |
+| 測試 | 1 個測試檔 | 125 個測試 |
+
 ## 管線總覽
 
 1. **去背與主色偵測**：加權 k-means++ 抓設計主色、剪掉反鋸齒混色假色，
@@ -221,6 +239,25 @@ curves, fonts, or layers. What the tool does is move the starting point of
 the redraw from zero to a high-quality draft, gate every stage with an
 external pixel-exact renderer, and clearly flag or fail low-quality results
 instead of dressing them up as finished.
+
+## What changed since v0.1
+
+v0.1 was a "flatten colors + trace + snap circles + group by layer" draft
+tool; v0.3 turns that into structured vector a designer can actually take
+over and edit. Per-version detail is in `CHANGELOG.md`.
+
+| Capability | v0.1 | v0.3 |
+|---|---|---|
+| Line work | high-node filled outlines, hard to edit | real `stroke`s with adjustable width and caps |
+| Circles & geometry | circle/rivet regularization, still paths | native `<circle>` / `<line>` / `<polyline>`; rings become stroked circles |
+| Gradients | flattened to solid bands | real `<linearGradient>` |
+| Opacity | none | `fill-opacity` / `stroke-opacity` |
+| Large paths | one blob, hard to select | safely split into selectable parts + stable IDs + scene groups |
+| Recolor | none | offline global recolor page (OKLCH) |
+| Quality scores | flat + source | plus foreground ink-ROI, candidate fallback, hard-fail below 60%, three-axis editability audit |
+| UI | static overlay page | drag-drop workbench (zoom/object list/hotspots/per-image re-run) + blind test + Stage 2 timing |
+| Correctness | basic | every post-process stage pixel-exact validated, with rollback and atomic writes |
+| Tests | 1 test file | 125 tests |
 
 ## Pipeline
 
