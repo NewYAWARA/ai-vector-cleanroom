@@ -1,44 +1,79 @@
 # Changelog
 
+All notable changes to AI Vector Cleanroom. Versions before 1.0 are alpha /
+technical previews: interfaces and output may change.
+
+## v0.3.0-alpha - 2026-07-14
+
+Structured editing and global recolor. (Internal lineage: Codex Beta.3.2,
+built on the v0.2 engine; reviewed adversarially before release.)
+
+Local workbench:
+
+- Multi-image upload queue fix: jobs now carry a stable id, a second upload
+  stays visibly "queued" while the first is converting, and the browser keeps
+  polling until every queued job reaches a terminal state (a later waiting
+  file no longer looks like it vanished).
+- Live result table: each finished image appears immediately, even while later
+  files are still queued, instead of only after the whole batch completes.
+
+Native geometry and structure:
+
+- Conservative annulus detector: co-circular, same-color, same-width open
+  stroke fragments become one native `<circle>` (with `stroke-dasharray`)
+  only after a bidirectional 1 px raster gate; independent rollback per stage.
+- Pixel-proven line/polyline nativeization: unreferenced, style/transform-free
+  open `M/L/H/V` stroke paths become `<line>`/`<polyline>` only when an
+  external renderer proves the RGBA pixels are identical; fails closed when no
+  renderer is available. Runs after the scene-graph stage so inherited
+  presentation styles are materialized first.
+- Safe compound-path splitting: large paths split into independently
+  selectable parts only when hole/island topology is provably preserved; a
+  cubic is rewritten to a line only when control points are provably collinear
+  and monotonic via exact rationals.
+- Scene Graph post-process: cross-color parts become real `<g>` groups only
+  when stack order and pixels are unchanged; unsafe candidates stay
+  manifest-only. Every visible element gets a stable, unique ID.
+
+Recolor and editability:
+
+- Paint-role manifest + offline `色彩調整.html`: global recolor of fills,
+  strokes and gradient stops, OKLCH-preserving, exporting explicit SVG colors
+  (no tool-specific CSS variables); active-content / external-URL / injection
+  guards.
+- Editability audit split into three axes (`automation_readiness`,
+  `redraw_complexity`, `workflow_friction`); a 5/5 structural handle count is
+  never rewritten as a 5/5 human task result. Human-timing fields default to
+  `not_performed`.
+- Workbench Stage 2 editing-time page records SVG-handoff vs redraw seconds;
+  estimated times never count toward a saving claim, and a single session
+  never promotes itself to a product "80%" claim.
+
+Quality and safety:
+
+- `report.json` counts the final SVG DOM and keeps per-stage / recolor-role /
+  actual-vs-manifest-group evidence; withdrawn stages report only committed
+  counts.
+- Key writes (SVG, paint-role manifest, recolor page) use atomic replace; a
+  disk-write failure never leaves half an XML file.
+- Opacity output (`fill-opacity` / `stroke-opacity`) and low-contrast line
+  protection (`#dddddd` on white survives); original-resolution color sampling
+  keeps thin lines from turning gray or fat.
+
+## v0.2.0-alpha - 2026-07-13
+
+- Monoline stroke reconstruction (center line + `stroke-width`), native
+  `<circle>` and stroked rings, banded-ramp `<linearGradient>` reconstruction.
+- Ink-ROI foreground score with bidirectional 1 px tolerance; candidate
+  comparison with automatic fallback and a hard-fail floor.
+- Review workbench (zoom / object list / hotspots) and a local drag-and-drop
+  workbench server; Stage 1 blind-test page.
+- Third-review P0 fixes: corner detection, pixel-center offset, multicolor
+  line splitting, stroke-mask guard, palette merge threshold, honest
+  degradation for semi-transparent sources.
+
 ## v0.1.0-alpha - 2026-07-03
 
-Initial public release (technical preview).
-
-Core:
-
-- Convert PNG/JPG/WebP/BMP images into editable SVG vector drafts.
-- Simplify noisy antialiasing and gradients into a cleaner limited palette.
-- Preserve visual stack order while grouping paths by color/layer.
-- Regularize near-circles, circular arcs, concentric rings, and rivet-like dots.
-- Generate preview PNG, source reference PNG, review HTML, `report.json`,
-  output notes, and a zip package per image.
-
-Reliability and honesty fixes (pre-release review):
-
-- SVG `<title>` and group names are XML-escaped; filenames such as `a&b.png`
-  now produce valid SVG.
-- New `--background auto|keep|transparent`; `keep` prevents auto removal from
-  deleting light design elements that touch the image border.
-- Palette detection rewritten: weighted k-means++ over unique colors with
-  empty-cluster reseeding and antialiasing-blend pruning; auto mode detects up
-  to 8 colors (was 6) and `--colors N` reliably yields N clusters; tiny images
-  (fewer pixels than clusters) no longer crash.
-- Batch runs exit with code 1 when any file fails, print a failure summary,
-  and report "No successful output" when everything fails.
-- Same-stem inputs (`same.png` + `same.jpg`) get distinct output names instead
-  of overwriting each other.
-- Self-check now reports two scores: `flat match` (fidelity to the flattened
-  tracing input) and `source match` (similarity to the cleaned source — the
-  honest quality number). Low source match prints a warning.
-- Preview fallback (when SVG render packages are missing) is clearly labeled
-  in the console, `report.json`, and `OUTPUT_README.txt` instead of silently
-  posing as an SVG render.
-- New `--max-size` (default 2048) bounds tracing cost on very large inputs
-  while keeping the original display size in the SVG.
-- New `--geometry conservative|normal|off` (default conservative; `normal`
-  adds ring/band edge arc straightening; `--no-geometry` kept as a deprecated
-  alias for `off`).
-- New `--input` / `--output` folder options.
-- vtracer output is parsed with an XML parser (regex only as fallback), and
-  dependency versions are pinned in `requirements.txt` / `pyproject.toml`.
-- Synthetic pytest suite (16 tests) and GitHub Actions CI on Ubuntu + Windows.
+- First public release. Batch PNG/JPG/WebP/BMP → grouped editable SVG with
+  palette flattening and geometry regularization; honest self-check scores;
+  synthetic test suite and CI.

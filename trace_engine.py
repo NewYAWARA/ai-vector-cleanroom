@@ -117,7 +117,7 @@ def _prepare_image(src, max_size, background, white_threshold, alpha_threshold):
     light = (rgb.min(axis=2) >= white_threshold) & (spread <= 35)
     # 很多 AI 圖會把「透明棋盤格」烤進圖裡，角落常是亮灰/白色低飽和格子。
     # 這裡用較寬的 neutral mask 只移除連到圖片外緣的背景，不會碰到內部白字。
-    neutral_background = (rgb.min(axis=2) >= min(white_threshold, 220)) & (spread <= 30)
+    neutral_background = (rgb.min(axis=2) >= min(white_threshold, 190)) & (spread <= 30)
 
     removed_background = False
     if background != "keep":
@@ -128,7 +128,32 @@ def _prepare_image(src, max_size, background, white_threshold, alpha_threshold):
                 or _border_light_ratio(alpha, neutral_background, alpha_threshold) >= 0.55
             )
         if should_remove:
-            candidate = neutral_background if background == "auto" else light | neutral_background
+            if background == "auto":
+                # Only remove neutral colors that are actually represented on
+                # the outer border.  The previous broad >=220 mask connected
+                # a deliberate #dddddd hairline to a white canvas and erased
+                # both.  Quantized border colors still recognise baked
+                # white/#ccc checkerboards because both tones touch an edge.
+                border_rgb = np.concatenate(
+                    [rgb[0, :], rgb[-1, :], rgb[:, 0], rgb[:, -1]], axis=0)
+                border_spread = border_rgb.max(1) - border_rgb.min(1)
+                bn = border_rgb[(border_rgb.min(1) >= min(white_threshold, 190))
+                                & (border_spread <= 30)]
+                candidate = np.zeros(alpha.shape, dtype=bool)
+                if len(bn):
+                    q = (bn // 8).astype(np.uint8)
+                    uq, cnt = np.unique(q, axis=0, return_counts=True)
+                    order = np.argsort(cnt)[::-1]
+                    keep = [idx for idx in order[:6]
+                            if cnt[idx] >= max(2, int(0.01 * len(bn)))]
+                    for idx in keep:
+                        members = bn[(q == uq[idx]).all(1)].astype(np.float32)
+                        center = np.median(members, axis=0)
+                        candidate |= (np.abs(rgb.astype(np.float32) - center)
+                                      .max(axis=2) <= 14)
+                candidate &= neutral_background
+            else:
+                candidate = light | neutral_background
             removable = _border_connected(candidate & (alpha >= alpha_threshold))
             if np.any(removable):
                 arr[removable, 3] = 0

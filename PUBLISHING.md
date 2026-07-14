@@ -1,114 +1,77 @@
 # Publishing Guide
 
-This checklist is for publishing AI Vector Cleanroom to GitHub for the first
-time.
+How to replace the published version of AI Vector Cleanroom on GitHub with a
+new one, while keeping the repository, its URL, stars and issue history.
 
-## 1. Create the GitHub repository
-
-Recommended repository name:
-
-```text
-ai-vector-cleanroom
-```
-
-Recommended description:
-
-```text
-Clean editable SVG drafts from AI-generated or bitmap logos.
-```
-
-Use `Public` visibility. If you upload this prepared folder, do not ask GitHub
-to auto-create a README, license, or `.gitignore`; those files already exist.
-
-## 2. Prepare local Git
-
-Run these commands from this folder:
+## 0. Before you push
 
 ```powershell
-python preflight_check.py
-python -m py_compile vector_cleanroom.py clean_base.py trace_engine.py
-git init -b main
-git config user.name "張進逸 (Shinichi Chang)"
-git config user.email "123047152+NewYAWARA@users.noreply.github.com"
-git add .
-git commit -m "Initial open source release"
+python preflight_check.py                 # must print "Preflight OK"
+python -m unittest discover -s tests -v   # must end with "OK"
 ```
 
-If you prefer to keep your email private in commits, replace the email above
-with your GitHub no-reply email before committing.
+`preflight_check.py` fails the build if any binary asset or private string
+would be published. Never bypass it.
 
-## 3. Connect to GitHub
+## 1. Replace the contents of the existing repo (preserves history)
 
-After creating the empty GitHub repository, GitHub will show a remote URL.
-Use your real username:
+From a clone of the repo, with the new tree prepared separately:
 
 ```powershell
-git remote add origin https://github.com/NewYAWARA/ai-vector-cleanroom.git
-git push -u origin main
+git clone https://github.com/NewYAWARA/ai-vector-cleanroom.git
+cd ai-vector-cleanroom
+
+# remove everything that git tracks (keeps .git), then copy the new tree in
+git rm -r --quiet .
+robocopy "PATH\TO\new-tree" . /E /XD .git    # Windows; use rsync on macOS/Linux
+
+git add -A
+git commit -m "Release v0.3.0-alpha: structured editing, native geometry, recolor"
+git push origin main
 ```
 
-## 4. Add repository metadata
+This makes HEAD the new version; the old code stays reachable in history.
 
-Suggested topics:
+## 2. Tag a pre-release
+
+```powershell
+git tag v0.3.0-alpha
+git push origin v0.3.0-alpha
+```
+
+On GitHub, create a Release from that tag and **check "This is a
+pre-release"**. Suggested notes (accurate wording only):
 
 ```text
-svg, vector, logo, raster-to-vector, vtracer, image-processing, ai-generated-art
+v0.3.0-alpha (technical preview). Flat bitmap logos/icons -> editable SVG:
+real strokes, native circle/line/polyline, linear gradients, safe compound
+splitting, scene grouping, offline global recolor. Every post-process stage
+is validated pixel-exact by an external renderer. Output still needs human
+review; the "80% time saving" claim is not yet verified by designer editing
+timings.
 ```
 
-Suggested website/about text:
-
-```text
-Clean editable SVG drafts from AI-generated or bitmap logos.
-```
-
-## 5. Create the first release
-
-Create a GitHub Release:
-
-- Tag: `v0.1.0-alpha`
-- Title: `AI Vector Cleanroom v0.1.0-alpha (technical preview)`
-- Notes:
-
-```text
-First public release of AI Vector Cleanroom (v0.1.0-alpha, technical preview).
-
-Scope: flat, limited-palette logos and icons. Output is an editable SVG
-draft that still needs human review.
-
-- Converts PNG/JPG/WebP/BMP images into editable SVG vector drafts.
-- Preserves visual stack order while grouping paths by color/layer.
-- Optional geometry regularization for near-circles, rings, and rivet-like dots
-  (conservative by default; --geometry normal|off available).
-- Self-check reports both flat match and source match scores.
-- Review HTML, report.json, and output notes for inspection.
-- Tested with a synthetic pytest suite; CI on Ubuntu and Windows.
-
-Maintained by 張進逸 (Shinichi Chang).
-```
-
-Mark the release as a **pre-release** in the GitHub release form.
-
-## 6. Public wording
+## 3. Wording rules
 
 Use accurate wording:
 
 ```text
-AI Vector Cleanroom turns flat bitmap logos and icons into clean, editable
-SVG drafts (palette flattening, stack-order grouping, geometry
-regularization). Alpha / technical preview: output needs human review,
-especially for gradients, shadows, and multi-color artwork.
+Turns flat bitmap logos and icons into clean, editable, structured SVG
+drafts. Alpha / technical preview: output needs human review, especially for
+gradients, shadows, transparency, text, and complex multi-color artwork.
 ```
 
-Avoid misleading wording:
+Do not claim:
 
 ```text
 lossless vector recovery
-perfect one-click vectorization
-one-click 90%+ vectorization
+one-click 80%/90% vectorization of any image
 production ready / designer ready without review
 ```
 
-## 7. Do not publish restricted assets
+## 4. Do not publish restricted assets
 
-Do not commit private, client-owned, trademarked, or unclear-license images.
-Generated SVG outputs inherit the legal restrictions of the source image.
+Private, client-owned, trademarked, or unclear-license images — and any SVG
+generated from them — must never be committed. `input/`, `output/`,
+`tests/fixtures/`, and the portable `python/` interpreter are gitignored;
+keep them that way.
