@@ -177,10 +177,21 @@ def _run_one(img_path: Path, overrides: dict, requested_base=None, *, job_id=Non
         vc.process_one(img_path, out_base, args, OUTPUT_DIR)
         if not ((result_dir / "report.json").is_file() and result_zip.is_file()):
             raise RuntimeError("輸出不完整（缺 report.json 或 zip）")
+        report = json.loads(
+            (result_dir / "report.json").read_text(encoding="utf-8"))
+        acceptance = str(report.get("acceptance_status") or "manual_review")
         detail = f"result_{out_base}"
         if previous:
             detail += f" · 上一版已存入歷史：{previous.name}"
-        _set_job(job_id, "done", detail)
+        if acceptance == "rejected":
+            reasons = ((report.get("visual_gate") or {}).get("reasons") or [])
+            reason = f" · {'；'.join(str(v) for v in reasons[:2])}" if reasons else ""
+            _set_job(job_id, "rejected",
+                     f"未達標，已保留診斷檔但請勿交付 · {detail}{reason}")
+        elif acceptance != "accepted":
+            _set_job(job_id, "review", f"完成但需要人工檢查 · {detail}")
+        else:
+            _set_job(job_id, "done", detail)
     except Exception as e:
         shutil.rmtree(result_dir, ignore_errors=True)
         result_zip.unlink(missing_ok=True)
@@ -293,8 +304,8 @@ def _count_value(value, default=None):
         return default
 
 
-def _beta3_report_summary(report):
-    """Extract compact Beta.3 editability data without breaking old reports."""
+def _report_feature_summary(report):
+    """Extract compact editability data without breaking older reports."""
     scene = _mapping(report.get("scene"))
     if not scene:
         # Accept an intermediate Beta.3 report layout used during development.
@@ -396,7 +407,7 @@ def _list_results():
         svg = next(iter(rd.glob("*_vector.svg")), None)
         primitive_counts = _report_primitive_counts(rep)
         requested, effective, fallback = _report_options(rep)
-        beta3 = _beta3_report_summary(rep)
+        features = _report_feature_summary(rep)
         legacy_status = rep.get("acceptance_status", "accepted")
         visual_status = rep.get("visual_acceptance_status", legacy_status)
         editability_status = rep.get("editability_status", "not_audited")
@@ -441,13 +452,13 @@ def _list_results():
             "acceptance_status": legacy_status,
             "manual_review_required": bool(
                 rep.get("manual_review_required", False)
-                or rep.get("acceptance_status") == "manual_review"),
+                or legacy_status != "accepted"),
             "history": history,
             "svg": f"{rd.name}/{svg.name}" if svg else "",
             "review": f"{rd.name}/review.html",
             "recolor": (f"{rd.name}/色彩調整.html"
                         if (rd / "色彩調整.html").is_file() else ""),
-            **beta3,
+            **features,
             "mtime": rj.stat().st_mtime,
         })
     out.sort(key=lambda r: -r["mtime"])
@@ -537,7 +548,7 @@ document.getElementById('export').onclick=()=>{
   else if(q)verdict=(q===tool)?'tool_better':'original_better';
   let meta={}; try{meta=JSON.parse(it.dataset.meta||'{}')}catch(_){}
   return {item:+i+1,...meta,quality:verdict,editable:e,comment:c};});
- const payload={tool:'ai-vector-cleanroom',version:'v3-codex-beta.3',
+ const payload={tool:'ai-vector-cleanroom',version:'__TOOL_VERSION__',
   generated:new Date().toISOString(),kind:'visual-blind-test-stage1',
   note:'第一階段視覺盲評;省工驗收需第二階段實際編輯計時',results:out};
  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
@@ -546,6 +557,7 @@ document.getElementById('export').onclick=()=>{
 </script></body></html>"""
     page = page.replace("__ROWS__", "\n".join(rows) if rows else
                         "<p>output 裡還沒有結果，先轉幾張圖。</p>")
+    page = page.replace("__TOOL_VERSION__", vc.TOOL_VERSION)
     dst = OUTPUT_DIR / "blind_test.html"
     dst.write_text(page, encoding="utf-8")
     return dst
@@ -575,7 +587,7 @@ APP_HTML = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
  #jobs{font-size:12px;color:#555;margin-top:10px;max-height:130px;overflow:auto;
    background:#fafafa;border:1px solid #eee;border-radius:8px;padding:8px 10px}
  .badge{display:inline-block;padding:0 7px;border-radius:9px;font-size:11px;color:#fff}
- .warn{background:#e65100}.ok{background:#2e7d32}.fallback{background:#6a1b9a}
+ .warn{background:#e65100}.bad{background:#b71c1c}.ok{background:#2e7d32}.fallback{background:#6a1b9a}
  details{margin-top:4px} summary{cursor:pointer;color:#666}
  .opts{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px}
  .sub{font-size:11px;color:#666;line-height:1.55;margin-top:3px}
@@ -583,7 +595,7 @@ APP_HTML = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
  #notice.err{background:#ffebee;color:#b71c1c}
  button:disabled{opacity:.55;cursor:wait}
 </style></head><body>
- <h2>AI Vector Cleanroom 工作台 <small>v3 Codex Beta.3.2</small>
+ <h2>AI Vector Cleanroom 工作台 <small>__TOOL_VERSION__</small>
  <span style="float:right"><button id="blind">產生盲測頁</button>
  <button id="editing">Stage 2 實作計時</button></span></h2>
 <div id="drop">把 PNG / JPG 拖進來（可多張），放開就排入轉檔佇列<br>
@@ -636,7 +648,7 @@ function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','
 function optionSet(values,current){return values.map(v=>'<option value="'+esc(v)+'"'+(String(v)===String(current)?' selected':'')+'>'+esc(v)+'</option>').join('');}
 function optText(opts){const names={background:'背景',geometry:'幾何',strokes:'筆畫',gradients:'漸層',colors:'色數'};
  return Object.entries(opts||{}).filter(([k])=>names[k]).map(([k,v])=>names[k]+'='+v).join(' · ')||'預設';}
-function beta3Text(r){
+function featureText(r){
  const bits=[],scene=r.scene||{},paint=r.paint||{},ops=r.designer_operations||{};
  if(scene.actual_dom_group_count!=null){
   let text='可選群組 '+scene.actual_dom_group_count;
@@ -660,7 +672,7 @@ function beta3Text(r){
  }
  if(r.automation_readiness_score!=null)bits.push('自動化準備 '+Number(r.automation_readiness_score).toFixed(1)+'/100');
  if(r.redraw_ease_score!=null)bits.push('描點收尾 '+Number(r.redraw_ease_score).toFixed(1)+'/100');
- return bits.length?'<div class="sub">Beta.3：'+bits.map(esc).join(' · ')+'</div>':'';
+ return bits.length?'<div class="sub">結構：'+bits.map(esc).join(' · ')+'</div>':'';
 }
 async function refresh(){
  let rs; try{rs=await api('/api/list',{},true)}catch(e){tell('無法讀取結果：'+e.message,true);return;}
@@ -670,7 +682,9 @@ async function refresh(){
    const fg=r.foreground==null?'n/a':r.foreground.toFixed(1)+'%';
    const visualBadge=r.visual_acceptance_status==='accepted'
     ?' <span class="badge ok">外觀通過</span>'
-    :' <span class="badge warn">外觀需查</span>';
+    :(r.visual_acceptance_status==='rejected'
+      ?' <span class="badge bad">外觀未達標</span>'
+      :' <span class="badge warn">外觀需查</span>');
    const editScore=r.editability_score==null?'':(' '+Number(r.editability_score).toFixed(1)+'/100');
    const editBadge=r.editability_status==='accepted'
     ?' <span class="badge ok">可編輯性通過</span>'
@@ -698,7 +712,7 @@ async function refresh(){
     r.native_polylines+' 折線、'+r.native_polygons+' 多邊形) / '+
      r.strokes+' 筆畫 / '+r.gradients+' 漸層'+
      (r.unique_paints_total==null?'':' / '+r.unique_paints_total+' 種實際色彩／漸層資源')+
-     beta3Text(r)+
+     featureText(r)+
      '<details><summary>候選 '+(r.candidates||[]).length+' 個</summary><div class="sub">'+(cand||'無候選資料')+'</div></details></td>'+
    '<td class="num">'+r.hotspots+'</td>'+
     '<td><a href="/output/'+encodeURI(r.review)+'" target="_blank">校稿</a> · '+
@@ -727,8 +741,11 @@ let polling=null;
 async function poll(force){
  let js;try{js=await api('/api/jobs',{},true)}catch(_){return;}
  const el=document.getElementById('jobs');
+ const statusLabel={queued:'排隊中',running:'轉檔中',done:'完成',review:'完成但需檢查',
+                    rejected:'未達標',failed:'失敗'};
  el.innerHTML=js.slice(-12).reverse().map(j=>
-  '['+j.t+'] '+esc(j.name)+' — '+j.status+(j.detail?' · '+esc(j.detail):'')).join('<br>')||'（尚無工作）';
+  '['+j.t+'] '+esc(j.name)+' — '+(statusLabel[j.status]||esc(j.status))+
+  (j.detail?' · '+esc(j.detail):'')).join('<br>')||'（尚無工作）';
  // Jobs are updated in place.  Looking only at the last event used to stop
  // refresh as soon as a later file was merely waiting in the queue.
  const busy=js.some(j=>j.status==='queued'||j.status==='running');
@@ -740,7 +757,7 @@ async function poll(force){
  else if(polling){clearInterval(polling);polling=null;}
 }
 refresh();poll();
-</script></body></html>"""
+</script></body></html>""".replace("__TOOL_VERSION__", vc.TOOL_VERSION)
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -11,7 +11,8 @@ from PIL import Image
 
 from svg_postprocess import (atomic_replace_bytes, attach_paint_roles,
                              enhance_svg_structure, measure_svg_structure)
-from vector_cleanroom import validate_svg_stage_renders
+from vector_cleanroom import (_validation_render_width,
+                              validate_svg_stage_renders)
 
 
 SVG_NS = "http://www.w3.org/2000/svg"
@@ -40,6 +41,15 @@ def _source() -> str:
 
 
 class SvgPostprocessTests(unittest.TestCase):
+    def test_validation_render_width_preserves_aspect_and_longest_side_cap(self):
+        self.assertEqual(_validation_render_width([1254, 1254]), 1254)
+        self.assertEqual(_validation_render_width([3000, 1500]), 2048)
+        self.assertEqual(_validation_render_width([1500, 3000]), 1024)
+        self.assertEqual(_validation_render_width([100, 50]), 512)
+        self.assertEqual(_validation_render_width([50, 100]), 256)
+        self.assertEqual(_validation_render_width([]), 2048)
+        self.assertEqual(_validation_render_width([0, 100]), 2048)
+
     def test_structure_reports_disjoint_native_element_types(self):
         with tempfile.TemporaryDirectory() as temp:
             svg = Path(temp) / "native-types.svg"
@@ -360,6 +370,144 @@ class SvgPostprocessTests(unittest.TestCase):
         self.assertEqual(
             result["required_equivalence"],
             "pixel_array_exact_at_validation_resolution")
+
+    def test_stage_render_guard_reuses_identical_intermediate_svg(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = root / "before.svg"
+            middle = root / "middle.svg"
+            after = root / "after.svg"
+            before.write_text("<svg data-stage='before'/>", encoding="utf-8")
+            middle.write_text("<svg data-stage='middle'/>", encoding="utf-8")
+            after.write_text("<svg data-stage='after'/>", encoding="utf-8")
+            calls = []
+
+            def fake_render(svg_path, png_path, **kwargs):
+                calls.append((Path(svg_path).read_bytes(), kwargs.get("size")))
+                Image.new("RGBA", (8, 8), (255, 255, 255, 255)).save(png_path)
+                return True
+
+            cache = {}
+            with mock.patch("vector_cleanroom.render_svg_png",
+                            side_effect=fake_render):
+                first = validate_svg_stage_renders(
+                    before, middle, "compound_exact",
+                    render_cache=cache, render_size=321)
+                second = validate_svg_stage_renders(
+                    middle, after, "scene_graph_exact",
+                    render_cache=cache, render_size=321)
+
+        self.assertTrue(first["accepted"])
+        self.assertTrue(second["accepted"])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([size for _svg, size in calls], [321, 321, 321])
+        self.assertEqual(
+            first["render_cache_hits"], {"before": False, "after": False})
+        self.assertEqual(
+            second["render_cache_hits"], {"before": True, "after": False})
+        self.assertEqual(second["validation_render_width_px"], 321)
+
+    def test_stage_render_cache_key_includes_gradient_metadata_and_size(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = root / "before.svg"
+            after = root / "after.svg"
+            source = "<svg><path fill='#123456' d='M0 0h1v1z'/></svg>"
+            before.write_text(source, encoding="utf-8")
+            after.write_text(source, encoding="utf-8")
+            calls = []
+
+            def fake_render(_svg_path, png_path, **kwargs):
+                calls.append(kwargs.get("size"))
+                Image.new("RGBA", (8, 8), (255, 255, 255, 255)).save(png_path)
+                return True
+
+            cache = {}
+            with mock.patch("vector_cleanroom.render_svg_png",
+                            side_effect=fake_render):
+                first = validate_svg_stage_renders(
+                    before, after, "paint_roles_exact", render_cache=cache,
+                    render_size=300, gradient_info=[{"id": "a", "key": "#010203"}])
+                second = validate_svg_stage_renders(
+                    before, after, "paint_roles_exact", render_cache=cache,
+                    render_size=300, gradient_info=[{"id": "b", "key": "#010203"}])
+                third = validate_svg_stage_renders(
+                    before, after, "paint_roles_exact", render_cache=cache,
+                    render_size=301, gradient_info=[{"id": "b", "key": "#010203"}])
+
+        self.assertTrue(first["accepted"] and second["accepted"] and third["accepted"])
+        self.assertEqual(calls, [300, 300, 301])
+        self.assertEqual(
+            first["render_cache_hits"], {"before": False, "after": True})
+        self.assertEqual(
+            second["render_cache_hits"], {"before": False, "after": True})
+        self.assertEqual(
+            third["render_cache_hits"], {"before": False, "after": True})
+
+    def test_stage_render_cache_canonicalises_xml_line_endings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = root / "before.svg"
+            after = root / "after.svg"
+            before.write_bytes(b"<svg>\n<path d='M0 0'/>\n</svg>\n")
+            after.write_bytes(b"<svg>\r\n<path d='M0 0'/>\r\n</svg>\r\n")
+
+            def fake_render(_svg_path, png_path, **_kwargs):
+                Image.new("RGBA", (8, 8), (255, 255, 255, 255)).save(png_path)
+                return True
+
+            cache = {}
+            with mock.patch("vector_cleanroom.render_svg_png",
+                            side_effect=fake_render) as renderer:
+                result = validate_svg_stage_renders(
+                    before, after, "scene_graph_exact",
+                    render_cache=cache, render_size=300)
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(renderer.call_count, 1)
+        self.assertEqual(
+            result["render_cache_hits"], {"before": False, "after": True})
+
+    def test_failed_stage_render_is_not_cached(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = root / "before.svg"
+            after = root / "after.svg"
+            before.write_text("<svg data-stage='before'/>", encoding="utf-8")
+            after.write_text("<svg data-stage='after'/>", encoding="utf-8")
+            cache = {}
+            with mock.patch("vector_cleanroom.render_svg_png",
+                            return_value=False) as renderer:
+                validate_svg_stage_renders(
+                    before, after, "compound_exact", render_cache=cache)
+                validate_svg_stage_renders(
+                    before, after, "compound_exact", render_cache=cache)
+
+        self.assertEqual(renderer.call_count, 4)
+        self.assertEqual(cache, {})
+
+    def test_exact_render_guard_also_requires_equal_pixel_dimensions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = root / "before.svg"
+            after = root / "after.svg"
+            before.write_text("<svg data-stage='before'/>", encoding="utf-8")
+            after.write_text("<svg data-stage='after'/>", encoding="utf-8")
+
+            def fake_render(svg_path, png_path, **_kwargs):
+                size = (8, 16) if Path(svg_path) == before else (16, 8)
+                Image.new("RGBA", size, (255, 255, 255, 255)).save(png_path)
+                return True
+
+            with mock.patch("vector_cleanroom.render_svg_png",
+                            side_effect=fake_render):
+                result = validate_svg_stage_renders(
+                    before, after, "compound_exact")
+
+        self.assertFalse(result["accepted"])
+        self.assertFalse(result["exact_pixel_array_equal"])
+        self.assertEqual(result["exact_before_render_size_px"], [8, 16])
+        self.assertEqual(result["exact_after_render_size_px"], [16, 8])
 
 
 if __name__ == "__main__":

@@ -534,6 +534,8 @@ class VectorRegression(unittest.TestCase):
             "flat_match_percent", "source_match_percent",
             "foreground_match_percent", "preview_is_svg_render", "hotspots",
             "detail_grid", "candidates", "candidate_selection_policy",
+            "palette_detection", "visual_gate",
+            "transparent_light_fidelity",
             "auto_fallback", "visual_acceptance_status",
             "editability_status", "editability_score", "editability_reasons",
             "editability_details", "editability_schema",
@@ -559,13 +561,16 @@ class VectorRegression(unittest.TestCase):
         self.assertIsInstance(report["editability_reasons"], list)
         self.assertIsInstance(report["editability_details"], dict)
         self.assertIsInstance(report["detail_grid"], dict)
+        self.assertIsInstance(report["palette_detection"], dict)
+        self.assertIsInstance(report["visual_gate"], dict)
+        self.assertIsInstance(report["transparent_light_fidelity"], dict)
         self.assertIsInstance(report["paint_resources"], list)
         self.assertIsInstance(report["final_structure"], dict)
         self.assertIsInstance(report["editability_enhancements"], dict)
         self.assertIsInstance(report["paint_roles"], dict)
         self.assertIsInstance(report["designer_operations"], dict)
         self.assertTrue(report["preview_is_svg_render"])
-        self.assertEqual(report["tool_version"], "v3-codex-beta.3")
+        self.assertEqual(report["tool_version"], "v3-codex-beta.5")
         self.assertEqual(
             report["editability_schema"],
             "ai-vector-cleanroom.editability/v2")
@@ -584,7 +589,7 @@ class VectorRegression(unittest.TestCase):
                 "native_lines", "native_polylines", "native_polygons")),
         )
 
-        # Beta.3 keeps independent visual and structural/editability gates.  The
+        # Beta.5 keeps independent visual and structural/editability gates.  The
         # legacy aggregate status must be derived from those two gates instead
         # of silently treating visual fidelity as proof of easy handoff.
         self.assertIn(report["visual_acceptance_status"],
@@ -626,6 +631,74 @@ class VectorRegression(unittest.TestCase):
             self.assertGreaterEqual(detail[key], 0.0)
             self.assertLessEqual(detail[key], 100.0)
 
+        topology = detail["component_topology"]
+        topology_required = {
+            "eligible_components", "minimum_component_area_px",
+            "one_pixel_tolerance", "p10_score_percent",
+            "worst_score_percent", "mean_score_percent",
+            "coverage_p10_percent", "connectivity_p10_percent",
+            "fragmented_components", "measurement_mask", "core_threshold",
+            "core_source_ink_pixels", "low_contrast_excluded_pixels",
+        }
+        self.assertEqual(set(), topology_required - set(topology))
+        self.assertIs(topology["one_pixel_tolerance"], True)
+        self.assertEqual(topology["measurement_mask"], "strong_ink_core")
+        self.assertGreaterEqual(topology["eligible_components"], 0)
+        self.assertGreaterEqual(topology["fragmented_components"], 0)
+
+        palette_detection = report["palette_detection"]
+        accent = palette_detection["initial_accent_retention"]
+        self.assertEqual(
+            accent["policy"],
+            "initial_palette_connected_residual_retention")
+        self.assertEqual(accent["colors_retained"], len(accent["records"]))
+        linear = palette_detection["linear_detail_stabilization"]
+        self.assertEqual(
+            linear["policy"],
+            "small_strong_ink_pca_linear_multicolour_only")
+        self.assertEqual(linear["components_stabilized"],
+                         len(linear["components"]))
+        self.assertEqual(
+            linear["pixels_relabelled"],
+            sum(item["pixels_relabelled"] for item in linear["components"]),
+        )
+
+        visual_gate = report["visual_gate"]
+        visual_gate_required = {
+            "status", "metrics", "applicability", "acceptance_thresholds",
+            "catastrophic_rejection_thresholds",
+            "multi_metric_rejection_thresholds", "acceptance_breaches",
+            "catastrophic_breaches", "soft_breaches",
+            "compound_local_failure", "reasons", "policy",
+        }
+        self.assertEqual(set(), visual_gate_required - set(visual_gate))
+        self.assertEqual(visual_gate["status"],
+                         report["visual_acceptance_status"])
+        self.assertIn("topology_p10", visual_gate["metrics"])
+        self.assertIn("light_object_coverage", visual_gate["metrics"])
+
+        light = report["transparent_light_fidelity"]
+        light_required = {
+            "applicable", "source_pixels", "core_pixels",
+            "measurement_pixels", "measurement_mask",
+            "spatial_tolerance_px", "coverage_percent",
+            "non_background_coverage_percent", "mean_color_error",
+            "p90_color_error", "match_tolerance_rgb", "error_metric",
+            "background_rgb",
+        }
+        self.assertEqual(set(), light_required - set(light))
+        self.assertIsInstance(light["applicable"], bool)
+        self.assertIsInstance(light["source_pixels"], int)
+        self.assertIsInstance(light["core_pixels"], int)
+        self.assertEqual(light["match_tolerance_rgb"], 48)
+        self.assertEqual(light["error_metric"], "max_channel_rgb")
+        if light["applicable"]:
+            self.assertEqual(light["measurement_mask"],
+                             "one_pixel_eroded_light_core")
+            self.assertIsInstance(light["coverage_percent"], (int, float))
+            self.assertGreaterEqual(light["coverage_percent"], 0.0)
+            self.assertLessEqual(light["coverage_percent"], 100.0)
+
         # Report paint resources, not color-stack layer count, as the palette
         # a designer actually sees in an SVG editor.
         self.assertEqual(report["unique_paints_total"],
@@ -665,25 +738,55 @@ class VectorRegression(unittest.TestCase):
             "selected_visual_quality",
             "selected_requested_features_retained",
             "requested_features_total", "policy", "matrix_strategy",
-            "evaluated_candidates",
+            "evaluated_candidates", "best_visual_status",
+            "selected_visual_status", "visual_status_counts",
+            "visual_status_survivor_count", "dominance_budgets",
+            "survivor_count", "candidate_count", "selected_metric_vector",
+            "base_structure_risk",
         }
         self.assertEqual(set(), policy_required - set(policy))
         self.assertEqual(policy["policy"],
-                         "preserve_requested_features_within_visual_tie")
+                         "visual_gate_tier_then_safe_dominance_then_preserve_features")
         self.assertEqual(policy["evaluated_candidates"],
                          len(report["candidates"]))
         self.assertLessEqual(policy["selected_requested_features_retained"],
-                             policy["requested_features_total"])
+                              policy["requested_features_total"])
+        self.assertEqual(policy["candidate_count"], len(report["candidates"]))
+        self.assertIn(policy["selected_visual_status"],
+                      {"accepted", "manual_review", "rejected"})
+        self.assertEqual(
+            set(policy["selected_metric_vector"]),
+            {"foreground", "color_fidelity", "detail_p10", "detail_mean",
+             "topology_p10", "light_object_coverage"},
+        )
         selected = [item for item in report["candidates"]
                     if item.get("selected")]
         self.assertEqual(len(selected), 1)
         self.assertAlmostEqual(selected[0]["quality_score"],
                                policy["selected_visual_quality"], places=6)
 
+        render_guards = []
+        stages = report["editability_enhancements"]["stages"]
+        for stage in stages.values():
+            for key in ("render_guard", "render_guards"):
+                guard = stage.get(key)
+                if isinstance(guard, dict) and guard.get(
+                        "external_render_check") == "completed":
+                    render_guards.append(guard)
+        paint_guard = report["paint_roles"].get("render_guard")
+        if isinstance(paint_guard, dict) and paint_guard.get(
+                "external_render_check") == "completed":
+            render_guards.append(paint_guard)
+        self.assertTrue(render_guards)
+        for guard in render_guards:
+            hits = guard["render_cache_hits"]
+            self.assertIsInstance(hits["before"], bool)
+            self.assertIsInstance(hits["after"], bool)
+
         readme = (self.result_dir("one_px_black") / "OUTPUT_README.txt").read_text(
             encoding="utf-8")
         self.assertTrue(readme.startswith("AI 向量清稿工具｜本次輸出摘要\n"))
-        self.assertIn("工具版本：v3-codex-beta.3", readme)
+        self.assertIn("工具版本：v3-codex-beta.5", readme)
         self.assertIn("驗收狀態：accepted", readme)
         self.assertIn("前景符合度：", readme)
         self.assertIn("外觀閘門：accepted", readme)
@@ -693,12 +796,13 @@ class VectorRegression(unittest.TestCase):
         self.assertIn("請求設定：", readme)
         self.assertIn("實際設定：", readme)
         self.assertIn("自動回退：", readme)
-        self.assertIn("Beta.3 editability enhancements", readme)
+        self.assertIn(
+            "Beta.5 fidelity, topology and editability enhancements", readme)
         self.assertIn("色彩調整.html", readme)
 
         review = (self.result_dir("one_px_black") / "review.html").read_text(
             encoding="utf-8")
-        self.assertIn("AI Vector Cleanroom v3-codex-beta.3", review)
+        self.assertIn("AI Vector Cleanroom v3-codex-beta.5", review)
         self.assertIn("accepted：外觀與可編輯性均通過自動品質閘門", review)
         self.assertIn("局部細節 p10", review)
         self.assertIn("可編輯性", review)
@@ -711,7 +815,7 @@ class VectorRegression(unittest.TestCase):
             and element.attrib.get("id") == "ai-vector-cleanroom-metadata"
         )
         embedded = json.loads(metadata.text)
-        self.assertEqual(embedded["tool_version"], "v3-codex-beta.3")
+        self.assertEqual(embedded["tool_version"], "v3-codex-beta.5")
         self.assertEqual(embedded["options_requested"], report["options_requested"])
         self.assertEqual(embedded["options_effective"], report["options_effective"])
         self.assertEqual(embedded["visual_acceptance_status"],

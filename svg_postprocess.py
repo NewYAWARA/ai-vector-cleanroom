@@ -1,4 +1,4 @@
-"""Transactional Beta.3 SVG editability enhancements.
+"""Transactional SVG editability enhancements.
 
 Each stage is conservative and independently reversible.  The caller may
 provide a renderer-backed validator; internal geometry/ordering invariants

@@ -19,7 +19,7 @@ class EditingTestPageTests(unittest.TestCase):
                            encoding="utf-8")
             (result / "source_reference.png").write_bytes(b"png")
             (result / "report.json").write_text(json.dumps({
-                "tool_version": "v3-codex-beta.3",
+                "tool_version": "v3-codex-beta.5",
                 "input": "demo.png",
             }), encoding="utf-8")
             path = build_editing_test_page(output, [{
@@ -27,7 +27,7 @@ class EditingTestPageTests(unittest.TestCase):
                 "svg": "result_demo/demo_vector.svg",
                 "visual_acceptance_status": "accepted",
                 "editability_status": "manual_review",
-            }], tool_version="v3-codex-beta.3")
+            }], tool_version="v3-codex-beta.5")
             body = path.read_text(encoding="utf-8")
 
         self.assertIn("Stage 2", body)
@@ -43,7 +43,7 @@ class EditingTestPageTests(unittest.TestCase):
             output = Path(folder)
             path = build_editing_test_page(output, [{
                 "dir": "result_missing", "svg": "result_missing/no.svg",
-            }], tool_version="v3-codex-beta.3")
+            }], tool_version="v3-codex-beta.5")
             body = path.read_text(encoding="utf-8")
         self.assertIn("尚無同時具備 SVG", body)
         self.assertNotIn('class="case"', body)
@@ -57,7 +57,7 @@ class EditingTestPageTests(unittest.TestCase):
                                encoding="utf-8")
             path = build_editing_test_page(output, [{
                 "dir": "..", "svg": "../outside.svg",
-            }], tool_version="v3-codex-beta.3")
+            }], tool_version="v3-codex-beta.5")
             body = path.read_text(encoding="utf-8")
         self.assertIn("尚無同時具備 SVG", body)
         self.assertNotIn(str(outside), body)

@@ -45,7 +45,33 @@ class CleanBaseStats:
     stroke_info: list = field(default_factory=list)
     n_gradients: int = 0         # banded ramps rebuilt as linearGradient
     gradient_info: list = field(default_factory=list)
+    component_repair: dict = field(default_factory=dict)
     viewbox: list = field(default_factory=list)   # [W, H] trace coordinates
+    palette_audit: dict = field(default_factory=dict)
+    # Private, compact provenance for broad background-coloured pockets that
+    # the stroke-aware hole guard classified as negative space.  Candidate
+    # validation runs after this function returns; carrying the exact mask lets
+    # it canonicalize the metric/source reference without re-guessing from
+    # colour alone (which would endanger genuine white lettering).  Packbits
+    # keeps a 2048px trace mask small when several candidates are retained.
+    _validation_hole_shape: tuple = field(
+        default_factory=tuple, repr=False, compare=False)
+    _validation_hole_bits: bytes = field(
+        default=b"", repr=False, compare=False)
+
+    def _validation_hole_mask(self):
+        """Return the private stroke-proven negative-space mask, if any."""
+        if len(self._validation_hole_shape) != 2 or not self._validation_hole_bits:
+            return None
+        height, width = (int(value) for value in self._validation_hole_shape)
+        if height <= 0 or width <= 0:
+            return None
+        packed = np.frombuffer(self._validation_hole_bits, dtype=np.uint8)
+        unpacked = np.unpackbits(packed, bitorder="little")
+        required = height * width
+        if unpacked.size < required:
+            return None
+        return unpacked[:required].reshape((height, width)).astype(bool)
 
 
 # ---------- Palette detection ----------
@@ -72,21 +98,28 @@ def _kmeans_pp_init(uniq, w, k, rng):
     return uniq[list(dict.fromkeys(idx))].copy()
 
 
-def _kmeans(pixels, k, iters=30, seed=0):
-    """Weighted k-means over unique colors with k-means++ init.
-
-    Robust to tiny images (k is clamped to the number of unique colors) and
-    to dominant-color images (weighted seeding cannot collapse clusters).
-    Empty clusters are re-seeded at the point of largest weighted error.
-    """
-    uniq, w = _unique_colors(pixels)
+def _kmeans_from_unique(uniq, w, k, iters=30, seed=0):
+    """Weighted k-means over a prepared unique-colour histogram."""
+    uniq = np.asarray(uniq, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float64)
     k = max(1, min(int(k), len(uniq)))
     if len(uniq) <= k:
         return uniq.copy()
     rng = np.random.default_rng(seed)
-    if len(uniq) > 60000:
-        keep = np.argsort(w)[-60000:]
+    # Keep clustering memory bounded on photographic inputs while retaining
+    # both dominant colours and a deterministic spread of the colour gamut.
+    # The former implementation kept only the most frequent colours; with a
+    # smooth ramp (many equally frequent colours) that biased the sample to
+    # one lexicographic end of the gamut.
+    if len(uniq) > 100000:
+        ranked = np.argsort(-w, kind="stable")
+        dominant = ranked[:50000]
+        remainder = np.sort(ranked[50000:])
+        spread_at = np.linspace(0, len(remainder) - 1, 50000,
+                                dtype=np.int64)
+        keep = np.unique(np.concatenate([dominant, remainder[spread_at]]))
         uniq, w = uniq[keep], w[keep]
+        k = max(1, min(k, len(uniq)))
     cent = _kmeans_pp_init(uniq, w, k, rng)
     for _ in range(iters):
         d = ((uniq[:, None] - cent[None]) ** 2).sum(2)
@@ -107,6 +140,17 @@ def _kmeans(pixels, k, iters=30, seed=0):
             break
         cent = new
     return cent
+
+
+def _kmeans(pixels, k, iters=30, seed=0):
+    """Weighted k-means over unique colors with k-means++ init.
+
+    Robust to tiny images (k is clamped to the number of unique colors) and
+    to dominant-color images (weighted seeding cannot collapse clusters).
+    Empty clusters are re-seeded at the point of largest weighted error.
+    """
+    uniq, w = _unique_colors(pixels)
+    return _kmeans_from_unique(uniq, w, k, iters=iters, seed=seed)
 
 
 def _cluster_shares(cent, uniq, w):
@@ -174,20 +218,352 @@ def _prune_blend_clusters(cent, uniq, w, share_limit=0.035, seg_dist=28.0):
     return cent
 
 
-def detect_palette(den, visible, forced=0, max_k=8, merge_thresh=45):
+def _palette_fit_stats(uniq, w, cent):
+    """Weighted RGB fitting error without expanding the pixel histogram."""
+    uniq = np.asarray(uniq, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float64)
+    cent = np.asarray(cent, dtype=np.float32).reshape(-1, 3)
+    if not len(uniq) or not len(cent) or float(w.sum()) <= 0:
+        return {"mean": 0.0, "p90": 0.0, "p95": 0.0,
+                "over_25_share": 0.0}
+    error = np.empty(len(uniq), dtype=np.float32)
+    # A photo can contain millions of unique colours.  Keep the audit itself
+    # bounded; otherwise deciding whether to use 16 colours could consume more
+    # memory than the trace it is meant to improve.
+    for start in range(0, len(uniq), 65536):
+        block = uniq[start:start + 65536]
+        error[start:start + len(block)] = np.sqrt(
+            ((block[:, None] - cent[None]) ** 2).sum(2).min(1))
+    total = float(w.sum())
+    order = np.argsort(error, kind="stable")
+    cumulative = np.cumsum(w[order])
+
+    def _weighted_percentile(q):
+        idx = int(np.searchsorted(cumulative, q * total, side="left"))
+        return float(error[order[min(idx, len(order) - 1)]])
+
+    return {
+        "mean": round(float((error * w).sum() / total), 3),
+        "p90": round(_weighted_percentile(0.90), 3),
+        "p95": round(_weighted_percentile(0.95), 3),
+        "over_25_share": round(float(w[error > 25.0].sum() / total), 4),
+    }
+
+
+def _nearest_palette_labels(img, palette, chunk=131072):
+    """Assign palette labels in bounded memory (20 colours can be sizeable)."""
+    pixels = np.asarray(img, dtype=np.float32).reshape(-1, 3)
+    palette = np.asarray(palette, dtype=np.float32).reshape(-1, 3)
+    out = np.empty(len(pixels), dtype=np.int16)
+    for start in range(0, len(pixels), int(chunk)):
+        block = pixels[start:start + int(chunk)]
+        out[start:start + len(block)] = (
+            ((block[:, None] - palette[None]) ** 2).sum(2).argmin(1))
+    return out.reshape(np.asarray(img).shape[:2])
+
+
+def detect_palette(den, visible, forced=0, max_k=8, merge_thresh=45,
+                   return_audit=False, return_labels=True):
     pix = den[visible].astype(np.float32)
     uniq, w = _unique_colors(pix)
     if forced and forced >= 2:
-        cent = _kmeans(pix, int(forced))
+        cent = _kmeans_from_unique(uniq, w, int(forced))
+        audit = {
+            "mode": "forced", "base_colors": int(len(cent)),
+            "selected_colors": int(len(cent)),
+            "fit_before": _palette_fit_stats(uniq, w, cent),
+        }
     else:
-        cent = _kmeans(pix, min(int(max_k), max(2, len(uniq))))
+        base_k = min(int(max_k), max(2, len(uniq)))
+        cent = _kmeans_from_unique(uniq, w, base_k)
         cent = _merge_close(cent, uniq, w, merge_thresh)
         cent = _prune_blend_clusters(cent, uniq, w)
+        base_cent = cent.copy()
+        base_fit = _palette_fit_stats(uniq, w, base_cent)
+        candidates = [{"colors": int(len(base_cent)), **base_fit}]
+
+        # A flat logo should stay compact and easy to edit.  A genuinely
+        # continuous/textured logo, however, cannot be represented honestly by
+        # the old hard 8-colour ceiling.  Expand only when BOTH mean and tail
+        # error say that 8 colours are visibly inadequate, and stop at the
+        # smallest richer palette that meets the target.  Twenty is the final
+        # bounded step: it can rescue a difficult ramp without jumping to the
+        # visibly more fragmented 24-colour result.
+        adaptive = (int(max_k) >= 8 and len(uniq) > len(base_cent)
+                    and base_fit["mean"] > 13.0
+                    and base_fit["p90"] > 25.0)
+        selected_fit = base_fit
+        if adaptive:
+            best_cent, best_fit = base_cent, base_fit
+            for richer_k in (12, 16, 20):
+                richer_k = min(richer_k, len(uniq))
+                if richer_k <= len(base_cent):
+                    continue
+                richer = _kmeans_from_unique(uniq, w, richer_k)
+                # Only collapse virtually duplicate centres.  Ordinary blend
+                # pruning would remove the very ramp stops this branch exists
+                # to preserve.
+                richer = _merge_close(richer, uniq, w, 10.0)
+                richer = _prune_blend_clusters(
+                    richer, uniq, w, share_limit=0.0015, seg_dist=6.0)
+                fit = _palette_fit_stats(uniq, w, richer)
+                candidates.append({"colors": int(len(richer)), **fit})
+                material = (
+                    (fit["mean"] <= best_fit["mean"] - 1.0
+                     or fit["p90"] <= best_fit["p90"] - 2.0)
+                    and fit["mean"] <= best_fit["mean"] + 0.25
+                    and fit["p90"] <= best_fit["p90"] + 0.5)
+                if material:
+                    best_cent, best_fit = richer, fit
+                if fit["mean"] <= 13.0 and fit["p90"] <= 25.0:
+                    best_cent, best_fit = richer, fit
+                    break
+            cent, selected_fit = best_cent, best_fit
+        audit = {
+            "mode": "adaptive" if len(cent) > len(base_cent) else "compact",
+            "base_colors": int(len(base_cent)),
+            "selected_colors": int(len(cent)),
+            "fit_before": base_fit,
+            "fit_after": selected_fit,
+            "candidates": candidates,
+        }
     cent_i = np.clip(np.round(cent), 0, 255).astype(np.uint8)
-    H, W, _ = den.shape
-    lab_all = (((den.reshape(-1, 3)[:, None].astype(np.float32) - cent_i[None]) ** 2)
-               .sum(2).argmin(1).reshape(H, W))
+    lab_all = (_nearest_palette_labels(den, cent_i)
+               if return_labels else None)
+    if return_audit:
+        return cent_i, lab_all, audit
     return cent_i, lab_all
+
+
+def _allow_palette_tier_b_strokes(palette_audit):
+    """Return whether per-palette stroke recovery is visually trustworthy.
+
+    Tier B is useful for flat logos where a real line crosses another fill.
+    On continuous-tone artwork that needed 12+ adaptive colours, however, the
+    thin quantisation bands inside glyphs and gradients look exactly like
+    one-pixel strokes.  Keep the global Tier-A lines, but leave those colour
+    fragments with the fill tracer so letter silhouettes stay intact.
+    """
+    audit = palette_audit or {}
+    return not (
+        audit.get("mode") == "adaptive"
+        and int(audit.get("selected_colors") or 0) >= 12
+    )
+
+
+def _stabilize_fragmented_linear_details(
+        den, visible, palette, labels, bg_color, owned_mask=None,
+        *, core_threshold=12.0, min_area=21, max_area=800):
+    """Collapse only tiny, ruler-straight multi-palette details to one paint.
+
+    A one- or two-pixel ray can cross several adaptive palette bands.  A
+    cutout tracer then sees each band as a separate speck and may drop the
+    entire ray even though the original strong-ink component is continuous.
+    PCA distinguishes those details from glyphs and illustrated ribbons: the
+    perpendicular sigma must stay below 1.5px and the component must be both
+    extremely linear and sparsely filled inside its bounding box.
+    """
+
+    from stroke_engine import connected_components
+
+    den = np.asarray(den, dtype=np.float32)
+    visible = np.asarray(visible, dtype=bool)
+    palette = np.asarray(palette, dtype=np.uint8).reshape(-1, 3)
+    result = np.asarray(labels).copy()
+    owned = (np.zeros_like(visible) if owned_mask is None
+             else np.asarray(owned_mask, dtype=bool))
+    bg = np.asarray(bg_color, dtype=np.float32).reshape(1, 1, 3)
+    strength = np.abs(den - bg).max(axis=2)
+    components, count = connected_components(
+        visible & ~owned & (strength >= float(core_threshold)))
+    areas = np.bincount(components.ravel(), minlength=count + 1)
+    records = []
+    changed_pixels = 0
+
+    for component in range(1, count + 1):
+        area = int(areas[component])
+        if area < int(min_area) or area > int(max_area):
+            continue
+        yy, xx = np.nonzero(components == component)
+        if not len(xx):
+            continue
+        width = int(xx.max() - xx.min() + 1)
+        height = int(yy.max() - yy.min() + 1)
+        if max(width, height) < 12:
+            continue
+        points = np.column_stack((xx, yy)).astype(np.float64)
+        covariance = np.cov(points, rowvar=False)
+        eigenvalues = np.linalg.eigvalsh(covariance)
+        perpendicular_sigma = math.sqrt(max(0.0, float(eigenvalues[0])))
+        linearity = float(eigenvalues[-1]) / max(float(eigenvalues[0]), 0.25)
+        fill_ratio = area / float(max(1, width * height))
+        if (perpendicular_sigma > 1.5 or linearity < 100.0
+                or fill_ratio > 0.28):
+            continue
+
+        component_labels = result[yy, xx].astype(np.int64)
+        counts = np.bincount(component_labels, minlength=len(palette))
+        dominant_share = float(counts.max()) / max(1, area)
+        if dominant_share >= 0.85:
+            continue
+        # A one-pixel antialiased line contains many pale edge samples.  The
+        # median therefore points toward the paper/background colour and can
+        # select a low-chroma grey even when the actual line is gold or blue.
+        # Estimate the paint from the strongest 15% of the component instead:
+        # those pixels are closest to the opaque centre-line colour while the
+        # full component is still used for the geometry decision above.
+        component_strength = strength[yy, xx]
+        core_cutoff = float(np.quantile(component_strength, 0.85))
+        colour_core = den[yy[component_strength >= core_cutoff],
+                          xx[component_strength >= core_cutoff]]
+        source_median = np.median(
+            colour_core if len(colour_core) else den[yy, xx], axis=0)
+        palette_index = int(
+            ((palette.astype(np.float32) - source_median) ** 2).sum(1).argmin())
+        changed = int((component_labels != palette_index).sum())
+        if changed <= 0:
+            continue
+        result[yy, xx] = palette_index
+        changed_pixels += changed
+        records.append({
+            "source_component": int(component),
+            "area_px": area,
+            "bbox_px": [int(xx.min()), int(yy.min()), width, height],
+            "linearity": round(linearity, 3),
+            "perpendicular_sigma_px": round(perpendicular_sigma, 3),
+            "old_dominant_share": round(dominant_share, 4),
+            "colour_core_quantile": 0.85,
+            "paint": "#{:02x}{:02x}{:02x}".format(
+                *(int(value) for value in palette[palette_index])),
+            "pixels_relabelled": changed,
+        })
+
+    return result, {
+        "policy": "small_strong_ink_pca_linear_multicolour_only",
+        "components_stabilized": len(records),
+        "pixels_relabelled": int(changed_pixels),
+        "core_threshold": float(core_threshold),
+        "max_perpendicular_sigma_px": 1.5,
+        "minimum_linearity": 100.0,
+        "components": records,
+    }
+
+
+def _retain_initial_accent_colors(
+        den, visible, initial_palette, fill_palette, labels, *,
+        max_colors=2, minimum_improvement=8.0,
+        minimum_component_area=128, minimum_foreground_share=0.002):
+    """Restore a small, coherent accent lost by fill-only re-clustering.
+
+    Stroke extraction can remove most samples of a real accent (for example
+    two brown rules), causing the remaining brown leaf to disappear from the
+    re-estimated fill palette.  Only colours already proven by the initial
+    whole-art palette are eligible, and only large connected ownership
+    regions with a material residual improvement are recoloured.
+    """
+
+    from stroke_engine import connected_components
+
+    den = np.asarray(den, dtype=np.float32)
+    visible = np.asarray(visible, dtype=bool)
+    initial = np.asarray(initial_palette, dtype=np.uint8).reshape(-1, 3)
+    palette = np.asarray(fill_palette, dtype=np.uint8).reshape(-1, 3).copy()
+    result = np.asarray(labels).copy()
+    foreground_pixels = int(visible.sum())
+    minimum_total = max(
+        int(minimum_component_area),
+        int(math.ceil(float(minimum_foreground_share) * foreground_pixels)),
+    )
+    records = []
+    if foreground_pixels and int(max_colors) > 0:
+        current_rgb = palette[result].astype(np.float32)
+        current_error = np.sqrt(((den - current_rgb) ** 2).sum(axis=2))
+        candidate_colours = []
+        for colour in initial:
+            colour_tuple = tuple(int(v) for v in colour)
+            candidate = np.asarray(colour_tuple, dtype=np.float32)
+            palette_distance = np.sqrt(
+                ((palette.astype(np.float32) - candidate) ** 2).sum(axis=1))
+            if len(palette_distance) and float(palette_distance.min()) < 8.0:
+                continue
+            candidate_colours.append(colour_tuple)
+
+        # Assign every pixel to at most one missing initial colour before any
+        # component labelling.  The old implementation flood-filled the full
+        # canvas once per candidate (and again after each acceptance), which
+        # turned a two-colour guard into a minute-long step on a 1254px logo.
+        best_candidate = np.full(visible.shape, -1, dtype=np.int16)
+        best_gain = np.zeros(visible.shape, dtype=np.float32)
+        for index, colour in enumerate(candidate_colours):
+            candidate = np.asarray(colour, dtype=np.float32)
+            candidate_error = np.sqrt(((den - candidate) ** 2).sum(axis=2))
+            improvement = current_error - candidate_error
+            better = visible & (improvement > best_gain)
+            best_gain[better] = improvement[better]
+            best_candidate[better] = index
+
+        ranked = []
+        for index, colour in enumerate(candidate_colours):
+            strong = ((best_candidate == index)
+                      & (best_gain >= float(minimum_improvement)))
+            strong_pixels = int(strong.sum())
+            if strong_pixels < minimum_total:
+                continue
+            ranked.append((float(best_gain[strong].sum()), strong_pixels,
+                           index, colour))
+        ranked.sort(reverse=True)
+
+        for _rough_benefit, _rough_pixels, index, colour in ranked:
+            if len(records) >= int(max_colors):
+                break
+            candidate = np.asarray(colour, dtype=np.float32)
+            if np.sqrt(((palette.astype(np.float32) - candidate) ** 2)
+                       .sum(axis=1)).min() < 8.0:
+                continue
+            owner = (best_candidate == index) & visible & (best_gain > 0)
+            strong = owner & (best_gain >= float(minimum_improvement))
+            owner_y, owner_x = np.nonzero(owner)
+            if not len(owner_y):
+                continue
+            y0, y1 = int(owner_y.min()), int(owner_y.max()) + 1
+            x0, x1 = int(owner_x.min()), int(owner_x.max()) + 1
+            owner_crop = owner[y0:y1, x0:x1]
+            strong_crop = strong[y0:y1, x0:x1]
+            owner_labels, owner_count = connected_components(owner_crop)
+            keep_ids = []
+            strong_pixels = 0
+            for component in range(1, owner_count + 1):
+                strong_count = int(
+                    (strong_crop & (owner_labels == component)).sum())
+                if strong_count >= int(minimum_component_area):
+                    keep_ids.append(component)
+                    strong_pixels += strong_count
+            if strong_pixels < minimum_total or not keep_ids:
+                continue
+            accepted = np.zeros_like(visible)
+            accepted[y0:y1, x0:x1] = np.isin(owner_labels, keep_ids)
+            benefit = float(best_gain[accepted].sum())
+            mean_gain = float(best_gain[accepted].mean())
+            palette_index = len(palette)
+            palette = np.vstack([palette, np.asarray(colour, dtype=np.uint8)])
+            result[accepted] = palette_index
+            records.append({
+                "paint": "#{:02x}{:02x}{:02x}".format(*colour),
+                "assigned_pixels": int(accepted.sum()),
+                "strong_improvement_pixels": int(strong_pixels),
+                "mean_rgb_error_improvement": round(mean_gain, 3),
+                "total_error_improvement": round(benefit, 3),
+            })
+
+    return palette, result, {
+        "policy": "initial_palette_connected_residual_retention",
+        "maximum_colors": int(max_colors),
+        "minimum_rgb_error_improvement": float(minimum_improvement),
+        "minimum_component_area_px": int(minimum_component_area),
+        "minimum_foreground_share": float(minimum_foreground_share),
+        "colors_retained": len(records),
+        "records": records,
+    }
 
 
 def color_name(rgb):
@@ -889,7 +1265,46 @@ def _bake_translate(d, tx, ty):
 
 # ---------- Gradient detection ----------
 
-def _detect_gradients(den, lab_all, vis_fill, palette, max_regions=8):
+def _allocate_gradient_keys(palette, count, min_distance=48):
+    """Allocate deterministic placeholder colours that cannot alias each other.
+
+    Gradient placeholders are an internal transport between the fill tracer and
+    the preview renderer.  They must be well separated from both real palette
+    colours and every other placeholder; otherwise one gradient can overwrite
+    another during antialias-fringe recovery.
+    """
+    count = int(count)
+    if count <= 0:
+        return []
+    pal = np.asarray(palette, dtype=np.int16).reshape(-1, 3)
+    levels = np.asarray((3, 35, 67, 99, 131, 163, 195, 227, 251),
+                        dtype=np.int16)
+    candidates = np.stack(np.meshgrid(levels, levels, levels, indexing="ij"),
+                          axis=-1).reshape(-1, 3)
+    chosen = []
+    occupied = pal.copy()
+    for _ in range(count):
+        if occupied.size:
+            # Chebyshev separation matches the renderer's max-channel key
+            # tolerance exactly.
+            dist = np.abs(candidates[:, None, :] - occupied[None, :, :]).max(2)
+            score = dist.min(1)
+        else:
+            score = np.full(len(candidates), 255, dtype=np.int16)
+        idx = int(score.argmax())
+        if int(score[idx]) < int(min_distance):
+            raise ValueError(
+                f"cannot isolate {count} gradient keys by {min_distance} RGB levels")
+        key = candidates[idx].copy()
+        chosen.append(tuple(int(v) for v in key))
+        occupied = (np.vstack([occupied, key]) if occupied.size
+                    else key.reshape(1, 3))
+        candidates = np.delete(candidates, idx, axis=0)
+    return chosen
+
+
+def _detect_gradients(den, lab_all, vis_fill, palette, max_regions=8,
+                      band_color_distance=32.0, minimum_color_span=30.0):
     """Detect palette-quantization banding and rebuild it as linear gradients.
 
     Adjacent flat-color components whose shared boundary is SMOOTH in the
@@ -974,7 +1389,8 @@ def _detect_gradients(den, lab_all, vis_fill, palette, max_regions=8):
         if area_arr[a] < 400 or area_arr[b] < 400:
             continue
         ca, cb = comp_color[a], comp_color[b]
-        if float(((pal[ca] - pal[cb]) ** 2).sum()) < 40 ** 2:
+        if (float(((pal[ca] - pal[cb]) ** 2).sum())
+                < float(band_color_distance) ** 2):
             continue
         ra, rb = find(a), find(b)
         if ra != rb:
@@ -1044,12 +1460,45 @@ def _detect_gradients(den, lab_all, vis_fill, palette, max_regions=8):
                     or off == stops[-1][0]:
                 ded.append((off, c2))
         span = max(abs(ded[0][1][j] - ded[-1][1][j]) for j in range(3))
-        if span < 40:
+        if span < float(minimum_color_span):
+            continue
+
+        # A smooth-looking fitted ramp is not automatically better than the
+        # flat palette it replaces.  Validate every region against that exact
+        # baseline, including its error tail, so a misleading fit can never
+        # make a large part of the logo visibly worse.
+        tt_s = np.clip((xs_s * ux + ys_s * uy - tmin) / (tmax - tmin),
+                       0.0, 1.0)
+        stop_offs = np.asarray([off for off, _ in ded], dtype=np.float64)
+        stop_cols = np.asarray([c for _, c in ded], dtype=np.float64)
+        fitted = np.column_stack([
+            np.interp(tt_s, stop_offs, stop_cols[:, ch]) for ch in range(3)
+        ])
+        source_sample = den[ys_s, xs_s].astype(np.float64)
+        flat_sample = pal[lab_all[ys_s, xs_s]]
+        grad_err = np.abs(fitted - source_sample).max(axis=1)
+        flat_err = np.abs(flat_sample - source_sample).max(axis=1)
+        grad_mean = float(grad_err.mean())
+        flat_mean = float(flat_err.mean())
+        grad_p90 = float(np.quantile(grad_err, 0.90))
+        flat_p90 = float(np.quantile(flat_err, 0.90))
+        degraded_share = float((grad_err > flat_err + 3.0).mean())
+        validation = {
+            "sample_pixels": int(len(grad_err)),
+            "flat_mean_error": round(flat_mean, 3),
+            "gradient_mean_error": round(grad_mean, 3),
+            "flat_p90_error": round(flat_p90, 3),
+            "gradient_p90_error": round(grad_p90, 3),
+            "degraded_over_3_share": round(degraded_share, 4),
+        }
+        if (grad_mean > flat_mean - 2.0
+                or grad_p90 > flat_p90
+                or degraded_share > 0.10):
             continue
         regions.append({"mask": mask, "area": area,
                         "x1": ux * tmin, "y1": uy * tmin,
                         "x2": ux * tmax, "y2": uy * tmax,
-                        "stops": ded})
+                        "stops": ded, "validation": validation})
     regions.sort(key=lambda r: -r["area"])
     return regions[:max_regions]
 
@@ -1094,6 +1543,101 @@ def _iter_svg_paths(raw):
         yield dm.group(1), fm.group(1), tx, ty
 
 
+def _erode_boolean_mask(mask, iterations=1):
+    """Return a small dependency-free 8-neighbourhood erosion."""
+    result = np.asarray(mask, dtype=bool).copy()
+    for _ in range(max(0, int(iterations))):
+        padded = np.pad(result, 1, mode="constant", constant_values=False)
+        eroded = np.ones_like(result, dtype=bool)
+        for dy in range(3):
+            for dx in range(3):
+                eroded &= padded[dy:dy + result.shape[0],
+                                 dx:dx + result.shape[1]]
+        result = eroded
+    return result
+
+
+def _broad_enclosed_background_mask(visible, bg_like, enclosure):
+    """Select only broad background pockets inside a detected outline.
+
+    A closed circle/rectangle can trap the source canvas as an opaque white
+    island after border-connected background removal.  Conversely, real white
+    lettering and highlights can live inside that same outline.  Treating all
+    background-coloured pixels as a hole therefore destroys real artwork.
+
+    This classifier removes a component only when it has the spatial evidence
+    of negative space: it occupies at least 30% of the enclosure, or is both
+    broadly spanning and dominant while touching the inner boundary.  A third
+    branch handles a cross/bar that partitions one large background into
+    several components; it activates only when background-like pixels jointly
+    occupy at least 30% of the enclosure and the component clearly owns part
+    of the inner boundary.
+    """
+    visible = np.asarray(visible, dtype=bool)
+    bg_like = np.asarray(bg_like, dtype=bool)
+    enclosure = np.asarray(enclosure, dtype=bool)
+    if not (visible.shape == bg_like.shape == enclosure.shape):
+        raise ValueError("visible, bg_like and enclosure must have equal shapes")
+
+    selected = np.zeros_like(enclosure, dtype=bool)
+    enclosure_area = int(enclosure.sum())
+    candidate = enclosure & visible & bg_like
+    candidate_area = int(candidate.sum())
+    if enclosure_area == 0 or candidate_area == 0:
+        return selected
+
+    from stroke_engine import connected_components
+
+    labels, count = connected_components(candidate)
+    if not count:
+        return selected
+    areas = np.bincount(labels.ravel(), minlength=count + 1)
+
+    ey, ex = np.nonzero(enclosure)
+    enclosure_width = max(1, int(ex.max() - ex.min() + 1))
+    enclosure_height = max(1, int(ey.max() - ey.min() + 1))
+    # A 1--3 px band tolerates antialiasing gaps at the detected stroke edge
+    # without making centrally placed white artwork count as boundary-owned.
+    band_depth = max(1, min(
+        3, int(round(0.01 * min(enclosure_width, enclosure_height)))))
+    inner = _erode_boolean_mask(enclosure, band_depth)
+    boundary_band = enclosure & ~inner
+    boundary_area = max(1, int(boundary_band.sum()))
+    total_ratio = candidate_area / float(enclosure_area)
+
+    for component in range(1, count + 1):
+        area = int(areas[component])
+        if area <= 0:
+            continue
+        component_mask = labels == component
+        cy, cx = np.nonzero(component_mask)
+        area_ratio = area / float(enclosure_area)
+        span_x = (int(cx.max() - cx.min() + 1) / float(enclosure_width))
+        span_y = (int(cy.max() - cy.min() + 1) / float(enclosure_height))
+        dominance = area / float(candidate_area)
+        boundary_share = float(
+            (component_mask & boundary_band).sum()) / boundary_area
+
+        large_single_pocket = area_ratio >= 0.30
+        dominant_spanning_pocket = (
+            area_ratio >= 0.08
+            and span_x >= 0.72
+            and span_y >= 0.72
+            and dominance >= 0.65
+            and boundary_share >= 0.12
+        )
+        partitioned_background = (
+            total_ratio >= 0.30
+            and area_ratio >= 0.01
+            and boundary_share >= 0.08
+        )
+        if (large_single_pocket or dominant_spanning_pocket
+                or partitioned_background):
+            selected |= component_mask
+
+    return selected
+
+
 def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                      regularize=True, flat_out=None,
                      background="auto", max_size=0, geometry=None,
@@ -1120,10 +1664,22 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     )
     A = np.asarray(im)
     source_alpha = A[:, :, 3]
+    background_counter_mask = np.asarray(
+        getattr(im, "_avc_background_counter_mask",
+                np.zeros(source_alpha.shape, dtype=bool)),
+        dtype=bool,
+    )
+    if background_counter_mask.shape != source_alpha.shape:
+        background_counter_mask = np.zeros(source_alpha.shape, dtype=bool)
     # Keep genuine semi-transparent artwork in the canonical mask.  The old
     # alpha>=128 split silently deleted mixed-alpha details whenever another
     # opaque object was present.
     visible = source_alpha >= 16
+    # Counter pixels are transparent delivery geometry, but retaining their
+    # neutral samples solely for adaptive palette estimation avoids changing
+    # unrelated colours, gradient bands and thin accents when a wordmark's
+    # paper-coloured holes are canonicalized.
+    palette_visible = visible | background_counter_mask
     H, W = visible.shape
     pre_notes = []
     if not np.any(visible):
@@ -1142,7 +1698,10 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     # the palette estimator unfiltered, and label assignment always runs on
     # the unfiltered image — a 3x3 median can no longer erase a thin stroke.
     rgb = A[:, :, :3].copy()
-    rgb[~visible] = 255
+    # Preserve the original off-white/antialiased counter samples for palette
+    # estimation; only pixels that were never artwork or retained sampling
+    # evidence receive the neutral invisible RGB fill.
+    rgb[~palette_visible] = 255
     den = rgb.astype(np.float32)                     # labels/colors: unfiltered
     if min(W, H) >= 3 and int(visible.sum()) >= 4096:
         med = np.asarray(Image.fromarray(rgb)
@@ -1155,16 +1714,16 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         den_palette = np.where(fine[..., None], den, med)
     else:
         den_palette = den
-    palette, _ = detect_palette(den_palette, visible, forced=forced_colors)
+    palette, _, palette_audit = detect_palette(
+        den_palette, palette_visible, forced=forced_colors,
+        return_audit=True, return_labels=False)
     # Stroke colors sampled later from the original-resolution image must
     # snap back to this pre-extraction palette, not to the fill-only palette
     # that is estimated after stroke pixels have been removed.
     initial_palette = palette.copy()
 
     def _assign(img, pal):
-        return (((img.reshape(-1, 3)[:, None].astype(np.float32)
-                  - pal[None].astype(np.float32)) ** 2)
-                .sum(2).argmin(1).reshape(img.shape[:2]))
+        return _nearest_palette_labels(img, pal)
 
     lab_all = _assign(den, palette)
 
@@ -1190,10 +1749,21 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     # scans each palette color for lines sitting on other fills.
     stroke_list = []
     stroke_mask = np.zeros((H, W), dtype=bool)
+    stroke_deferred_mask = np.zeros((H, W), dtype=bool)
     bg_col = (255.0, 255.0, 255.0)
     if strokes != "off":
         try:
             from stroke_engine import extract_strokes
+
+            def _stroke_result(value):
+                # Three values are the Beta.4 contract.  Accept the former
+                # two-value shape for third-party tests/extensions and treat
+                # it as having no explicit deferred guard.
+                if len(value) == 3:
+                    return value
+                found, owned = value
+                return found, owned, np.zeros_like(owned)
+
             if removed:
                 # the removed background was light; enclosed pockets of the
                 # same light color are still opaque (negative space), so
@@ -1205,21 +1775,32 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                 bg_col = tuple(np.median(border, axis=0))
             ink = visible & (((den - np.asarray(bg_col, dtype=np.float32)) ** 2)
                              .sum(axis=2) > 60 ** 2)
-            s_a, m_a = extract_strokes(ink, den, palette, bg_col,
-                                       alpha=source_alpha)
+            s_a, m_a, d_a = _stroke_result(
+                extract_strokes(ink, den, palette, bg_col,
+                                alpha=source_alpha))
             stroke_list += s_a
             stroke_mask |= m_a
-            for ci in range(len(palette)):
-                cm = visible & ~stroke_mask & (lab_all == ci)
-                if not cm.any() or cm.sum() > 0.35 * H * W:
-                    continue
-                s_b, m_b = extract_strokes(cm, den, palette, bg_col,
-                                           alpha=source_alpha)
-                stroke_list += s_b
-                stroke_mask |= m_b
+            stroke_deferred_mask |= d_a
+            if _allow_palette_tier_b_strokes(palette_audit):
+                for ci in range(len(palette)):
+                    cm = (visible & ~stroke_mask & ~stroke_deferred_mask
+                          & (lab_all == ci))
+                    if not cm.any() or cm.sum() > 0.35 * H * W:
+                        continue
+                    s_b, m_b, d_b = _stroke_result(
+                        extract_strokes(cm, den, palette, bg_col,
+                                        alpha=source_alpha))
+                    stroke_list += s_b
+                    stroke_mask |= m_b
+                    stroke_deferred_mask |= d_b
+            else:
+                pre_notes.append(
+                    "per-palette stroke recovery skipped on continuous-tone "
+                    "artwork; global line components remain editable")
         except Exception as e:
             stroke_list = []
             stroke_mask[:] = False
+            stroke_deferred_mask[:] = False
             pre_notes.append(f"stroke engine disabled by error: {e!r}"[:160])
 
     # Recover the true core color (and sub-pixel trace width) from the
@@ -1275,17 +1856,20 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         bg_arr = np.asarray(bg_col, dtype=np.float32)
         bg_like = np.abs(den - bg_arr).max(axis=2) <= 36
         for s in stroke_list:
+            enclosure = None
             if s.primitive == "circle":
                 inner = max(0.0, s.radius - s.width / 2.0 - 0.5)
-                hole_mask |= (((xx - s.cx) ** 2 + (yy - s.cy) ** 2)
-                              <= inner * inner) & bg_like
+                enclosure = (((xx - s.cx) ** 2 + (yy - s.cy) ** 2)
+                             <= inner * inner)
             elif s.primitive == "rect":
                 inset = s.width / 2.0 + 0.5
-                hole_mask |= ((xx >= s.x + inset)
-                              & (xx <= s.x + s.shape_width - inset)
-                              & (yy >= s.y + inset)
-                              & (yy <= s.y + s.height - inset)
-                              & bg_like)
+                enclosure = ((xx >= s.x + inset)
+                             & (xx <= s.x + s.shape_width - inset)
+                             & (yy >= s.y + inset)
+                             & (yy <= s.y + s.height - inset))
+            if enclosure is not None:
+                hole_mask |= _broad_enclosed_background_mask(
+                    visible, bg_like, enclosure)
 
     vis_fill = visible & ~hole_mask
     if stroke_list:
@@ -1296,9 +1880,79 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         if not forced_colors and vis_fill.any():
             # re-estimate the palette without the stroke pixels so that
             # antialiasing-gray clusters created only by thin lines vanish
-            palette, _ = detect_palette(den_palette, vis_fill, forced=0)
+            palette_fill_samples = vis_fill | background_counter_mask
+            palette, _, fill_palette_audit = detect_palette(
+                den_palette, palette_fill_samples, forced=0,
+                return_audit=True, return_labels=False)
+            palette_audit = {
+                "initial": palette_audit,
+                "fill_after_strokes": fill_palette_audit,
+            }
             lab_all = _assign(den, palette)
             palette_opacity = _palette_opacities(vis_fill, palette, lab_all)
+
+    accent_retention_audit = {
+        "policy": "initial_palette_connected_residual_retention",
+        "colors_retained": 0,
+        "records": [],
+    }
+    palette_analysis_fill = vis_fill | background_counter_mask
+    if vis_fill.any() and len(initial_palette) and len(palette):
+        palette, lab_all, accent_retention_audit = _retain_initial_accent_colors(
+            den, palette_analysis_fill, initial_palette, palette, lab_all)
+        if accent_retention_audit["colors_retained"]:
+            paints = ", ".join(
+                record["paint"] for record in accent_retention_audit["records"])
+            pre_notes.append(
+                "small coherent accent paint retained after stroke-aware "
+                f"palette re-estimation: {paints}")
+
+    linear_detail_audit = {
+        "policy": "small_strong_ink_pca_linear_multicolour_only",
+        "components_stabilized": 0,
+        "pixels_relabelled": 0,
+        "components": [],
+    }
+    if vis_fill.any() and len(palette) >= 2:
+        # The fill-only palette intentionally drops colours represented mostly
+        # by extracted strokes.  A fragmented sibling line may nevertheless
+        # need one of those paints, so make the original whole-art palette
+        # available to this narrowly guarded recovery pass.  Existing colours
+        # stay first, preserving every pre-existing label index.
+        base_detail_palette_count = len(palette)
+        detail_palette = [tuple(int(v) for v in colour) for colour in palette]
+        seen_detail_colours = set(detail_palette)
+        for colour in initial_palette:
+            key = tuple(int(v) for v in colour)
+            if key not in seen_detail_colours:
+                detail_palette.append(key)
+                seen_detail_colours.add(key)
+        detail_palette = np.asarray(detail_palette, dtype=np.uint8)
+        lab_all, linear_detail_audit = _stabilize_fragmented_linear_details(
+            den, palette_analysis_fill, detail_palette, lab_all, bg_col,
+            owned_mask=stroke_mask)
+        if linear_detail_audit["components_stabilized"]:
+            # Keep only supplemental colours that the stabilizer actually
+            # selected.  Leaving every initial colour in the nearest-colour
+            # map would let unrelated VTracer paths snap to otherwise unused
+            # paints and inflate both colour controls and visual noise.
+            supplemental_used = sorted(
+                int(value) for value in np.unique(lab_all[vis_fill])
+                if int(value) >= base_detail_palette_count)
+            if supplemental_used:
+                compact_palette = np.vstack((
+                    palette, detail_palette[supplemental_used]))
+                for compact_index, expanded_index in enumerate(
+                        supplemental_used, start=base_detail_palette_count):
+                    lab_all[lab_all == expanded_index] = compact_index
+                palette = compact_palette.astype(np.uint8)
+            pre_notes.append(
+                f"{linear_detail_audit['components_stabilized']} small "
+                "multicolour line detail(s) stabilised before cutout tracing")
+    if isinstance(palette_audit, dict):
+        palette_audit["initial_accent_retention"] = accent_retention_audit
+        palette_audit["linear_detail_stabilization"] = linear_detail_audit
+    palette_opacity = _palette_opacities(vis_fill, palette, lab_all)
 
     # flat reference for self-check keeps EVERYTHING (fills + strokes)
     flat = palette[lab_all]
@@ -1320,38 +1974,161 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
             pre_notes.append(f"gradient detection disabled by error: {e!r}"[:160])
     grad_keys = []
     if grad_regions:
+        try:
+            grad_keys = _allocate_gradient_keys(palette, len(grad_regions))
+        except Exception as e:
+            grad_regions = []
+            pre_notes.append(
+                f"gradient reconstruction disabled: placeholder isolation failed: {e!r}"[:200])
+    if grad_regions:
         flat = flat.copy()
-        for gi, g in enumerate(grad_regions):
-            key = (241 - gi * 2, 3, 247 - gi * 4)      # reserved magentas
-            while any(((int(c[0]) - key[0]) ** 2 + (int(c[1]) - key[1]) ** 2
-                       + (int(c[2]) - key[2]) ** 2) < 20 ** 2 for c in palette):
-                key = (key[0] - 4, key[1] + 2, key[2])
+        for g, key in zip(grad_regions, grad_keys):
             g["key"] = key
+            g["key_distance"] = min(
+                int(np.abs(palette.astype(np.int16)
+                           - np.asarray(key, dtype=np.int16)).max(axis=1).min()),
+                255,
+            ) if len(palette) else 255
             avals = source_alpha[g["mask"]]
             gop = (float(np.quantile(avals.astype(np.float32), 0.75)) / 255.0
                    if avals.size else 1.0)
             g["opacity"] = 1.0 if gop >= 0.985 else round(max(0.02, gop), 3)
-            grad_keys.append(key)
             flat[g["mask"]] = key
 
-    # the fill tracer only sees what strokes did not take over
-    flat_rgba = np.dstack([flat, np.where(vis_fill, 255, 0).astype(np.uint8)])
+    # VTracer shifts boundary colours when it receives transparent RGB: the
+    # transparent edge is averaged into stacked/cutout regions before its
+    # fill is reported, which can remap a dark glyph to a lighter palette
+    # colour.  Give the *working* raster an isolated opaque routing surround,
+    # then remove only that temporary geometry after tracing.  The delivered
+    # SVG remains transparent and the separate flat reference above retains
+    # the source alpha exactly.
+    trace_opaque_background = bool((~vis_fill).any())
+    trace_rgb = flat.copy()
+    trace_background_rgb = None
+    trace_background_isolated = False
+    if trace_opaque_background:
+        occupied_trace_colours = {
+            tuple(int(channel) for channel in colour) for colour in palette
+        }
+        occupied_trace_colours.update(
+            tuple(int(channel) for channel in region.get("key", ()))
+            for region in grad_regions if region.get("key") is not None)
+        # Keep the routing surround neutral for fast, stable edge tracing.
+        # Genuine white/light objects are reconstructed independently below,
+        # so they no longer depend on VTracer distinguishing them from this
+        # temporary near-white canvas.
+        for level in range(255, 223, -1):
+            candidate = (level, level, level)
+            if all(max(abs(level - channel) for channel in colour) >= 8
+                   for colour in occupied_trace_colours):
+                trace_background_rgb = candidate
+                trace_background_isolated = True
+                break
+        if trace_background_rgb is None:
+            trace_background_rgb = (255, 255, 255)
+        trace_rgb[~vis_fill] = trace_background_rgb
+        trace_alpha = np.full((H, W), 255, dtype=np.uint8)
+    else:
+        trace_alpha = np.where(vis_fill, 255, 0).astype(np.uint8)
+    flat_rgba = np.dstack([trace_rgb, trace_alpha])
 
     raw = ""
     if vis_fill.any():
-        speckle = int(min(10, max(2, round(min(W, H) / 256))))
+        # Cutout tracing no longer creates the large cumulative unions that
+        # needed aggressive speckle suppression.  Keep small intentional logo
+        # details (sun rays, dots, diacritics) while still dropping 1px noise.
+        # Logos often use intentional micro-details (halftone dots, star
+        # points, registration marks).  A resolution-scaled speckle cutoff
+        # silently erased those details on large source images before the
+        # native-circle pass could simplify them.  Two pixels remains a small
+        # noise guard while preserving design components for later validation.
+        speckle = 2
         with tempfile.TemporaryDirectory() as td:
             flat_png = Path(td) / "flat.png"
             raw_svg = Path(td) / "raw.svg"
             Image.fromarray(flat_rgba, "RGBA").save(flat_png)
             vtracer.convert_image_to_svg_py(
                 str(flat_png), str(raw_svg),
-                colormode="color", hierarchical="stacked", mode="spline",
+                colormode="color", hierarchical="cutout", mode="spline",
                 filter_speckle=speckle, color_precision=8, layer_difference=0,
                 corner_threshold=58, length_threshold=5.0, splice_threshold=45,
                 path_precision=6,
             )
             raw = raw_svg.read_text(encoding="utf-8")
+
+    # Cutout tracing can encode white lettering as holes in a darker parent
+    # instead of as white objects.  That looks correct on the normal white
+    # review canvas but fails as soon as a designer places the SVG on colour.
+    # Trace each *visible internal* light paint independently as a binary mask
+    # and later replace any ambiguous main-trace light paths with these real
+    # overlay objects.  External background pixels are absent from vis_fill,
+    # so they can never leak into this recovery pass.
+    light_overlay_entries = {}
+    if trace_opaque_background and vis_fill.any():
+        gradient_owned = np.zeros_like(vis_fill)
+        for region in grad_regions:
+            gradient_owned |= np.asarray(region.get("mask"), dtype=bool)
+        background_arr = np.asarray(bg_col, dtype=np.float32)
+        light_indices = []
+        for ci, colour in enumerate(palette):
+            colour_f = colour.astype(np.float32)
+            if (float(colour_f.mean()) >= 210.0
+                    and float(np.abs(colour_f - background_arr).max()) <= 72.0
+                    and int((vis_fill & ~gradient_owned
+                             & (lab_all == ci)).sum()) >= 8):
+                light_indices.append(ci)
+        if light_indices:
+            with tempfile.TemporaryDirectory() as light_td:
+                light_td = Path(light_td)
+                markers = _allocate_gradient_keys(
+                    np.asarray(((255, 255, 255),), dtype=np.uint8),
+                    len(light_indices), min_distance=48)
+                marker_array = np.asarray(markers, dtype=np.int16)
+                binary_rgb = np.full((H, W, 3), 255, dtype=np.uint8)
+                for ci, marker in zip(light_indices, markers):
+                    mask = vis_fill & ~gradient_owned & (lab_all == ci)
+                    binary_rgb[mask] = marker
+                binary_rgba = np.dstack((
+                    binary_rgb, np.full((H, W), 255, dtype=np.uint8)))
+                mask_png = light_td / "light-paints.png"
+                mask_svg = light_td / "light-paints.svg"
+                Image.fromarray(binary_rgba, "RGBA").save(mask_png)
+                vtracer.convert_image_to_svg_py(
+                    str(mask_png), str(mask_svg), colormode="color",
+                    hierarchical="cutout", mode="spline", filter_speckle=2,
+                    color_precision=8, layer_difference=0,
+                    corner_threshold=58, length_threshold=5.0,
+                    splice_threshold=45, path_precision=6,
+                )
+                light_raw = mask_svg.read_text(encoding="utf-8")
+                for d, fill, tx, ty in _iter_svg_paths(light_raw):
+                    rgb = np.asarray(tuple(
+                        int(fill[index:index + 2], 16)
+                        for index in (1, 3, 5)), dtype=np.int16)
+                    if int(np.abs(rgb - 255).max()) <= 32:
+                        continue
+                    marker_index = int(
+                        ((marker_array.astype(np.int32)
+                          - rgb.astype(np.int32)) ** 2)
+                        .sum(axis=1).argmin())
+                    ci = light_indices[marker_index]
+                    try:
+                        subs = _parse_subpaths(d)
+                        _offset_subs(subs, tx, ty)
+                        xs, ys = [], []
+                        for sub in subs:
+                            _sub_bbox_accumulate(sub, xs, ys)
+                        covers_canvas = (
+                            xs and ys and min(xs) <= 1.0 and min(ys) <= 1.0
+                            and max(xs) >= W - 1.0 and max(ys) >= H - 1.0)
+                        if not covers_canvas:
+                            light_overlay_entries.setdefault(ci, []).append(
+                                {"color": ci, "subs": subs})
+                    except Exception:
+                        light_overlay_entries.setdefault(ci, []).append({
+                            "color": ci,
+                            "raw": _bake_translate(d, tx, ty),
+                        })
 
     pal_rgb = [tuple(int(v) for v in c) for c in palette]
     pal_opacity = list(palette_opacity)
@@ -1372,14 +2149,51 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
 
     # Parse every path, preserving vtracer's stacking order (bottom to top).
     entries = []
+    trace_background_paths_removed = 0
     for d, fill, tx, ty in _iter_svg_paths(raw):
-        ci = nearest_idx(fill.lower())
+        raw_rgb = tuple(int(fill[i:i + 2], 16) for i in (1, 3, 5))
         try:
             subs = _parse_subpaths(d)
             _offset_subs(subs, tx, ty)
+            route_distance = (max(
+                abs(raw_rgb[i] - trace_background_rgb[i]) for i in range(3))
+                if trace_background_rgb is not None else 256)
+            if trace_background_rgb is not None and route_distance <= 24:
+                xs, ys = [], []
+                for sub in subs:
+                    _sub_bbox_accumulate(sub, xs, ys)
+                covers_canvas = (
+                    xs and ys and min(xs) <= 1.0 and min(ys) <= 1.0
+                    and max(xs) >= W - 1.0 and max(ys) >= H - 1.0)
+                if ((trace_background_isolated and route_distance <= 4)
+                        or covers_canvas):
+                    trace_background_paths_removed += 1
+                    continue
+            ci = nearest_idx(fill.lower())
+            if ci in light_overlay_entries:
+                continue
             entries.append({"color": ci, "subs": subs})
         except Exception:
+            ci = nearest_idx(fill.lower())
+            if ci in light_overlay_entries:
+                continue
             entries.append({"color": ci, "raw": _bake_translate(d, tx, ty)})
+
+    recovered_light_paths = 0
+    for ci in sorted(light_overlay_entries,
+                     key=lambda index: float(palette[index].mean())):
+        recovered = light_overlay_entries[ci]
+        entries.extend(recovered)
+        recovered_light_paths += len(recovered)
+
+    if trace_background_paths_removed:
+        pre_notes.append(
+            f"{trace_background_paths_removed} tracer-only routing background "
+            "path(s) removed after opaque-edge colour stabilisation")
+    if recovered_light_paths:
+        pre_notes.append(
+            f"{recovered_light_paths} internal light-paint path(s) explicitly "
+            "preserved for transparent-background fidelity")
 
     geometry_notes = []
     if geometry != "off":
@@ -1651,6 +2465,14 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     if pre_notes:
         geometry_notes = pre_notes + geometry_notes
 
+    if np.any(hole_mask):
+        validation_hole_shape = tuple(int(value) for value in hole_mask.shape)
+        validation_hole_bits = np.packbits(
+            hole_mask.reshape(-1), bitorder="little").tobytes()
+    else:
+        validation_hole_shape = ()
+        validation_hole_bits = b""
+
     return CleanBaseStats(
         width=orig_w, height=orig_h, colors=len(final_palette),
         palette=final_palette, removed_background=removed,
@@ -1668,8 +2490,14 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                         "key": "#{:02x}{:02x}{:02x}".format(*g["key"]),
                         "x1": g["x1"], "y1": g["y1"],
                         "x2": g["x2"], "y2": g["y2"],
+                        "opacity": g.get("opacity", 1.0),
+                        "key_distance": g.get("key_distance", 48),
+                        "validation": g.get("validation", {}),
                         "stops": [{"offset": off,
                                    "color": "#{:02x}{:02x}{:02x}".format(*c)}
                                   for off, c in g["stops"]],
-                        "viewbox": [W, H]} for g in grad_regions],
+                         "viewbox": [W, H]} for g in grad_regions],
+        palette_audit=palette_audit,
+        _validation_hole_shape=validation_hole_shape,
+        _validation_hole_bits=validation_hole_bits,
     )

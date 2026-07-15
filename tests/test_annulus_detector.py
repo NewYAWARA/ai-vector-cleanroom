@@ -159,5 +159,6 @@ class AnnulusDetectorTests(unittest.TestCase):
             self.assertFalse(rejected["accepted"])
             self.assertLess(rejected["ink_recall_percent"], 80.0)
 
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

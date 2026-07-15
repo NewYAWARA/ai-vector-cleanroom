@@ -22,6 +22,12 @@ import numpy as np
 
 MAX_HALF_WIDTH = 13          # px at trace scale; wider shapes are not strokes
 MIN_STROKE_LEN = 10.0        # px; shorter skeletons are blobs, not strokes
+JUNCTION_ARM_STRAIGHTNESS_MIN = 0.90
+MULTICOLOR_CURVE_STRAIGHTNESS_MIN = 0.95
+MULTICOLOR_SPLIT_DISTANCE = 80.0
+MAX_MULTICOLOR_STRAIGHT_RUNS = 8
+SHORT_CURVE_MIN_LENGTH_WIDTH_RATIO = 8.0
+SHORT_CURVE_STRAIGHTNESS_MIN = 0.97
 
 
 @dataclass
@@ -560,6 +566,30 @@ def _fit_closed_primitive(points, width, length):
     return None
 
 
+def _polyline_straightness(points, closed=False):
+    """Chord/polyline ratio used to distinguish a line from a glyph/arc."""
+    if closed or len(points) < 2:
+        return 0.0
+    length = sum(math.hypot(points[i + 1][0] - points[i][0],
+                            points[i + 1][1] - points[i][1])
+                 for i in range(len(points) - 1))
+    if length <= 1e-9:
+        return 0.0
+    chord = math.hypot(points[-1][0] - points[0][0],
+                       points[-1][1] - points[0][1])
+    return chord / length
+
+
+def _dilate_one(mask):
+    """One-pixel guard dilation, used only to prevent Tier-B re-extraction."""
+    grown = mask.copy()
+    grown[1:, :] |= mask[:-1, :]
+    grown[:-1, :] |= mask[1:, :]
+    grown[:, 1:] |= mask[:, :-1]
+    grown[:, :-1] |= mask[:, 1:]
+    return grown
+
+
 # ---------- main entry ----------
 
 def _group_eligible_component_pixels(labels, n, min_area, max_area):
@@ -601,13 +631,17 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
               the pixels farthest from it (the line's true core color,
               uncontaminated by antialiasing blends).
 
-    Returns (strokes list[Stroke], stroke_mask bool array).
+    Returns ``(strokes, stroke_mask, deferred_mask)``.  Deferred pixels are
+    deliberately left for the fill/gradient tracer, but must be excluded from
+    the later per-palette stroke pass.  This prevents a rejected multicolour
+    ring or glyph from being resurrected as disconnected colour fragments.
     """
     H, W = ink_mask.shape
     stroke_mask = np.zeros((H, W), dtype=bool)
+    deferred_mask = np.zeros((H, W), dtype=bool)
     strokes = []
     if not ink_mask.any():
-        return strokes, stroke_mask
+        return strokes, stroke_mask, deferred_mask
     bg = np.asarray(bg_color, dtype=np.float32)
 
     labels, n = connected_components(ink_mask)
@@ -682,9 +716,25 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
             if got is not None:
                 break
         if real_junction or (got is None and not junction_edges):
+            dm = np.zeros((H, W), dtype=bool)
+            dm[comp_idx[:, 0], comp_idx[:, 1]] = True
+            deferred_mask |= _dilate_one(dm)
             continue
         raw_polys = ([(edge, False) for edge in junction_edges]
                      if junction_edges else [got])
+
+        # A simple T/X/Y has straight arms.  Bent arms are much more commonly
+        # glyph outlines or illustration shapes; rebuilding them with round
+        # caps changes corners and counters.  Keep those components as fills.
+        if junction_edges and (
+                len(junction_edges) not in (3, 4)
+                or any(_polyline_straightness(edge) <
+                       JUNCTION_ARM_STRAIGHTNESS_MIN
+                       for edge in junction_edges)):
+            dm = np.zeros((H, W), dtype=bool)
+            dm[comp_idx[:, 0], comp_idx[:, 1]] = True
+            deferred_mask |= _dilate_one(dm)
+            continue
 
         def _poly_length(poly, is_closed):
             val = sum(math.hypot(poly[i + 1][0] - poly[i][0],
@@ -706,6 +756,19 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
         if width <= 0.5 or width > 2.2 * MAX_HALF_WIDTH:
             continue
         if length < 2.5 * width:
+            continue
+        # Short bent ribbons are far more often detached glyph strokes or
+        # illustration fragments than intentional centre-line artwork.  Round
+        # caps/joins visibly deform them.  Preserve the filled silhouette;
+        # long arcs and genuinely straight dashes still qualify as strokes.
+        if (not junction_edges and len(raw_polys) == 1
+                and not raw_polys[0][1]
+                and length < SHORT_CURVE_MIN_LENGTH_WIDTH_RATIO * width
+                and _polyline_straightness(raw_polys[0][0])
+                    < SHORT_CURVE_STRAIGHTNESS_MIN):
+            dm = np.zeros((H, W), dtype=bool)
+            dm[comp_idx[:, 0], comp_idx[:, 1]] = True
+            deferred_mask |= _dilate_one(dm)
             continue
         # uniformity along the skeleton
         dvals = dt[sk]
@@ -747,11 +810,21 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
         # the same collapsed junction coordinate.
         pieces = []
         all_gpts = []
+        defer_component = False
         for pts, closed in raw_polys:
             gpts = [(x + x0 - 2 + 0.5, y + y0 - 2 + 0.5)
                     for x, y in pts]
             all_gpts.extend(gpts)
             local_pieces = [(gpts, closed)]
+
+            # Closed non-primitive ribbons include glyph counters and
+            # irregular outline art.  A centre-line with round joins is not an
+            # equivalent representation, so let the fill tracer preserve it.
+            local_length = _poly_length(gpts, closed)
+            if closed and _fit_closed_primitive(
+                    gpts, width, local_length) is None:
+                defer_component = True
+                break
 
             # multicolor polylines (e.g. red touching blue) are split at
             # sustained color changes instead of painted one color end to end.
@@ -777,13 +850,35 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
                 distinct = {lab_s[rr[0]] for rr in big_runs}
                 if len(big_runs) >= 2 and len(distinct) >= 2:
                     pal_f = palette.astype(np.float32)
-                    far = any(((pal_f[a] - pal_f[b]) ** 2).sum() > 80 ** 2
+                    far = any(((pal_f[a] - pal_f[b]) ** 2).sum()
+                              > MULTICOLOR_SPLIT_DISTANCE ** 2
                               for a in distinct for b in distinct if a != b)
                     if far:
-                        local_pieces = [(gpts[rr[0]:rr[1]], False)
-                                        for rr in big_runs
-                                        if rr[1] - rr[0] >= 2]
+                        # Splitting a curved/closed colour ramp makes dashed
+                        # arcs because transition runs become gaps.  Defer the
+                        # complete component instead.  Straight two-colour
+                        # rules remain editable, with shared boundary points
+                        # so no pixels disappear between runs.
+                        if (closed
+                                or _polyline_straightness(gpts) <
+                                MULTICOLOR_CURVE_STRAIGHTNESS_MIN
+                                or len(runs) > MAX_MULTICOLOR_STRAIGHT_RUNS):
+                            defer_component = True
+                            break
+                        local_pieces = []
+                        for ri, rr in enumerate(runs):
+                            start_i = max(0, rr[0] - (1 if ri else 0))
+                            end_i = min(len(gpts), rr[1] + 1)
+                            segment = gpts[start_i:end_i]
+                            if len(segment) >= 2:
+                                local_pieces.append((segment, False))
             pieces.extend(local_pieces)
+
+        if defer_component:
+            dm = np.zeros((H, W), dtype=bool)
+            dm[comp_idx[:, 0], comp_idx[:, 1]] = True
+            deferred_mask |= _dilate_one(dm)
+            continue
 
         for seg_pts, seg_closed in pieces:
             if len(seg_pts) < 2:
@@ -828,4 +923,4 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
             gm = gm | (grown & allow)
         stroke_mask |= gm
 
-    return strokes, stroke_mask
+    return strokes, stroke_mask, deferred_mask

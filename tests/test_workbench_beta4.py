@@ -63,7 +63,7 @@ def _base_report(name: str) -> dict:
     }
 
 
-class WorkbenchBeta3Tests(unittest.TestCase):
+class WorkbenchBeta5Tests(unittest.TestCase):
     def _patch_output(self, output: Path):
         return mock.patch.multiple(
             workbench,
@@ -71,7 +71,7 @@ class WorkbenchBeta3Tests(unittest.TestCase):
             HISTORY_DIR=output / "_history",
         )
 
-    def test_beta3_report_fields_are_exposed_and_recolor_needs_real_file(self):
+    def test_report_features_are_exposed_and_recolor_needs_real_file(self):
         report = _base_report("new")
         report.update({
             "editability_schema": "ai-vector-cleanroom.editability/v2",
@@ -180,6 +180,44 @@ class WorkbenchBeta3Tests(unittest.TestCase):
         self.assertIsNone(item["designer_operations"]["total_operations"])
         self.assertEqual(item["recolor"], "")
 
+    def test_rejected_result_is_visible_but_never_presented_as_done(self):
+        report = _base_report("rejected")
+        report.update({
+            "acceptance_status": "rejected",
+            "visual_acceptance_status": "rejected",
+            "manual_review_required": True,
+            "visual_gate": {"reasons": ["多項失守：顏色、局部低分區"]},
+        })
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            input_dir = root / "input"
+            output = root / "output"
+            input_dir.mkdir()
+            image = input_dir / "rejected.png"
+            Image.new("RGB", (4, 4), "white").save(image)
+
+            def fake_process(_image, out_base, _args, output_dir):
+                _write_result(output_dir, out_base, report)
+                (output_dir / f"result_{out_base}.zip").write_bytes(b"zip")
+
+            jobs = [{"id": 1, "name": image.name, "status": "queued",
+                     "detail": "", "t": "00:00:00"}]
+            with mock.patch.multiple(
+                    workbench, INPUT_DIR=input_dir, OUTPUT_DIR=output,
+                    HISTORY_DIR=output / "_history", _jobs=jobs), \
+                    mock.patch.object(workbench.vc, "process_one",
+                                      side_effect=fake_process):
+                workbench._run_one(image, {}, requested_base="rejected",
+                                   job_id=1)
+                listed = workbench._list_results()[0]
+
+            self.assertEqual(jobs[0]["status"], "rejected")
+            self.assertIn("勿交付", jobs[0]["detail"])
+            self.assertTrue(listed["manual_review_required"])
+            self.assertEqual(listed["visual_acceptance_status"], "rejected")
+            self.assertIn("外觀未達標", workbench.APP_HTML)
+            self.assertIn("完成但需檢查", workbench.APP_HTML)
+
     def test_fallback_audit_counts_and_intermediate_scene_layout_are_supported(self):
         report = _base_report("fallback")
         report.update({
@@ -208,14 +246,14 @@ class WorkbenchBeta3Tests(unittest.TestCase):
                 "automatable": 0,
             },
         })
-        summary = workbench._beta3_report_summary(report)
+        summary = workbench._report_feature_summary(report)
         self.assertEqual(summary["scene"]["manifest_only_group_count"], 3)
         self.assertEqual(summary["paint"]["role_controls"], 2)
         self.assertEqual(summary["paint"]["paint_resources_total"], 7)
         self.assertEqual(summary["designer_operations"]["total_operations"], 5)
         self.assertEqual(summary["designer_operations"]["status"], "manual_review")
 
-    def test_blind_payload_and_visible_workbench_version_are_beta3(self):
+    def test_blind_payload_and_visible_workbench_version_are_beta5(self):
         report = _base_report("blind")
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder)
@@ -225,12 +263,15 @@ class WorkbenchBeta3Tests(unittest.TestCase):
                 page = workbench.build_blind_test()
                 body = page.read_text(encoding="utf-8")
 
-        self.assertIn("version:'v3-codex-beta.3'", body)
-        self.assertNotIn("v3-codex-beta.2", body)
-        self.assertIn("v3 Codex Beta.3", workbench.APP_HTML)
+        self.assertEqual(workbench.vc.TOOL_VERSION, "v3-codex-beta.5")
+        self.assertIn(
+            f"version:'{workbench.vc.TOOL_VERSION}'", body)
+        self.assertNotIn("v3-codex-beta.3", body)
+        self.assertNotIn("v3-codex-beta.4", body)
+        self.assertIn(workbench.vc.TOOL_VERSION, workbench.APP_HTML)
         self.assertIn('r.recolor', workbench.APP_HTML)
         self.assertIn('>換色</a>', workbench.APP_HTML)
-        self.assertIn('beta3Text(r)', workbench.APP_HTML)
+        self.assertIn('featureText(r)', workbench.APP_HTML)
         self.assertIn("通用結構把手", workbench.APP_HTML)
         self.assertIn("真人未驗", workbench.APP_HTML)
         self.assertIn("自動化準備", workbench.APP_HTML)

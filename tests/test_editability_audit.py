@@ -205,7 +205,7 @@ class EditabilityAuditTests(unittest.TestCase):
     def test_complex_color_layer_fixture_requires_manual_review(self):
         # 318 paths, 8,310 reported nodes, one 854-command path, 37 colour
         # layers and no drawable IDs reproduce the structural risk profile of
-        # the real-world Chiayi logo without embedding that large artifact.
+        # the real-world dark-wordmark logo without embedding that large artifact.
         long_path = "M0 0 " + " ".join(
             f"L{index % 100} {(index * 7) % 100}" for index in range(852)
         ) + " Z"
@@ -318,6 +318,7 @@ class EditabilityAuditTests(unittest.TestCase):
         self.assertIn("single_very_complex_path", details["risk_penalties"])
         self.assertIn("No visual-style or brush-texture discount",
                       details["penalty_combination"])
+
 
 if __name__ == "__main__":
     unittest.main()

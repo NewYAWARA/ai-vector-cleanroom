@@ -41,9 +41,29 @@ else:
     BASE = Path(__file__).resolve().parent
 
 EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-TOOL_VERSION = "v3-codex-beta.3"
+TOOL_VERSION = "v3-codex-beta.5"
 MATERIAL_FALLBACK_GAIN = 1.0
 RECONSTRUCTION_KEYS = ("strokes", "gradients", "geometry")
+_CANDIDATE_GAIN = {
+    "foreground": 1.0,
+    "color_fidelity": 1.0,
+    "detail_p10": 1.0,
+    "detail_mean": 1.0,
+    "topology_p10": 2.0,
+    "light_object_coverage": 2.0,
+}
+_CANDIDATE_REGRESSION_BUDGET = {
+    "foreground": 0.5,
+    "color_fidelity": 3.0,
+    # A topology-preserving candidate may move a few low-scoring grid cells
+    # while keeping glyphs/arcs whole.  Three points is the measured tea-logo
+    # tradeoff; foreground, colour, mean-detail and topology guards still cap
+    # every other regression.
+    "detail_p10": 3.0,
+    "detail_mean": 1.0,
+    "topology_p10": 2.0,
+    "light_object_coverage": 2.0,
+}
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -56,6 +76,222 @@ def find_inputs(input_dir: Path):
     input_dir.mkdir(parents=True, exist_ok=True)
     return sorted(p for p in input_dir.iterdir()
                   if p.is_file() and p.suffix.lower() in EXTS)
+
+
+def _apply_validation_hole_mask(image, hole_mask):
+    """Clear only stroke-proven negative space from a review/metric image.
+
+    The mask is produced by ``build_clean_base`` after it has identified a
+    native circle/rectangle stroke and applied the conservative broad-pocket
+    classifier.  Do not infer extra holes from light colour here: real white
+    lettering and highlights must remain opaque.  A nearest-neighbour resize
+    carries the trace-resolution decision to the native source reference.
+    """
+    import numpy as np
+    from PIL import Image
+
+    result = image.convert("RGBA").copy()
+    if hole_mask is None:
+        return result
+    mask = np.asarray(hole_mask, dtype=bool)
+    if mask.ndim != 2 or not mask.any():
+        return result
+    if (mask.shape[1], mask.shape[0]) != result.size:
+        resampling = getattr(Image, "Resampling", Image)
+        mask_image = Image.fromarray(mask.astype(np.uint8) * 255, "L")
+        mask_image = mask_image.resize(result.size, resampling.NEAREST)
+        mask = np.asarray(mask_image, dtype=np.uint8) >= 128
+    rgba = np.asarray(result).copy()
+    rgba[mask, 3] = 0
+    return Image.fromarray(rgba, "RGBA")
+
+
+def _candidate_metric_vector(item):
+    """Return the comparable visual evidence carried by one candidate.
+
+    Foreground coverage alone cannot distinguish a faithful glyph from a
+    centre-line reconstruction that occupies roughly the same pixels.  The
+    local grid and colour fields already exist in every real candidate; make
+    them first-class selection evidence instead of report-only diagnostics.
+    """
+    scores = item[4] if len(item) > 4 and isinstance(item[4], dict) else {}
+    detail = scores.get("detail_grid") or {}
+    topology = detail.get("component_topology") or {}
+    transparency = scores.get("transparent_light_fidelity") or {}
+
+    def number(value):
+        return float(value) if isinstance(value, (int, float)) else None
+
+    topology_p10 = (number(topology.get("p10_score_percent"))
+                    if int(topology.get("eligible_components") or 0) >= 8
+                    else None)
+    light_object_coverage = (
+        number(transparency.get("coverage_percent"))
+        if bool(transparency.get("applicable"))
+        and int(transparency.get("source_pixels") or 0) >= 64
+        else None)
+    return {
+        "foreground": number(item[1]),
+        "color_fidelity": number(scores.get("foreground_color_fidelity")),
+        "detail_p10": number(detail.get("p10_score_percent")),
+        "detail_mean": number(detail.get("mean_score_percent")),
+        "topology_p10": topology_p10,
+        "light_object_coverage": light_object_coverage,
+    }
+
+
+def _candidate_safely_dominates(candidate, other):
+    """True when candidate buys a material gain without hiding a regression."""
+    a = _candidate_metric_vector(candidate)
+    b = _candidate_metric_vector(other)
+    material_gain = False
+    comparable = False
+    for key, required_gain in _CANDIDATE_GAIN.items():
+        av, bv = a.get(key), b.get(key)
+        if av is None or bv is None:
+            continue
+        comparable = True
+        delta = av - bv
+        if delta < -_CANDIDATE_REGRESSION_BUDGET[key]:
+            return False
+        if delta >= required_gain:
+            material_gain = True
+    return comparable and material_gain
+
+
+def _evaluate_visual_gate(scores):
+    """Return an auditable accepted/manual-review/rejected visual verdict.
+
+    A single whole-logo percentage cannot protect small text, thin lines and
+    colour.  Nor can a white review canvas expose a white object that became a
+    transparent hole.  Rejection therefore also consumes the contrasting-
+    background light-object check when applicable.
+    """
+    scores = scores or {}
+    detail = scores.get("detail_grid") or {}
+    topology = detail.get("component_topology") or {}
+    transparency = scores.get("transparent_light_fidelity") or {}
+
+    def number(value):
+        return float(value) if isinstance(value, (int, float)) else None
+
+    local_applicable = int(detail.get("eligible_cells") or 0) >= 8
+    topology_applicable = int(topology.get("eligible_components") or 0) >= 8
+    transparency_applicable = (
+        bool(transparency.get("applicable"))
+        and int(transparency.get("source_pixels") or 0) >= 64)
+    metrics = {
+        "foreground": number(scores.get("foreground")),
+        "color_fidelity": number(scores.get("foreground_color_fidelity")),
+        "detail_p10": (number(detail.get("p10_score_percent"))
+                       if local_applicable else None),
+        "detail_mean": (number(detail.get("mean_score_percent"))
+                        if local_applicable else None),
+        "topology_p10": (number(topology.get("p10_score_percent"))
+                         if topology_applicable else None),
+        "light_object_coverage": (
+            number(transparency.get("coverage_percent"))
+            if transparency_applicable else None),
+    }
+    accept_at = {
+        "foreground": 88.0,
+        "color_fidelity": 85.0,
+        "detail_p10": 80.0,
+        "detail_mean": 88.0,
+        "topology_p10": 90.0,
+        "light_object_coverage": 95.0,
+    }
+    reject_below = {
+        "foreground": 60.0,
+        "color_fidelity": 70.0,
+        "detail_p10": 55.0,
+        "detail_mean": 75.0,
+        "topology_p10": 70.0,
+        "light_object_coverage": 85.0,
+    }
+    soft_below = {
+        "foreground": 85.0,
+        "color_fidelity": 85.0,
+        "detail_p10": 75.0,
+        "detail_mean": 88.0,
+        "topology_p10": 85.0,
+        "light_object_coverage": 95.0,
+    }
+    catastrophic = [
+        key for key, threshold in reject_below.items()
+        if metrics[key] is not None and metrics[key] < threshold
+    ]
+    soft = [
+        key for key, threshold in soft_below.items()
+        if metrics[key] is not None and metrics[key] < threshold
+    ]
+    required_metrics = ["foreground", "color_fidelity"]
+    if local_applicable:
+        required_metrics.extend(["detail_p10", "detail_mean"])
+    if topology_applicable:
+        required_metrics.append("topology_p10")
+    if transparency_applicable:
+        required_metrics.append("light_object_coverage")
+    acceptance_breaches = [
+        key for key in required_metrics
+        if metrics[key] is None or metrics[key] < accept_at[key]
+    ]
+    compound_local_failure = bool(
+        local_applicable
+        and metrics["detail_p10"] is not None
+        and metrics["detail_mean"] is not None
+        and metrics["detail_p10"] < accept_at["detail_p10"]
+        and metrics["detail_mean"] < accept_at["detail_mean"]
+    )
+    if catastrophic or len(soft) >= 2 or compound_local_failure:
+        status = "rejected"
+    elif acceptance_breaches:
+        status = "manual_review"
+    else:
+        status = "accepted"
+
+    label = {
+        "foreground": "整體前景",
+        "color_fidelity": "顏色",
+        "detail_p10": "局部低分區",
+        "detail_mean": "局部平均",
+        "topology_p10": "元件連續性",
+        "light_object_coverage": "透明底白／淺色物件",
+    }
+    reasons = []
+    if catastrophic:
+        reasons.append("嚴重失守：" + "、".join(label[k] for k in catastrophic))
+    if len(soft) >= 2:
+        reasons.append("多項失守：" + "、".join(label[k] for k in soft))
+    if compound_local_failure and len(soft) < 2:
+        reasons.append("局部低分區與局部平均同時未達驗收門檻")
+    if status == "manual_review":
+        reasons.append("未達自動驗收：" + "、".join(
+            label[k] for k in acceptance_breaches))
+    return {
+        "status": status,
+        "metrics": metrics,
+        "applicability": {
+            "local_detail": local_applicable,
+            "component_topology": topology_applicable,
+            "transparent_light_objects": transparency_applicable,
+            "eligible_cells": int(detail.get("eligible_cells") or 0),
+            "eligible_components": int(topology.get("eligible_components") or 0),
+            "transparent_light_source_pixels": int(
+                transparency.get("source_pixels") or 0),
+        },
+        "acceptance_thresholds": accept_at,
+        "catastrophic_rejection_thresholds": reject_below,
+        "multi_metric_rejection_thresholds": soft_below,
+        "acceptance_breaches": acceptance_breaches,
+        "catastrophic_breaches": catastrophic,
+        "soft_breaches": soft,
+        "compound_local_failure": compound_local_failure,
+        "reasons": reasons,
+        "policy": (
+            "reject_one_catastrophic_two_independent_soft_or_compound_local_failure"
+        ),
+    }
 
 
 def _select_viable_candidate(viable, requested_options,
@@ -71,9 +307,44 @@ def _select_viable_candidate(viable, requested_options,
     """
     if not viable:
         raise ValueError("no viable candidates")
-    best_quality = max(item[1] for item in viable)
-    tied = [item for item in viable
-            if item[1] >= best_quality - material_gain]
+    # A numerically stronger but explicitly rejected build must never displace
+    # a candidate that is at least safe enough for manual review.  Select the
+    # best visual-gate tier first; only then compare Pareto trade-offs and
+    # requested editing features inside that tier.  Doing this after dominance
+    # would be too late because a rejected candidate could already eliminate
+    # the safer one.
+    status_rank = {"rejected": 0, "manual_review": 1, "accepted": 2}
+    visual_status = {
+        id(item): _evaluate_visual_gate(item[4])["status"] for item in viable
+    }
+    best_visual_status_rank = max(
+        status_rank.get(visual_status[id(item)], 0) for item in viable)
+    visual_tier = [
+        item for item in viable
+        if status_rank.get(visual_status[id(item)], 0)
+        == best_visual_status_rank
+    ]
+
+    # Remove candidates that are measurably worse on the multi-axis visual
+    # evidence.  This is deliberately asymmetric: a tiny foreground gain no
+    # longer excuses broken local detail, while a local-detail win may spend
+    # only tightly bounded foreground/colour regressions.  The old feature-
+    # retention tie-break remains for genuinely equivalent candidates.
+    survivors = [
+        item for item in viable
+        if not any(
+            other is not item and _candidate_safely_dominates(other, item)
+            for other in visual_tier
+        )
+    ]
+    survivors = [item for item in survivors if item in visual_tier]
+    survivors = survivors or list(visual_tier)
+    # Every survivor represents a real Pareto trade-off.  Re-applying the old
+    # scalar foreground window here would undo the safety pruning (for
+    # example, a 1.2 foreground gain could still hide a 2.5-point local-detail
+    # loss).  Feature retention is therefore allowed only among these
+    # non-dominated candidates.
+    tied = survivors
 
     def retention(item):
         options = item[2]
@@ -84,15 +355,31 @@ def _select_viable_candidate(viable, requested_options,
         )
 
     selected = max(tied, key=lambda item: (retention(item), item[0], item[1]))
+    visual_status_counts = {
+        status: sum(1 for item in viable
+                    if visual_status[id(item)] == status)
+        for status in ("accepted", "manual_review", "rejected")
+    }
     return selected, {
         "material_visual_gain_required": material_gain,
-        "best_visual_quality": best_quality,
+        "best_visual_quality": max(item[1] for item in viable),
         "selected_visual_quality": selected[1],
         "selected_requested_features_retained": retention(selected),
         "requested_features_total": sum(
             1 for key in RECONSTRUCTION_KEYS
             if requested_options.get(key) not in (None, "off")),
-        "policy": "preserve_requested_features_within_visual_tie",
+        "best_visual_status": visual_status[id(visual_tier[0])],
+        "selected_visual_status": visual_status[id(selected)],
+        "visual_status_counts": visual_status_counts,
+        "visual_status_survivor_count": len(visual_tier),
+        "policy": "visual_gate_tier_then_safe_dominance_then_preserve_features",
+        "dominance_budgets": {
+            "material_gain": dict(_CANDIDATE_GAIN),
+            "maximum_regression": dict(_CANDIDATE_REGRESSION_BUDGET),
+        },
+        "survivor_count": len(survivors),
+        "candidate_count": len(viable),
+        "selected_metric_vector": _candidate_metric_vector(selected),
     }
 
 
@@ -139,23 +426,57 @@ def _paint_gradients(png_path: Path, gradient_info):
     arr = np.asarray(im).astype(np.int16)
     h, w, _ = arr.shape
     out = arr.copy()
-    for g in gradient_info:
+    parsed_keys = [
+        np.array([int(g["key"][1:3], 16), int(g["key"][3:5], 16),
+                  int(g["key"][5:7], 16)], dtype=np.int16)
+        for g in gradient_info
+    ]
+    # Assign every rendered pixel to at most one placeholder before growing
+    # antialiased fringes.  This prevents sequential gradient passes from
+    # repainting one another even when an old file contains poorly-spaced keys.
+    owner = np.full((h, w), -1, dtype=np.int16)
+    best_distance = np.full((h, w), 32767, dtype=np.int16)
+    for gi, key in enumerate(parsed_keys):
+        distance = np.abs(arr - key).max(axis=2)
+        better = distance < best_distance
+        owner[better] = gi
+        best_distance[better] = distance[better]
+
+    for gi, (g, key) in enumerate(zip(gradient_info, parsed_keys)):
         vb_w = float(g["viewbox"][0])
         f = w / vb_w if vb_w else 1.0
-        key = np.array([int(g["key"][1:3], 16), int(g["key"][3:5], 16),
-                        int(g["key"][5:7], 16)], dtype=np.int16)
-        mask = (np.abs(arr - key).max(axis=2) <= 10)
+        # Thin traced slivers may be entirely antialiased and never contain an
+        # exact placeholder pixel.  The allocator keeps real palette colours
+        # at least 48 levels away, so a 47-level seed safely recovers those
+        # disconnected slivers without mistaking an ordinary solid fill for a
+        # gradient key.
+        isolation = max(2, int(g.get("key_distance", 48)))
+        seed_limit = min(47, isolation - 1)
+        mask = (owner == gi) & (best_distance <= seed_limit)
+        # Absorb the whole connected antialiased component, not merely three
+        # spatial hops.  Long sub-pixel slivers can otherwise retain a purple
+        # placeholder tail even though their first pixels were recognised.
+        # The key's measured palette isolation caps the flood strictly before
+        # any genuine solid colour can join it.
+        distance = np.abs(arr - key).max(axis=2)
+        near_limit = min(96, isolation - 1)
+        near = (owner == gi) & (distance <= near_limit)
+        if isolation > 96:
+            # With this much measured clearance, every near-key pixel is an
+            # internal placeholder contribution.  This also recovers a tiny
+            # disconnected sliver whose raster contains no strong seed at all.
+            mask = near
+        else:
+            if not mask.any():
+                continue
+            from stroke_engine import connected_components
+            labels, _ = connected_components(near)
+            keep = np.unique(labels[mask])
+            keep = keep[keep != 0]
+            if len(keep):
+                mask = np.isin(labels, keep)
         if not mask.any():
             continue
-        # absorb the antialiased fringe around the keyed region
-        near = np.abs(arr - key).max(axis=2) <= 120
-        for _ in range(3):
-            grow = mask.copy()
-            grow[1:, :] |= mask[:-1, :]
-            grow[:-1, :] |= mask[1:, :]
-            grow[:, 1:] |= mask[:, :-1]
-            grow[:, :-1] |= mask[:, 1:]
-            mask = (grow & near) | mask
         ys, xs = np.nonzero(mask)
         x1, y1 = g["x1"] * f, g["y1"] * f
         x2, y2 = g["x2"] * f, g["y2"] * f
@@ -277,7 +598,8 @@ def render_svg_png(svg_path: Path, png_path: Path, size=2000, bg=0xffffff,
 
 
 def validate_svg_stage_renders(before_svg: Path, after_svg: Path, stage: str,
-                               gradient_info=None):
+                               gradient_info=None, *, render_cache=None,
+                               render_size=None):
     """Renderer-backed transaction guard for SVG post-processing.
 
     Exact stages must be pixel-identical.  Annulus regularisation is allowed
@@ -287,22 +609,61 @@ def validate_svg_stage_renders(before_svg: Path, after_svg: Path, stage: str,
     remain authoritative and the report says so explicitly.
     """
 
+    validation_width = max(1, int(render_size or SELF_CHECK_MAX_SIDE))
     safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "-", stage)
     before_png = before_svg.with_name(before_svg.stem + f"-{safe_stage}-render.png")
     after_png = after_svg.with_name(after_svg.stem + f"-{safe_stage}-render.png")
+
+    def _cache_key(svg_path):
+        if render_cache is None:
+            return None
+        import hashlib
+        gradient_payload = json.dumps(
+            gradient_info or [], ensure_ascii=True, sort_keys=True,
+            separators=(",", ":"), default=str).encode("utf-8")
+        digest = hashlib.sha256()
+        digest.update(b"ai-vector-cleanroom-stage-render-v1\0")
+        digest.update(str(validation_width).encode("ascii"))
+        digest.update(b"\0ffffff\0")
+        digest.update(gradient_payload)
+        digest.update(b"\0")
+        # Path.write_text uses CRLF on Windows while the committed candidate
+        # is written from UTF-8 bytes with LF.  XML normalises literal line
+        # endings before parsing, so canonicalise them in the cache identity;
+        # otherwise the same document is needlessly rendered twice.
+        svg_bytes = Path(svg_path).read_bytes()
+        svg_bytes = svg_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        digest.update(svg_bytes)
+        return digest.hexdigest()
+
+    def _render(svg_path, png_path):
+        key = _cache_key(svg_path)
+        if key is not None:
+            cached = render_cache.get(key)
+            if isinstance(cached, bytes) and cached:
+                png_path.write_bytes(cached)
+                return True, True
+        rendered = render_svg_png(
+            svg_path, png_path, size=validation_width,
+            gradient_info=gradient_info)
+        if rendered and key is not None and png_path.is_file():
+            render_cache[key] = png_path.read_bytes()
+        return rendered, False
+
     try:
-        rendered_before = render_svg_png(
-            before_svg, before_png, size=SELF_CHECK_MAX_SIDE,
-            gradient_info=gradient_info)
-        rendered_after = render_svg_png(
-            after_svg, after_png, size=SELF_CHECK_MAX_SIDE,
-            gradient_info=gradient_info)
+        rendered_before, before_cache_hit = _render(before_svg, before_png)
+        rendered_after, after_cache_hit = _render(after_svg, after_png)
         if not (rendered_before and rendered_after):
             return {
                 "accepted": True,
                 "external_render_check": "unavailable",
                 "validation_level": "internal_invariants",
                 "reason": "optional SVG renderer unavailable",
+                "validation_render_width_px": validation_width,
+                "render_cache_hits": {
+                    "before": before_cache_hit,
+                    "after": after_cache_hit,
+                },
             }
         from annulus_detector import compare_rendered_pngs
         exact = stage.endswith("_exact")
@@ -312,20 +673,30 @@ def validate_svg_stage_renders(before_svg: Path, after_svg: Path, stage: str,
             import hashlib
             from PIL import Image
             with Image.open(before_png) as image:
+                before_size = image.size
                 before_pixels = image.convert("RGBA").tobytes()
             with Image.open(after_png) as image:
+                after_size = image.size
                 after_pixels = image.convert("RGBA").tobytes()
             before_hash = hashlib.sha256(before_pixels).hexdigest()
             after_hash = hashlib.sha256(after_pixels).hexdigest()
             metrics["exact_before_pixel_sha256"] = before_hash
             metrics["exact_after_pixel_sha256"] = after_hash
-            metrics["exact_pixel_array_equal"] = before_hash == after_hash
+            metrics["exact_before_render_size_px"] = list(before_size)
+            metrics["exact_after_render_size_px"] = list(after_size)
+            metrics["exact_pixel_array_equal"] = (
+                before_size == after_size and before_hash == after_hash)
             metrics["accepted"] = metrics["exact_pixel_array_equal"]
             metrics["required_equivalence"] = "pixel_array_exact_at_validation_resolution"
         else:
             metrics["required_equivalence"] = "bidirectional_1px_99_percent"
         metrics["external_render_check"] = "completed"
         metrics["validation_level"] = "renderer_and_internal_invariants"
+        metrics["validation_render_width_px"] = validation_width
+        metrics["render_cache_hits"] = {
+            "before": before_cache_hit,
+            "after": after_cache_hit,
+        }
         return metrics
     finally:
         before_png.unlink(missing_ok=True)
@@ -333,6 +704,27 @@ def validate_svg_stage_renders(before_svg: Path, after_svg: Path, stage: str,
 
 
 SELF_CHECK_MAX_SIDE = 2048
+
+
+def _validation_render_width(viewbox, *, max_longest=SELF_CHECK_MAX_SIDE,
+                             min_longest=512):
+    """Return renderer width for a bounded, aspect-preserving guard image."""
+
+    try:
+        if not viewbox or len(viewbox) < 2:
+            raise ValueError("missing viewBox")
+        source_width = float(viewbox[0])
+        source_height = float(viewbox[1])
+        if (not math.isfinite(source_width) or not math.isfinite(source_height)
+                or source_width <= 0 or source_height <= 0):
+            raise ValueError("invalid viewBox")
+    except (TypeError, ValueError, OverflowError):
+        return max(1, int(max_longest))
+    source_longest = max(source_width, source_height)
+    validation_longest = max(
+        float(min_longest), min(float(max_longest), source_longest))
+    return max(
+        1, int(round(source_width * validation_longest / source_longest)))
 
 
 def _match_percent(render_png: Path, reference_png: Path,
@@ -508,6 +900,118 @@ def _match_percent(render_png: Path, reference_png: Path,
     return details if return_details else score
 
 
+def _source_has_transparent_light_objects(source_png: Path,
+                                          minimum_pixels=64):
+    """Cheaply decide whether the contrasting-background render is needed."""
+    from PIL import Image
+    import numpy as np
+
+    try:
+        with Image.open(source_png) as source_image:
+            source = np.asarray(source_image.convert("RGBA"), dtype=np.uint8)
+        alpha = source[:, :, 3]
+        if not bool((alpha < 250).any()):
+            return False
+        light = (
+            (alpha >= 128)
+            & (source[:, :, :3].mean(axis=2) >= 210.0)
+            & (source[:, :, :3].min(axis=2) >= 185)
+        )
+        padded = np.pad(light, 1, mode="constant", constant_values=False)
+        core = np.ones_like(light, dtype=bool)
+        for dy in range(3):
+            for dx in range(3):
+                core &= padded[dy:dy + light.shape[0],
+                               dx:dx + light.shape[1]]
+        return int(core.sum()) >= int(minimum_pixels)
+    except Exception:
+        return False
+
+
+def _transparent_light_fidelity(render_png: Path, source_png: Path,
+                                background=(91, 75, 138)):
+    """Measure whether internal white/light objects stay opaque on colour.
+
+    A one-pixel white matte around otherwise coloured artwork is an
+    antialiasing boundary, not a white design object.  Light objects are
+    therefore measured on a one-pixel-eroded core.  Images without a stable
+    light core stay outside this specialised gate; their thin details remain
+    covered by the bidirectional foreground, detail-grid and topology gates.
+    """
+    from PIL import Image
+    import numpy as np
+
+    with Image.open(render_png) as rendered_image:
+        rendered = np.asarray(rendered_image.convert("RGB"), dtype=np.float32)
+    with Image.open(source_png) as source_image:
+        source_rgba = source_image.convert("RGBA")
+        if source_rgba.size != (rendered.shape[1], rendered.shape[0]):
+            source_rgba = source_rgba.resize(
+                (rendered.shape[1], rendered.shape[0]), Image.Resampling.LANCZOS)
+        source = np.asarray(source_rgba, dtype=np.float32)
+    alpha = source[:, :, 3] / 255.0
+    has_transparency = bool((alpha < 0.98).any())
+    light = (
+        (alpha >= 0.5)
+        & (source[:, :, :3].mean(axis=2) >= 210.0)
+        & (source[:, :, :3].min(axis=2) >= 185.0)
+    )
+    source_pixels = int(light.sum())
+    core = np.ones_like(light, dtype=bool)
+    padded = np.pad(light, 1, mode="constant", constant_values=False)
+    for dy in range(3):
+        for dx in range(3):
+            core &= padded[dy:dy + light.shape[0],
+                           dx:dx + light.shape[1]]
+    core_pixels = int(core.sum())
+    measurement = core
+    measurement_pixels = core_pixels
+    if not has_transparency or core_pixels < 64:
+        return {
+            "applicable": False,
+            "source_pixels": source_pixels,
+            "core_pixels": core_pixels,
+            "measurement_pixels": 0,
+            "measurement_mask": None,
+            "spatial_tolerance_px": None,
+            "coverage_percent": None,
+            "non_background_coverage_percent": None,
+            "mean_color_error": None,
+            "p90_color_error": None,
+            "match_tolerance_rgb": 48,
+            "error_metric": "max_channel_rgb",
+            "background_rgb": list(background),
+            "inapplicable_reason": (
+                "source_is_opaque" if not has_transparency
+                else "fewer_than_64_stable_light_core_pixels"),
+        }
+    bg = np.asarray(background, dtype=np.float32)
+    expected = (source[:, :, :3] * alpha[:, :, None]
+                + bg.reshape(1, 1, 3) * (1.0 - alpha[:, :, None]))
+    error = np.abs(rendered - expected).max(axis=2)
+    distance_from_background = np.abs(
+        rendered - bg.reshape(1, 1, 3)).max(axis=2)
+    return {
+        "applicable": True,
+        "source_pixels": source_pixels,
+        "core_pixels": core_pixels,
+        "measurement_pixels": measurement_pixels,
+        "measurement_mask": "one_pixel_eroded_light_core",
+        "spatial_tolerance_px": 0,
+        "coverage_percent": round(
+            float((error[measurement] <= 48.0).mean() * 100.0), 3),
+        "non_background_coverage_percent": round(float(
+            (distance_from_background[measurement] > 32.0).mean() * 100.0), 3),
+        "mean_color_error": round(float(error[measurement].mean()), 3),
+        "p90_color_error": round(
+            float(np.percentile(error[measurement], 90)), 3),
+        "match_tolerance_rgb": 48,
+        "error_metric": "max_channel_rgb",
+        "background_rgb": [int(value) for value in background],
+        "policy": "eroded_core_expected_light_colour_match",
+    }
+
+
 def self_check(svg_path: Path, flat_png: Path, source_png: Path,
                gradient_info=None, keep_render: Path = None, viewbox=None):
     """Render the SVG back and compare it against the references.
@@ -525,7 +1029,19 @@ def self_check(svg_path: Path, flat_png: Path, source_png: Path,
            "foreground_coverage_f1": None,
            "foreground_color_fidelity": None,
            "source_ink_pixels": None, "render_ink_pixels": None,
-           "ink_threshold": None, "detail_grid": None, "hotspots": []}
+           "ink_threshold": None, "detail_grid": None, "hotspots": [],
+           "transparent_light_fidelity": {
+               "applicable": False, "source_pixels": 0,
+               "core_pixels": 0, "measurement_pixels": 0,
+               "measurement_mask": None, "spatial_tolerance_px": None,
+               "coverage_percent": None, "mean_color_error": None,
+               "p90_color_error": None,
+               "non_background_coverage_percent": None,
+               "match_tolerance_rgb": 48,
+               "error_metric": "max_channel_rgb",
+               "background_rgb": [91, 75, 138],
+               "inapplicable_reason": "not_evaluated",
+           }}
     try:
         tmp = svg_path.parent / "_selfcheck.png"
         # Render at the comparison resolution when possible.  Rendering every
@@ -570,6 +1086,17 @@ def self_check(svg_path: Path, flat_png: Path, source_png: Path,
             out["hotspots"] = diag["hotspots"]
         except Exception:
             pass
+        if _source_has_transparent_light_objects(source_png):
+            try:
+                contrast_tmp = svg_path.parent / "_selfcheck_contrast.png"
+                if render_svg_png(
+                        svg_path, contrast_tmp, size=render_width, bg=0x5b4b8a,
+                        gradient_info=gradient_info):
+                    out["transparent_light_fidelity"] = (
+                        _transparent_light_fidelity(contrast_tmp, source_png))
+                contrast_tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
         if keep_render is not None:
             try:
                 tmp.replace(keep_render)
@@ -580,6 +1107,165 @@ def self_check(svg_path: Path, flat_png: Path, source_png: Path,
     except Exception:
         pass
     return out
+
+
+def _attempt_isolated_component_repair(
+        svg_path: Path, flat_png: Path, source_png: Path, stats,
+        before_scores: dict, before_render: Path):
+    """Propose, render and transactionally commit safe missing components.
+
+    The live candidate is never touched until a separate proposal SVG has
+    passed the same visual gate, per-metric non-regression checks, complete
+    failed-component evidence and an exact outside-bbox render guard.
+    """
+
+    import hashlib
+
+    from component_repair import (
+        append_repair_fragment,
+        propose_missing_component_repairs,
+        validate_repair_transaction,
+    )
+    from svg_postprocess import atomic_replace_bytes
+
+    topology = ((before_scores.get("detail_grid") or {}).get(
+        "component_topology") or {})
+    failed_examples = topology.get("failed_examples")
+    base_audit = {
+        "schema": "ai-vector-cleanroom.component-repair/v1",
+        "status": "not_needed",
+        "policy": "safe_proposal_render_validate_atomic_commit",
+        "failed_examples_received": (
+            len(failed_examples) if isinstance(failed_examples, list) else 0),
+        "repair_count": 0,
+        "path_count": 0,
+        "node_count": 0,
+        "repairs": [],
+        "proposal": None,
+        "transaction": None,
+    }
+    if not isinstance(failed_examples, list):
+        base_audit.update({
+            "status": "skipped",
+            "reason": "complete_failed_examples_unavailable",
+        })
+        return before_scores, base_audit
+    if not failed_examples:
+        return before_scores, base_audit
+    missing_like = []
+    for example in failed_examples:
+        if not isinstance(example, dict):
+            continue
+        try:
+            score = float(example.get("score_percent"))
+            coverage = float(example.get("coverage_percent"))
+            fragments = int(example.get("fragment_count"))
+        except (TypeError, ValueError):
+            continue
+        if (math.isfinite(score) and math.isfinite(coverage)
+                and score <= 5.0 and coverage <= 5.0 and fragments == 0):
+            missing_like.append(example)
+    base_audit["completely_missing_examples"] = len(missing_like)
+    if not missing_like:
+        base_audit.update({
+            "status": "skipped",
+            "reason": "no_completely_missing_components",
+        })
+        return before_scores, base_audit
+    if not before_render.is_file():
+        base_audit.update({
+            "status": "skipped",
+            "reason": "before_render_unavailable",
+        })
+        return before_scores, base_audit
+
+    original_bytes = svg_path.read_bytes()
+    original_sha = hashlib.sha256(original_bytes).hexdigest()
+    proposal_path = svg_path.with_name("_component_repair_proposal.svg")
+    after_render = svg_path.with_name("_component_repair_after.png")
+    try:
+        proposal = propose_missing_component_repairs(
+            source_png, before_render, flat_png, missing_like,
+            viewbox=stats.viewbox)
+        base_audit["proposal"] = proposal.get("audit")
+        base_audit["before_svg_sha256"] = original_sha
+        if proposal.get("status") != "proposed":
+            base_audit.update({
+                "status": "skipped",
+                "reason": (proposal.get("audit") or {}).get(
+                    "skipped_reason", "no_safe_components"),
+            })
+            return before_scores, base_audit
+
+        proposal_bytes = append_repair_fragment(
+            original_bytes, proposal["svg_fragment"])
+        proposal_sha = hashlib.sha256(proposal_bytes).hexdigest()
+        atomic_replace_bytes(proposal_path, proposal_bytes)
+        after_scores = self_check(
+            proposal_path, flat_png, source_png,
+            gradient_info=stats.gradient_info,
+            keep_render=after_render, viewbox=stats.viewbox)
+        before_gate = _evaluate_visual_gate(before_scores)
+        after_gate = _evaluate_visual_gate(after_scores)
+        transaction = validate_repair_transaction(
+            proposal, before_scores, after_scores, before_gate, after_gate,
+            before_render, after_render)
+        base_audit["transaction"] = transaction
+        public_repairs = [
+            {key: value for key, value in repair.items() if key != "path"}
+            for repair in proposal.get("repairs", [])
+        ]
+        base_audit.update({
+            "proposal_svg_sha256": proposal_sha,
+            "repair_count": int(proposal.get("repair_count") or 0),
+            "path_count": int(proposal.get("path_count") or 0),
+            "node_count": int(proposal.get("node_count") or 0),
+            "repairs": public_repairs,
+        })
+        if transaction.get("status") != "accepted":
+            base_audit.update({
+                "status": "rolled_back",
+                "reason": "transaction_guard_rejected",
+                "after_svg_sha256": original_sha,
+                "live_svg_unchanged": svg_path.read_bytes() == original_bytes,
+            })
+            return before_scores, base_audit
+
+        atomic_replace_bytes(svg_path, proposal_bytes)
+        committed_bytes = svg_path.read_bytes()
+        committed_sha = hashlib.sha256(committed_bytes).hexdigest()
+        if committed_bytes != proposal_bytes:
+            raise OSError("atomic component repair commit did not preserve bytes")
+        stats.n_paths += int(proposal.get("path_count") or 0)
+        stats.n_nodes += int(proposal.get("node_count") or 0)
+        stats.geometry_notes.append(
+            f"{proposal.get('repair_count', 0)} isolated missing component(s) "
+            "restored by renderer-validated local trace")
+        base_audit.update({
+            "status": "committed",
+            "reason": None,
+            "after_svg_sha256": committed_sha,
+            "live_svg_unchanged": False,
+        })
+        return after_scores, base_audit
+    except Exception as exc:
+        # The proposal path is separate and the only live write occurs after
+        # validation.  If that final atomic replace itself fails, its helper
+        # guarantees the previous target remains intact.
+        current_bytes = svg_path.read_bytes() if svg_path.is_file() else b""
+        base_audit.update({
+            "status": "error",
+            "reason": "component_repair_exception",
+            "error": repr(exc)[:240],
+            "after_svg_sha256": (
+                hashlib.sha256(current_bytes).hexdigest()
+                if current_bytes else None),
+            "live_svg_unchanged": current_bytes == original_bytes,
+        })
+        return before_scores, base_audit
+    finally:
+        proposal_path.unlink(missing_ok=True)
+        after_render.unlink(missing_ok=True)
 
 
 REVIEW_PREVIEW_MAX_SIDE = 1600
@@ -658,10 +1344,16 @@ def make_review_html(out: Path, name: str, original_png: Path, svg_text: str,
         f"({native_detail}) · "
         f"{st.get('strokes', 0)} strokes · "
         f"{st.get('gradients', 0)} gradients · {st.get('nodes', 0)} nodes")
+    rejected = (acceptance_status == "rejected"
+                or visual_acceptance_status == "rejected")
     manual_review = (manual_review_required
-                     or acceptance_status == "manual_review")
-    gate_class = "manual" if manual_review else "accepted"
-    if manual_review:
+                     or acceptance_status != "accepted")
+    gate_class = ("rejected" if rejected
+                  else "manual" if manual_review else "accepted")
+    if rejected:
+        gate_text = ("未達標：此檔只供診斷，請勿交付設計師或客戶。"
+                     "請查看熱區後重跑或改採人工描繪")
+    elif manual_review:
         visual_text = ("通過" if visual_acceptance_status == "accepted"
                        else "需檢查")
         edit_text = ("通過" if editability_status == "accepted"
@@ -745,6 +1437,7 @@ REVIEW_TEMPLATE = """<!doctype html>
  .gate{margin:8px 0 10px;padding:7px 9px;border-radius:6px;font-weight:700}
  .gate.accepted{background:#e8f5e9;color:#1b5e20;border:1px solid #a5d6a7}
  .gate.manual{background:#fff3e0;color:#b71c1c;border:2px solid #e65100}
+ .gate.rejected{background:#ffebee;color:#8e0000;border:3px solid #b71c1c}
  @keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
  .hlrect{animation:blink .5s 3}
 </style></head><body>
@@ -991,13 +1684,49 @@ def _paint_resource_summary(stats):
     layers = []
     solids = {}
     gradients = list(getattr(stats, "gradient_info", ()) or ())
-    gradient_index = 0
+
+    # A gradient paint can occur in more than one non-contiguous stack run.
+    # ``stats.palette`` records every run, while ``gradient_info`` records the
+    # unique SVG resources.  Resolve a run through the real middle stop used
+    # by clean_base for its presentation colour; never let an extra gradient
+    # run fall through and masquerade as a solid paint.
+    gradients_by_palette_hex = {}
+    for gradient in gradients:
+        stops = list(gradient.get("stops", ()) or ())
+        if not stops:
+            continue
+        try:
+            middle = min(
+                stops,
+                key=lambda stop: abs(float(stop.get("offset", 0.0)) - 0.5),
+            )
+        except (AttributeError, TypeError, ValueError):
+            continue
+        hx = str(middle.get("color", "")).lower()
+        if re.fullmatch(r"#[0-9a-f]{6}", hx):
+            gradients_by_palette_hex.setdefault(hx, []).append(gradient)
+    assigned_gradient_ids = set()
+
     for name, value in (getattr(stats, "palette", ()) or ()):
-        if str(name).lower().startswith("gradient") and gradient_index < len(gradients):
-            gradient = gradients[gradient_index]
-            gradient_index += 1
+        if str(name).lower().startswith("gradient"):
+            hx = str(value).lower()
+            candidates = gradients_by_palette_hex.get(hx, ())
+            gradient = next(
+                (item for item in candidates
+                 if item.get("id", "") not in assigned_gradient_ids),
+                candidates[0] if candidates else None,
+            )
+            if gradient is None:
+                gradient = next(
+                    (item for item in gradients
+                     if item.get("id", "") not in assigned_gradient_ids),
+                    None,
+                )
+            gradient_id = gradient.get("id", "") if gradient else ""
+            if gradient_id:
+                assigned_gradient_ids.add(gradient_id)
             layers.append({"name": name, "type": "linearGradient",
-                           "gradient_id": gradient.get("id", "")})
+                           "gradient_id": gradient_id})
             continue
         hx = str(value).lower()
         layers.append({"name": name, "type": "solid", "hex": hx})
@@ -1102,7 +1831,15 @@ Self-check scores
     foreground = (f"{scores['foreground']:.1f}%"
                   if scores and isinstance(scores.get("foreground"), (int, float))
                   else "n/a")
-    if acceptance_status == "manual_review":
+    if acceptance_status == "rejected":
+        acceptance_line = "rejected：未達標，僅保留作診斷，請勿交付"
+        acceptance_warning = (
+            "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            "未達標／勿交付：外觀品質閘門偵測到多項或嚴重失守。\n"
+            "請先開啟 review.html 查看差異，再重跑或改採人工描繪。\n"
+            "SVG 雖為真正向量路徑，但不代表本次近似結果可用。\n"
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    elif acceptance_status == "manual_review":
         acceptance_line = "manual_review"
         visual_line = ("accepted" if visual_acceptance_status == "accepted"
                        else "manual_review")
@@ -1132,8 +1869,8 @@ Self-check scores
     role_counts = (paint_role_report or {}).get("resource_counts", {})
     ops = (designer_operations or {}).get("summary", {})
     enhancement_block = f"""
-Beta.3 editability enhancements
--------------------------------
+Beta.5 fidelity, topology and editability enhancements
+---------------------------------------------
   - Native annulus replacements: {int(annulus.get('applied_candidates', 0) or 0)}
   - Pixel-exact path-to-native conversions: {int(exact_native.get('committed_candidate_count', 0) or 0)} ({int(exact_native.get('committed_line_count', 0) or 0)} lines, {int(exact_native.get('committed_polyline_count', 0) or 0)} polylines)
   - Additional independently selectable paths: +{int(compound.get('selectable_path_delta', 0) or 0)}
@@ -1247,10 +1984,11 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
         "max_size": args.max_size,
     }
 
-    # 1) Source reference for review plus a stricter validation reference.
-    # The ordinary 220 light-background threshold can classify a deliberate
-    # #dddddd/#ebebeb mark as background. Validation therefore keeps the raw
-    # background; the chosen candidate still follows the requested option.
+    # 1) Source reference for review.  Candidate validation must use the same
+    # background mode as that candidate: scoring an auto-cleaned logo against
+    # the deliberately retained AI paper glow mistakes removable background
+    # texture for lost vector detail.  Low-contrast enclosed marks still remain
+    # in the auto-cleaned reference and have their ordinary source-ink score.
     clean_img, _sz, removed = _prepare_image(
         img_path, max_size=0, background=args.background,
         white_threshold=args.white_threshold, alpha_threshold=12)
@@ -1258,12 +1996,51 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
     clean_img.save(ref_png)
     msg = " (outer light/checker background removed)" if removed else ""
     print(f"  Source reference OK{msg}")
-    metric_ref = deliver / "_metric_reference.png"
-    metric_threshold = max(args.white_threshold, 250)
-    metric_img, _metric_sz, _metric_removed = _prepare_image(
-        img_path, max_size=0, background="keep",
-        white_threshold=metric_threshold, alpha_threshold=2)
-    metric_img.save(metric_ref)
+    metric_refs = {}
+
+    def _metric_reference(options, hole_mask=None):
+        mode = options["background"]
+        threshold = int(options["white_threshold"])
+        base_key = ("base", mode, threshold)
+        if base_key not in metric_refs:
+            safe_mode = re.sub(r"[^a-z0-9_-]+", "_", mode.lower())
+            path = deliver / f"_metric_reference_{safe_mode}_{threshold}.png"
+            metric_img, _metric_sz, _metric_removed = _prepare_image(
+                img_path, max_size=0, background=mode,
+                white_threshold=threshold, alpha_threshold=2)
+            metric_img.save(path)
+            metric_refs[base_key] = path
+        base_path = metric_refs[base_key]
+
+        # The circle/rectangle hole guard runs after stroke extraction, so the
+        # raw prepared reference cannot know about its decision.  Reuse that
+        # exact mask for candidate scoring instead of reclassifying light
+        # pixels here.  This keeps white letters/emblems opaque while removing
+        # only the broad canvas-coloured pocket the SVG itself omitted.
+        if hole_mask is None:
+            return base_path
+        import hashlib
+        import numpy as np
+        from PIL import Image
+        mask = np.asarray(hole_mask, dtype=bool)
+        if mask.ndim != 2 or not mask.any():
+            return base_path
+        packed = np.packbits(mask.reshape(-1), bitorder="little").tobytes()
+        digest = hashlib.sha256(
+            f"{mask.shape[0]}x{mask.shape[1]}:".encode("ascii") + packed
+        ).hexdigest()[:16]
+        hole_key = ("holes", mode, threshold, digest)
+        if hole_key not in metric_refs:
+            safe_mode = re.sub(r"[^a-z0-9_-]+", "_", mode.lower())
+            path = deliver / (
+                f"_metric_reference_{safe_mode}_{threshold}_holes_{digest}.png")
+            with Image.open(base_path) as metric_img:
+                canonical = _apply_validation_hole_mask(metric_img, mask)
+            canonical.save(path)
+            metric_refs[hole_key] = path
+        return metric_refs[hole_key]
+
+    metric_ref = _metric_reference(requested_options)
 
     # 2) Clean vector result. Low-scoring conversions trigger candidate
     # comparison (strokes/gradients/geometry off) and automatic fallback to
@@ -1282,10 +2059,21 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
                               strokes=options["strokes"],
                               gradients=options["gradients"],
                               flat_out=flat_chk)
-        sc = self_check(svg_path, flat_chk, metric_ref,
+        hole_getter = getattr(st, "_validation_hole_mask", None)
+        hole_mask = hole_getter() if callable(hole_getter) else None
+        candidate_metric_ref = _metric_reference(options, hole_mask)
+        component_before_render = deliver / "_component_repair_before.png"
+        sc = self_check(svg_path, flat_chk, candidate_metric_ref,
                         gradient_info=st.gradient_info,
+                        keep_render=component_before_render,
                         viewbox=st.viewbox)
-        return st, sc
+        try:
+            sc, st.component_repair = _attempt_isolated_component_repair(
+                svg_path, flat_chk, candidate_metric_ref, st, sc,
+                component_before_render)
+        finally:
+            component_before_render.unlink(missing_ok=True)
+        return st, sc, candidate_metric_ref
 
     def _eff(sc):
         # Never fall back to whole-canvas similarity: that is precisely how a
@@ -1339,7 +2127,7 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
         attempted.add(signature)
         public = {"status": "failed", "options": dict(opts)}
         try:
-            st, sc = _build(opts)
+            st, sc, candidate_metric_ref = _build(opts)
             structure = _structure(st)
             quality = _eff(sc)
             rank = ((0.90 * quality + 0.10 * structure["score"])
@@ -1349,6 +2137,7 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
             public.update({"status": "ok", "scores": public_scores,
                            "quality_score": quality,
                            "structure": structure,
+                           "component_repair": st.component_repair,
                            "selection_score": rank,
                            "selected": False})
             # Keep the small candidate artifacts in memory. Rebuilding the
@@ -1359,21 +2148,26 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
             svg_snapshot = svg_path.read_bytes()
             flat_snapshot = flat_chk.read_bytes()
             internal.append((rank, quality, opts, st, sc, public,
-                             svg_snapshot, flat_snapshot))
+                             svg_snapshot, flat_snapshot,
+                             candidate_metric_ref))
         except Exception as exc:
             public["error"] = str(exc)[:240]
         candidates.append(public)
 
-    # Staged evaluation keeps normal logos at one render. Expand the full
-    # disabling matrix only when fidelity or editability structure is risky.
+    # Staged evaluation keeps visually accepted, structurally low-risk logos at
+    # one render.  A structurally risky base still evaluates the independent
+    # stage disables: an aggregate visual score can hide an overlap-specific
+    # reconstruction fault, and the candidate report must remain auditable.
     _attempt(args.background, {})
     base_item = next((item for item in internal
                       if item[2] == requested_options), None)
     structure_risk = False
     base_quality = None
+    base_visual_status = None
     if base_item is not None:
         base_quality = base_item[1]
         base_stats = base_item[3]
+        base_visual_status = _evaluate_visual_gate(base_item[4])["status"]
         element_count = max(
             1, base_stats.n_paths + base_stats.n_strokes
             + base_stats.n_native + base_stats.n_gradients)
@@ -1381,11 +2175,12 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
             detail.get("closed") and not detail.get("primitive")
             for detail in base_stats.stroke_info)
         structure_risk = (
-            base_stats.n_nodes > 80
-            or base_stats.n_nodes > 24 * element_count
+            base_stats.n_nodes > 24 * element_count
             or free_closed)
     expand_primary = (base_item is None or base_quality is None
-                      or base_quality < 88.0 or structure_risk)
+                      or base_quality < 88.0
+                      or base_visual_status != "accepted"
+                      or structure_risk)
     matrix_strategy = "base_only"
     if expand_primary:
         # First evaluate each reconstruction stage independently.  High-score
@@ -1397,18 +2192,42 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
         single_variants = [ov for ov in variants if len(ov) == 1]
         for ov in single_variants:
             _attempt(args.background, ov)
-        single_quality = max(
-            (item[1] for item in internal
-             if item[1] is not None and item[2] != requested_options),
-            default=-1.0)
-        expand_combinations = (
-            base_item is None or base_quality is None or base_quality < 88.0
-            or single_quality >= base_quality + MATERIAL_FALLBACK_GAIN)
-        if expand_combinations:
+        # Catastrophic/failed bases still deserve exhaustive rescue.  Above
+        # that floor, only combine stages whose single-disable candidate has a
+        # measurable visual or structural effect.  The tea logo used to spend half
+        # its six-minute run repeating geometry-on/off renders that differed by
+        # 0.002 points; the consequential strokes+gradients pair is retained.
+        if base_item is None or base_quality is None or base_quality < 80.0:
             matrix_strategy = "full_disable_matrix"
             for ov in variants:
                 if len(ov) >= 2:
                     _attempt(args.background, ov)
+        else:
+            impactful = []
+            base_structure = base_item[5].get("structure", {})
+            base_structure_score = float(base_structure.get("score") or 0.0)
+            for key in disable_keys:
+                wanted = dict(requested_options)
+                wanted[key] = "off"
+                single = next((item for item in internal
+                               if item[2] == wanted), None)
+                if single is None or single[1] is None:
+                    continue
+                structural_gain = (
+                    float(single[5].get("structure", {}).get("score") or 0.0)
+                    - base_structure_score)
+                if (_candidate_safely_dominates(single, base_item)
+                        or single[1] >= base_quality + 0.5
+                        or structural_gain >= 3.0):
+                    impactful.append(key)
+            if len(impactful) >= 2:
+                matrix_strategy = "impactful_disable_combinations"
+                for count in range(2, len(impactful) + 1):
+                    for subset in itertools.combinations(impactful, count):
+                        _attempt(args.background,
+                                 {key: "off" for key in subset})
+            else:
+                matrix_strategy = "single_disables_pruned_inert_combinations"
 
     primary_quality = max(
         (item[1] for item in internal if item[1] is not None), default=-1.0)
@@ -1430,8 +2249,9 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
         viable, requested_options)
     selection_policy["matrix_strategy"] = matrix_strategy
     selection_policy["evaluated_candidates"] = len(candidates)
+    selection_policy["base_structure_risk"] = bool(structure_risk)
     (_rank, _quality, effective_options, _st, _sc, chosen_public,
-     selected_svg, selected_flat) = selected_item
+     selected_svg, selected_flat, selected_metric_ref) = selected_item
     best_visual_quality = selection_policy["best_visual_quality"]
     for item in viable:
         item[5]["visual_gap_from_best"] = round(
@@ -1450,6 +2270,7 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
     atomic_replace_bytes(svg_path, selected_svg)
     flat_chk.write_bytes(selected_flat)
     stats, scores = _st, _sc
+    metric_ref = selected_metric_ref
     e_final = _eff(scores)
     initial_public = next((c for c in candidates
                            if c["options"] == requested_options), None)
@@ -1465,6 +2286,10 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
     clean_img, _sz, removed = _prepare_image(
         img_path, max_size=0, background=effective_options["background"],
         white_threshold=effective_options["white_threshold"], alpha_threshold=12)
+    selected_hole_getter = getattr(stats, "_validation_hole_mask", None)
+    selected_hole_mask = (
+        selected_hole_getter() if callable(selected_hole_getter) else None)
+    clean_img = _apply_validation_hole_mask(clean_img, selected_hole_mask)
     clean_img.save(ref_png)
     if removed:
         warnings.append("auto background removal was applied; if a light "
@@ -1487,8 +2312,21 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
                                  measure_svg_structure)
     original_svg_bytes = svg_path.read_bytes()
     baseline_scores = scores
-    render_validator = lambda before, after, stage: validate_svg_stage_renders(
-        before, after, stage, gradient_info=stats.gradient_info)
+    # Post-processing stages are sequential: the accepted "after" document
+    # of one stage is normally the "before" document of the next.  Cache
+    # renderer output by SVG content so that safety checks do not rasterise
+    # that identical document again.  Validate at the source's native scale
+    # (with a 512px minimum and a 2048px longest-side cap).  render_svg_png's
+    # size argument is an output *width*, so derive it from both viewBox axes
+    # to keep portrait artwork inside the same resource bound.
+    stage_render_cache = {}
+    validation_render_width = _validation_render_width(stats.viewbox)
+
+    def render_validator(before, after, stage):
+        return validate_svg_stage_renders(
+            before, after, stage, gradient_info=stats.gradient_info,
+            render_cache=stage_render_cache,
+            render_size=validation_render_width)
     enhancement_report = enhance_svg_structure(
         svg_path, validator=render_validator, work_dir=deliver)
 
@@ -1670,20 +2508,37 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
           f"+{compound_delta} selectable compound parts / "
           f"{scene_actual} actual object groups / {role_controls} paint controls")
 
+    # The verdict must use the exact SVG after every paint-role/structure
+    # mutation.  Previously an early score set the status, then this later
+    # self-check silently replaced the report metrics without recomputing the
+    # gate; the workbench could therefore say Done for a visibly broken file.
+    chk_render = deliver / "_render_check.png"
+    scores = self_check(svg_path, flat_chk, metric_ref,
+                        gradient_info=stats.gradient_info,
+                        keep_render=chk_render, viewbox=stats.viewbox)
+    e_final = _eff(scores)
+    if e_final is None:
+        raise RuntimeError("final delivered SVG could not be validated on source ink")
+    if e_final < 60.0:
+        raise RuntimeError(
+            f"final delivered SVG failed catastrophically ({e_final:.1f}% "
+            "foreground match); manual vectorization recommended")
+    visual_gate = _evaluate_visual_gate(scores)
+    visual_acceptance_status = visual_gate["status"]
+    visual_review_required = visual_acceptance_status != "accepted"
     selected_detail_grid = scores.get("detail_grid") or {}
     detail_p10 = selected_detail_grid.get("p10_score_percent")
-    detail_cells = int(selected_detail_grid.get("eligible_cells") or 0)
-    detail_review_required = (
-        detail_cells >= 2 and detail_p10 is not None and detail_p10 < 80.0)
-    visual_review_required = e_final < 80.0 or detail_review_required
-    visual_acceptance_status = (
-        "manual_review" if visual_review_required else "accepted")
-    if e_final < 80.0:
+    if visual_acceptance_status == "rejected":
+        reason = "; ".join(visual_gate["reasons"])
         warnings.append(
-            f"VISUAL REVIEW REQUIRED: foreground quality {e_final:.1f}% is "
-            "below the 80% automatic acceptance gate")
-        print(f"    VISUAL REVIEW REQUIRED: {e_final:.1f}% is below 80%.")
-    if detail_review_required:
+            "VISUAL NOT ACCEPTED: this output is diagnostic only and must not "
+            f"be handed off without rework ({reason})")
+        print(f"    VISUAL NOT ACCEPTED: {reason}")
+    elif visual_acceptance_status == "manual_review":
+        reason = "; ".join(visual_gate["reasons"])
+        warnings.append(f"VISUAL REVIEW REQUIRED: {reason}")
+        print(f"    VISUAL REVIEW REQUIRED: {reason}")
+    if (isinstance(detail_p10, (int, float)) and detail_p10 < 80.0):
         warnings.append(
             f"LOCAL DETAIL REVIEW REQUIRED: the weakest 10% of ink cells "
             f"scored {detail_p10:.1f}% (below 80%); small lines or dots may "
@@ -1737,9 +2592,13 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
             "this SVG may look correct but still need grouping/node cleanup")
         print(f"    EDITABILITY REVIEW REQUIRED: structural score {score_text}.")
 
-    manual_review_required = (
-        visual_review_required or editability_status != "accepted")
-    acceptance_status = "manual_review" if manual_review_required else "accepted"
+    if visual_acceptance_status == "rejected" or editability_status == "rejected":
+        acceptance_status = "rejected"
+    elif visual_review_required or editability_status != "accepted":
+        acceptance_status = "manual_review"
+    else:
+        acceptance_status = "accepted"
+    manual_review_required = acceptance_status != "accepted"
 
     # Keep the SVG self-describing even when it is copied away from its ZIP.
     # The JSON is XML-escaped text, readable by editors and scripts without
@@ -1752,12 +2611,15 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
         "options_requested": requested_options,
         "options_effective": effective_options,
         "visual_acceptance_status": visual_acceptance_status,
+        "visual_gate": visual_gate,
         "editability_status": editability_status,
         "acceptance_status": acceptance_status,
         "editability_enhancements": {
             key: value.get("status")
             for key, value in enhancement_report.get("stages", {}).items()
         },
+        "component_repair_status": (stats.component_repair or {}).get(
+            "status", "not_audited"),
         "paint_role_controls": role_controls,
         "designer_operations_passed": designer_operations.get(
             "summary", {}).get("passed", 0),
@@ -1811,7 +2673,11 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
             span = f"{colors[0]}->{colors[-1]}" if colors else "linearGradient"
             paint_labels.append(f"{resource.get('id') or 'gradient'}({span})")
             readme_palette.append((resource.get("id") or "gradient", span))
-    print(f"  Vector OK: {final_structure['groups']} final SVG groups; "
+    vector_label = ("Vector OK" if acceptance_status == "accepted"
+                    else "Vector generated — REVIEW REQUIRED"
+                    if acceptance_status == "manual_review"
+                    else "Vector generated — NOT ACCEPTED / DO NOT HAND OFF")
+    print(f"  {vector_label}: {final_structure['groups']} final SVG groups; "
           f"{paint_summary['unique_paints_total']} unique paint resources -> "
           + ", ".join(paint_labels))
     primitive_counts = {
@@ -1838,11 +2704,7 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
     for g in stats.geometry_notes:
         print(f"    - {g}")
 
-    # 2b) Render back and compare against the references.
-    chk_render = deliver / "_render_check.png"
-    scores = self_check(svg_path, flat_chk, metric_ref,
-                        gradient_info=stats.gradient_info,
-                        keep_render=chk_render, viewbox=stats.viewbox)
+    # 2b) Report the final render check already used by the visual gate above.
     if any(scores.get(k) is not None for k in ("flat", "source", "foreground")):
         def _s(k):
             return f"{scores[k]:.1f}%" if scores.get(k) is not None else "n/a"
@@ -1866,7 +2728,8 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
     hotspots = scores.get("hotspots") or []
     detail_grid = scores.get("detail_grid")
     chk_render.unlink(missing_ok=True)
-    metric_ref.unlink(missing_ok=True)
+    for _metric_path in metric_refs.values():
+        _metric_path.unlink(missing_ok=True)
 
     # 3) Preview. Never silently pass off the source as an SVG render.
     preview = deliver / f"{out_base}_preview.png"
@@ -1906,6 +2769,7 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
         "output_base": out_base,
         "size": [stats.width, stats.height],
         "palette": paint_summary["palette"],
+        "palette_detection": getattr(stats, "palette_audit", {}),
         "layers": paint_summary["layers"],
         "paint_resources": paint_summary["paint_resources"],
         "solid_paints": paint_summary["solid_paints"],
@@ -1931,6 +2795,7 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
             "gradients": stats.n_gradients,
             "nodes_total": stats.n_nodes,
         },
+        "component_repair": stats.component_repair,
         "editability_enhancements": enhancement_report,
         "paint_roles": paint_role_report,
         "paint_role_manifest": (paint_manifest_path.name
@@ -1954,11 +2819,14 @@ def process_one(img_path: Path, out_base: str, args, output_dir: Path):
         "review_preview_max_side": REVIEW_PREVIEW_MAX_SIDE,
         "preview_is_svg_render": not preview_is_fallback,
         "detail_grid": detail_grid,
+        "transparent_light_fidelity": scores.get(
+            "transparent_light_fidelity"),
         "hotspots": hotspots,
         "candidates": candidates,
         "candidate_selection_policy": selection_policy,
         "auto_fallback": chosen,
         "visual_acceptance_status": visual_acceptance_status,
+        "visual_gate": visual_gate,
         "editability_status": editability_status,
         "editability_score": editability.get("score"),
         "editability_reasons": editability.get("reasons", []),

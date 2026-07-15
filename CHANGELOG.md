@@ -3,6 +3,61 @@
 All notable changes to AI Vector Cleanroom. Versions before 1.0 are alpha /
 technical previews: interfaces and output may change.
 
+## v0.5.0-alpha - 2026-07-15
+
+Isolated-component repair, light-color fidelity, and negative-space
+guardrails. (Internal lineage: Codex Beta.5, built on the v0.3 engine; the
+unreleased Beta.4 light-color and negative-space work is folded into this
+release. Reviewed adversarially before release.)
+
+Component topology and repair:
+
+- Component topology schema v1: the detail diagnostic reports per-component
+  coverage, fragment counts, and complete failed-component evidence
+  (measurement size, viewBox, source-component labels).
+- Conservative local re-trace of completely missing, isolated, opaque,
+  single-color components: a separate append-only proposal SVG is rendered and
+  must pass the visual gate, per-metric non-regression checks, and an exact
+  outside-bbox render guard before an atomic commit. Anything ambiguous --
+  multicolor, translucent, connected, partially present, edge-touching, or
+  oversized -- is reported as skipped, and any failing check rolls back to the
+  original bytes.
+- `report.json` carries the full component-repair audit (schema
+  `ai-vector-cleanroom.component-repair/v1`): status, proposal, transaction
+  verdict, and per-component reasons.
+
+Appearance and fidelity (folds in the unreleased Beta.4 work):
+
+- Light solid objects are recovered after tracing with a conservative overlay
+  and verified by a dedicated light-core coverage gate, so white text and
+  white highlights are no longer hidden behind a high overall similarity score.
+- Stricter structural-core threshold on low-noise sources: faint near-white
+  modeling bands (RGB ~234-247 inside white glyphs) are no longer mistaken for
+  independent dark structure and falsely rejected; those low-contrast pixels
+  stay covered by the color and local-detail gates.
+- Multi-metric visual gate: appearance is checked on overall foreground, color,
+  local-detail P10, topology, and (when applicable) light-core coverage; any
+  failing applicable metric is reported explicitly instead of being averaged
+  away.
+
+Negative space and geometry:
+
+- Negative-space guardrails on circular and rectangular frames: if an inner
+  hole is filled in after a geometry conversion, that conversion is rolled
+  back. Candidate, metric, and final `source_reference` share one
+  stroke-proven hole mask.
+- Grouped-glyph counters (the enclosed holes in letters) are kept transparent
+  with a conservative counter mask, so they are not painted in as light solids.
+
+Candidates and reporting:
+
+- Structural-risk results expand into multiple candidates; the selection
+  policy is `visual_gate_tier_then_safe_dominance_then_preserve_features`.
+- Paint-resource accounting fix: a reused gradient is no longer double-counted
+  as a separate solid fill.
+
+Tests: 222 (private real-logo fixtures excluded from the public suite).
+
 ## v0.3.0-alpha - 2026-07-14
 
 Structured editing and global recolor. (Internal lineage: Codex Beta.3.2,

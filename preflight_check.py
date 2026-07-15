@@ -34,6 +34,8 @@ SENSITIVE_TEXT = [
     "logo" + "A-02",                       # private client logo file
     "real_world" + "_validation",          # private validation artifacts
     "給設計師_" + "請先看我",                # private portable delivery note
+    "Chi" + "ayi",                          # romanized private client (嘉義)
+    "Ali" + "shan",                         # romanized private test logo (阿里山)
 ]
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".bat", ".cff", ".toml", ".yml", ".yaml"}
 

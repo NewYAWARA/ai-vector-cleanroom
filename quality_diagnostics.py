@@ -14,6 +14,7 @@ Only Pillow and NumPy are required.  In particular, no SciPy morphology or
 distance-transform dependency is used, keeping the portable build small.
 """
 
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
@@ -145,6 +146,179 @@ def _viewbox_geometry(
     raise ValueError("viewbox must be [width, height] or [x, y, width, height]")
 
 
+def structural_core_threshold(ink_threshold: float) -> float:
+    """Return the contrast floor used for structural continuity labels.
+
+    The repair planner must rebuild exactly the same component labels as the
+    diagnostic report.  Keeping this policy in one public helper prevents a
+    threshold change from invalidating stored component IDs, areas or boxes.
+    """
+
+    threshold = float(ink_threshold)
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError("ink_threshold must be a finite non-negative number")
+    return max(threshold * 2.0, threshold + 12.0)
+
+
+def _component_topology(src_mask: np.ndarray, ren_mask: np.ndarray,
+                        *, max_examples: int = 20,
+                        failure_score_below: float = 90.0,
+                        viewbox: Optional[Sequence[float]] = None
+                        ) -> Dict[str, Any]:
+    """Measure whether each meaningful source component stays continuous.
+
+    Pixel recall can remain high when one glyph stem or circular arc is split
+    into several disconnected vector fragments.  Label source ink normally,
+    label a one-pixel-dilated render (the same raster phase tolerance used by
+    the local grid), then ask how much of each source component is represented
+    by its single largest render component.
+    """
+    from stroke_engine import connected_components
+
+    height, width = src_mask.shape
+    vb_x, vb_y, vb_w, vb_h = _viewbox_geometry(viewbox, width, height)
+    scale_x = vb_w / width if width else 1.0
+    scale_y = vb_h / height if height else 1.0
+    failure_score_below = float(failure_score_below)
+    schema = {
+        "schema": "ai-vector-cleanroom.component-topology/v1",
+        # stroke_engine.connected_components currently labels diagonal run
+        # contacts together.  Record the implemented contract explicitly; its
+        # historical docstring incorrectly called this 4-connectivity.
+        "connectivity": "8-connected",
+        "render_tolerance": {
+            "pixels": 1,
+            "neighbourhood": "3x3",
+            "operation": "dilation_before_component_labelling",
+        },
+        "measurement_size_px": [int(width), int(height)],
+        "viewbox": [round(float(vb_x), 3), round(float(vb_y), 3),
+                    round(float(vb_w), 3), round(float(vb_h), 3)],
+        "failure_score_below": failure_score_below,
+        "example_sort": "score_percent_asc_area_px_desc",
+    }
+
+    src_labels, src_count = connected_components(src_mask)
+    ren_tolerant = _neighbour_count(ren_mask) > 0
+    ren_labels, _ = connected_components(ren_tolerant)
+    source_ink = int(src_mask.sum())
+    min_area = max(16, min(128, int(round(source_ink * 1e-4))))
+    areas = np.bincount(src_labels.ravel(), minlength=src_count + 1)
+    eligible = np.flatnonzero(areas >= min_area)
+    eligible = eligible[eligible != 0]
+
+    if not len(eligible):
+        return {
+            **schema,
+            "eligible_components": 0,
+            "minimum_component_area_px": min_area,
+            "one_pixel_tolerance": True,
+            "p10_score_percent": None,
+            "worst_score_percent": None,
+            "mean_score_percent": None,
+            "coverage_p10_percent": None,
+            "connectivity_p10_percent": None,
+            "fragmented_components": 0,
+            "failed_component_count": 0,
+            "examples_total": 0,
+            "examples_returned": 0,
+            "examples_truncated": False,
+            "examples": [],
+            "failed_examples": [],
+        }
+
+    flat_source = src_labels.ravel()
+    foreground_indices = np.flatnonzero(flat_source)
+    order = np.argsort(flat_source[foreground_indices], kind="stable")
+    grouped = foreground_indices[order]
+    grouped_labels = flat_source[grouped]
+    starts = np.searchsorted(grouped_labels, eligible, side="left")
+    ends = np.searchsorted(grouped_labels, eligible, side="right")
+    flat_render = ren_labels.ravel()
+    items = []
+    scores = []
+    coverages = []
+    connectivities = []
+    fragmented = 0
+    for label, start, end in zip(eligible, starts, ends):
+        indices = grouped[start:end]
+        area = int(len(indices))
+        overlapping = flat_render[indices]
+        counts = np.bincount(overlapping)
+        nonzero = counts[1:] if len(counts) > 1 else np.empty(0, dtype=int)
+        largest = int(nonzero.max()) if len(nonzero) else 0
+        covered_pixels = int(nonzero.sum()) if len(nonzero) else 0
+        coverage = 100.0 * covered_pixels / max(1, area)
+        connectivity = 100.0 * largest / max(1, covered_pixels)
+        score = 100.0 * largest / max(1, area)
+        material_pixels = max(3, int(math.ceil(0.05 * area)))
+        fragment_count = int((nonzero >= material_pixels).sum())
+        if fragment_count >= 2:
+            fragmented += 1
+        yy, xx = np.divmod(indices, width)
+        bbox_px = [int(xx.min()), int(yy.min()),
+                   int(xx.max() - xx.min() + 1),
+                   int(yy.max() - yy.min() + 1)]
+        below_threshold = score < failure_score_below
+        is_fragmented = fragment_count >= 2
+        items.append({
+            "source_component": int(label),
+            "area_px": area,
+            "score_percent": round(score, 3),
+            "coverage_percent": round(coverage, 3),
+            "connectivity_percent": round(connectivity, 3),
+            "fragment_count": fragment_count,
+            "failure_score_below": failure_score_below,
+            "below_failure_threshold": bool(below_threshold),
+            "fragmented": bool(is_fragmented),
+            "bbox_px_format": "xywh",
+            "bbox_px": bbox_px,
+            "bbox_viewbox_format": "xywh",
+            "bbox_viewbox": [
+                round(vb_x + bbox_px[0] * scale_x, 3),
+                round(vb_y + bbox_px[1] * scale_y, 3),
+                round(bbox_px[2] * scale_x, 3),
+                round(bbox_px[3] * scale_y, 3),
+            ],
+        })
+        scores.append(score)
+        coverages.append(coverage)
+        connectivities.append(connectivity)
+
+    values = np.asarray(scores, dtype=float)
+    coverage_values = np.asarray(coverages, dtype=float)
+    connectivity_values = np.asarray(connectivities, dtype=float)
+    items.sort(key=lambda item: (item["score_percent"], -item["area_px"]))
+    examples = items[:max_examples]
+    failed_examples = [
+        item for item in items
+        if item["below_failure_threshold"] or item["fragmented"]
+    ]
+    return {
+        **schema,
+        "eligible_components": int(len(values)),
+        "minimum_component_area_px": min_area,
+        "one_pixel_tolerance": True,
+        "p10_score_percent": round(float(np.percentile(values, 10)), 3),
+        "worst_score_percent": round(float(values.min()), 3),
+        "mean_score_percent": round(float(values.mean()), 3),
+        "coverage_p10_percent": round(
+            float(np.percentile(coverage_values, 10)), 3),
+        "connectivity_p10_percent": round(
+            float(np.percentile(connectivity_values, 10)), 3),
+        "fragmented_components": int(fragmented),
+        "failed_component_count": len(failed_examples),
+        "examples_total": len(items),
+        "examples_returned": len(examples),
+        "examples_truncated": len(examples) < len(items),
+        "examples": examples,
+        # Unlike the compatibility `examples` sample, this is deliberately
+        # complete so a small number of lost glyphs cannot disappear behind
+        # the 20-record diagnostic cap.
+        "failed_examples": failed_examples,
+    }
+
+
 def compute_quality_diagnostics(
     render: ImageInput,
     source: ImageInput,
@@ -268,6 +442,33 @@ def compute_quality_diagnostics(
         }
 
     hotspots.sort(key=lambda item: (-item["severity"], -item["source_ink_pixels"]))
+    # Component continuity is a structural question, so measure it on a
+    # stable high-contrast core.  The raw ROI deliberately includes very light
+    # antialias halos for local colour/detail scoring; labelling those halos as
+    # independent components created false topology failures and could also
+    # join unrelated dark shapes through a six-level JPEG fringe.
+    # On a clean white boundary the adaptive ink threshold bottoms out at six
+    # levels.  Merely doubling that value made 13--17-level modelling bands
+    # inside white lettering look like independent structural strokes.  A
+    # palette flattener may legitimately merge those near-white bands into the
+    # light object while preserving its actual glyph silhouette; treating the
+    # bands as missing components produced a catastrophic topology score even
+    # when every meaningful dark stem remained intact.  The +12 floor applies
+    # only while boundary noise is low (once threshold >= 12, the existing 2x
+    # rule still dominates), so medium/dark lines on noisier artwork retain the
+    # previous structural sensitivity.  Local colour/detail diagnostics still
+    # measure the excluded low-contrast pixels.
+    core_threshold = structural_core_threshold(threshold)
+    core_source = src_mask & (roi["strength"] >= core_threshold)
+    core_render = ren_mask & (ren_strength >= core_threshold)
+    topology = _component_topology(
+        core_source, core_render, viewbox=viewbox)
+    topology.update({
+        "measurement_mask": "strong_ink_core",
+        "core_threshold": round(float(core_threshold), 3),
+        "core_source_ink_pixels": int(core_source.sum()),
+        "low_contrast_excluded_pixels": int(src_mask.sum() - core_source.sum()),
+    })
     detail_grid = {
         "cell_size_px": cell,
         "one_pixel_tolerance": True,
@@ -278,6 +479,7 @@ def compute_quality_diagnostics(
         "background_rgb": [round(v, 3) for v in roi["background_rgb"]],
         "boundary_noise_p95": round(float(roi["boundary_noise_p95"]), 3),
         "ink_threshold": round(threshold, 3),
+        "component_topology": topology,
         "cells": cells,
     }
     return {"hotspots": hotspots[:max_spots], "detail_grid": detail_grid}
@@ -302,4 +504,5 @@ __all__ = [
     "compute_hotspots",
     "compute_quality_diagnostics",
     "source_ink_roi",
+    "structural_core_threshold",
 ]

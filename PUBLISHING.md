@@ -26,7 +26,7 @@ git rm -r --quiet .
 robocopy "PATH\TO\new-tree" . /E /XD .git    # Windows; use rsync on macOS/Linux
 
 git add -A
-git commit -m "Release v0.3.0-alpha: structured editing, native geometry, recolor"
+git commit -m "Release v0.5.0-alpha: component-repair, light-color fidelity, negative-space guardrails"
 git push origin main
 ```
 
@@ -35,20 +35,23 @@ This makes HEAD the new version; the old code stays reachable in history.
 ## 2. Tag a pre-release
 
 ```powershell
-git tag v0.3.0-alpha
-git push origin v0.3.0-alpha
+git tag v0.5.0-alpha
+git push origin v0.5.0-alpha
 ```
 
 On GitHub, create a Release from that tag and **check "This is a
 pre-release"**. Suggested notes (accurate wording only):
 
 ```text
-v0.3.0-alpha (technical preview). Flat bitmap logos/icons -> editable SVG:
+v0.5.0-alpha (technical preview). Flat bitmap logos/icons -> editable SVG:
 real strokes, native circle/line/polyline, linear gradients, safe compound
-splitting, scene grouping, offline global recolor. Every post-process stage
-is validated pixel-exact by an external renderer. Output still needs human
-review; the "80% time saving" claim is not yet verified by designer editing
-timings.
+splitting, scene grouping, offline global recolor. New since v0.3: light-color
+fidelity (conservative overlay + light-core coverage gate), negative-space
+guardrails on frames and grouped-glyph counters, a multi-metric visual gate,
+and conservative render-validated re-trace of completely-missing components.
+Every post-process stage is validated pixel-exact by an external renderer.
+Output still needs human review; the "80% time saving" claim is not yet
+verified by designer editing timings.
 ```
 
 ## 3. Wording rules

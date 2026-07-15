@@ -8,10 +8,13 @@ tests\run_tests.bat
 
 測試會自動產生固定圖例，從命令列完整跑一次轉換，再檢查 SVG 結構、
 線寬／顏色、透明度、前景分數、自動候選與 `report.json` 欄位。
-Beta.3 另檢查外觀／可編輯性雙閘門、局部細節 p10、實際上色資源、候選保留、
+Beta.5 另檢查外觀／可編輯性雙閘門、色彩、局部細節 p10、拓撲、適用時的
+淺色核心覆蓋率、實際上色資源、候選保留、淺色物件覆蓋與負空間護欄、
 原生外環、compound path 安全拆分、Scene Graph 實體群組、父群組繼承樣式落地後的
 逐像素直線原生化、全域換色、五項設計操作結構驗收及編輯功能的選擇政策；
-SVG 內嵌 metadata 也必須與報告的兩道狀態一致。
+SVG 內嵌 metadata 也必須與報告的兩道狀態一致。Beta.5 並驗證近白建模帶
+不會誤成結構元件、component-topology schema 與完整 failed_examples 契約，
+以及隔離單色遺失元件的 deterministic 提案、bbox 外零變更交易閘門與 byte-exact rollback。
 
 `run_tests.bat` 一律清除舊的 `VECTOR_TEST_REUSE` 設定，並重新建立 13 張
 圖例及全部輸出，這才是正式發版驗收。

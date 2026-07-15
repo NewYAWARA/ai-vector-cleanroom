@@ -4,7 +4,7 @@
 
 把平面點陣圖 logo（含 AI 生成 logo）轉成「可編輯的 SVG 底稿」的清稿工具。
 
-> 目前狀態：v0.3.0-alpha 技術預覽版。
+> 目前狀態：v0.5.0-alpha 技術預覽版。
 > 適合少色、平面、邊界清楚的 logo 與 icon；其他類型的圖輸出仍需人工檢查與補修。
 > 「省工 80%」尚未經真人實際編輯計時驗證（見下方誠實聲明）。
 
@@ -20,12 +20,13 @@ AI 生成的 logo 只有 PNG，設計師拿到後常常只能整張重畫：
 無損還原不存在。它做的是把重畫的起點從 0 分拉到高分底稿，並在每個環節
 用外部渲染器逐像素把關、低品質就明確標示或判失敗，不把爛結果偽裝成完成品。
 
-## 從 v0.1 到 v0.3（重點變更）
+## 從 v0.1 到 v0.5（重點變更）
 
 v0.1 是「壓乾淨顏色 + 描邊 + 圓弄正 + 分色層」的底稿工具；v0.3 把它升級成
-設計師能真正接手編輯的結構化向量。逐版細節見 `CHANGELOG.md`。
+設計師能真正接手編輯的結構化向量；v0.5 再補上淺色實體保真、負空間護欄與
+完全遺失元件的保守局部重追。逐版細節見 `CHANGELOG.md`。
 
-| 能力 | v0.1 | v0.3 |
+| 能力 | v0.1 | v0.5 |
 |---|---|---|
 | 線條（心跳線／細線） | 一堆錨點的填色外框，難改 | 真筆畫 `stroke`，可調線寬與端點 |
 | 圓與幾何 | 圓／鉚釘規則化，仍是 path | 原生 `<circle>` / `<line>` / `<polyline>`；圓環為可調線寬 stroked circle |
@@ -36,7 +37,11 @@ v0.1 是「壓乾淨顏色 + 描邊 + 圓弄正 + 分色層」的底稿工具；
 | 品質分數 | flat + source 兩分數 | 加 foreground 墨水 ROI、候選自動回退、<60 分判失敗、三軸可編輯性稽核 |
 | 介面 | 靜態疊圖頁 | 拖放工作台（1600% 縮放／物件清單／問題熱區／逐圖重跑）+ 盲測 + Stage 2 計時 |
 | 正確性保證 | 基本 | 每個後處理階段外部渲染器逐像素驗證 + rollback + 原子寫入 |
-| 測試 | 1 個測試檔 | 125 個測試 |
+| 淺色實體細節 | 易被整體高分掩蓋 | 保守 overlay 補回 + 獨立淺色核心保真閘門（白字／白高光不再被埋沒） |
+| 框內／字內孔洞 | 可能被填實 | 圓框／方框負空間護欄，內孔填實即撤回；成組字形內孔保持透明 |
+| 外觀閘門 | 單一前景分數 | 多指標（前景／色彩／局部細節 P10／拓撲／淺色核心覆蓋） |
+| 遺失元件 | 無偵測 | 元件拓撲 schema + 完全遺失元件的保守局部重追（另渲染驗證、框外零變動、不過即回退） |
+| 測試 | 1 個測試檔 | 222 個測試 |
 
 ## 管線總覽
 
@@ -219,7 +224,7 @@ AI Vector Cleanroom by 張進逸 (Shinichi Chang)
 A cleanup tool that turns flat bitmap logos (including AI-generated ones)
 into editable SVG drafts.
 
-> Status: v0.3.0-alpha, technical preview.
+> Status: v0.5.0-alpha, technical preview.
 > Works well on flat, limited-palette logos and icons; everything else still
 > needs human review and touch-up.
 > The "80% time saving" claim is **not** yet backed by real designer editing
@@ -244,9 +249,11 @@ instead of dressing them up as finished.
 
 v0.1 was a "flatten colors + trace + snap circles + group by layer" draft
 tool; v0.3 turns that into structured vector a designer can actually take
-over and edit. Per-version detail is in `CHANGELOG.md`.
+over and edit; v0.5 adds light-color fidelity, negative-space guardrails, and
+conservative re-trace of completely-missing components. Per-version detail is
+in `CHANGELOG.md`.
 
-| Capability | v0.1 | v0.3 |
+| Capability | v0.1 | v0.5 |
 |---|---|---|
 | Line work | high-node filled outlines, hard to edit | real `stroke`s with adjustable width and caps |
 | Circles & geometry | circle/rivet regularization, still paths | native `<circle>` / `<line>` / `<polyline>`; rings become stroked circles |
@@ -257,7 +264,11 @@ over and edit. Per-version detail is in `CHANGELOG.md`.
 | Quality scores | flat + source | plus foreground ink-ROI, candidate fallback, hard-fail below 60%, three-axis editability audit |
 | UI | static overlay page | drag-drop workbench (zoom/object list/hotspots/per-image re-run) + blind test + Stage 2 timing |
 | Correctness | basic | every post-process stage pixel-exact validated, with rollback and atomic writes |
-| Tests | 1 test file | 125 tests |
+| Light-color detail | easily masked by an overall high score | conservative overlay + a dedicated light-core fidelity gate (white text/highlights no longer buried) |
+| Frame / counter holes | could be filled in | negative-space guardrails on ring/box frames (rolled back if a hole fills); grouped-glyph counters kept transparent |
+| Appearance gate | single foreground score | multi-metric (foreground / color / local-detail P10 / topology / light-core coverage) |
+| Missing components | not detected | component topology schema + conservative local re-trace of completely-missing components (separately rendered, zero out-of-bbox change, rolled back if unsafe) |
+| Tests | 1 test file | 222 tests |
 
 ## Pipeline
 

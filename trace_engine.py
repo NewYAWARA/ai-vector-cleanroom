@@ -8,9 +8,11 @@ Raster logo/icon tracer.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from html import escape
+from numbers import Real
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +104,164 @@ def _border_connected(mask):
     return seen
 
 
+def _dilate_boolean_mask(mask, iterations=1):
+    """Return a small dependency-free 8-neighbourhood dilation."""
+    result = np.asarray(mask, dtype=bool).copy()
+    for _ in range(max(0, int(iterations))):
+        padded = np.pad(result, 1, mode="constant", constant_values=False)
+        dilated = np.zeros_like(result, dtype=bool)
+        for dy in range(3):
+            for dx in range(3):
+                dilated |= padded[dy:dy + result.shape[0],
+                                  dx:dx + result.shape[1]]
+        result = dilated
+    return result
+
+
+def _clustered_enclosed_background_mask(visible, background_like):
+    """Find conservative rows of counters that still carry canvas colour.
+
+    Border-connected removal cannot reach the white paper trapped inside a
+    dark glyph.  Treating every enclosed white component as transparent would
+    be much worse: real white lettering, mountain highlights and leaf veins
+    are also enclosed.  A component is therefore eligible only when it is
+    tightly surrounded by ink *and* the transparent canvas returns within a
+    scale-relative distance.  It is removed only as part of a horizontal row
+    of at least three such components.  The row requirement protects isolated
+    highlights and small paired decorative marks while handling multi-glyph
+    wordmarks such as the four counters inside one block character.
+    """
+    visible = np.asarray(visible, dtype=bool)
+    background_like = np.asarray(background_like, dtype=bool)
+    if visible.shape != background_like.shape:
+        raise ValueError("visible and background_like must have equal shapes")
+
+    candidate = visible & background_like
+    if not candidate.any():
+        return np.zeros_like(candidate)
+
+    # Import lazily so the standalone tracer keeps its lightweight startup and
+    # so this helper can reuse the tested run-based component implementation.
+    from stroke_engine import connected_components
+
+    labels, count = connected_components(candidate)
+    if not count:
+        return np.zeros_like(candidate)
+
+    h, w = candidate.shape
+    areas = np.bincount(labels.ravel(), minlength=count + 1)
+    # Require a material component at every scale.  This deliberately leaves
+    # tiny ambiguous counters alone instead of risking real light micro-detail.
+    minimum_area = max(64, int(round(0.0001 * h * w)))
+    records = []
+    for component in range(1, count + 1):
+        area = int(areas[component])
+        if area < minimum_area:
+            continue
+        component_mask = labels == component
+        cy, cx = np.nonzero(component_mask)
+        x0, x1 = int(cx.min()), int(cx.max())
+        y0, y1 = int(cy.min()), int(cy.max())
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if min(width, height) < 3:
+            continue
+        if area / float(width * height) < 0.30:
+            continue
+
+        # Keep this distance tied to the canvas, not to the white component.
+        # Real white wordmarks in the dark-wordmark validation logo are 11--16 px
+        # from transparency, while the light tea logo's trapped glyph counters are 1--5 px
+        # away.  A component-relative radius grows too far for large letters
+        # and would incorrectly turn those real white shapes into holes.
+        search = max(3, int(np.ceil(0.004 * min(h, w))))
+        pad = search + 1
+        xa, xb = max(0, x0 - pad), min(w, x1 + pad + 1)
+        ya, yb = max(0, y0 - pad), min(h, y1 + pad + 1)
+        local = component_mask[ya:yb, xa:xb]
+        local_visible = visible[ya:yb, xa:xb]
+        local_background = background_like[ya:yb, xa:xb]
+
+        immediate = _dilate_boolean_mask(local, 1) & ~local
+        boundary_area = int(immediate.sum())
+        if boundary_area == 0:
+            continue
+        ink_share = float(
+            (immediate & local_visible & ~local_background).sum()
+        ) / boundary_area
+        if ink_share < 0.95:
+            continue
+
+        nearby = _dilate_boolean_mask(local, search) & ~local
+        if not np.any(nearby & ~local_visible):
+            continue
+
+        records.append({
+            "component": component,
+            "x0": x0,
+            "x1": x1,
+            "y0": y0,
+            "y1": y1,
+            "width": width,
+            "height": height,
+        })
+
+    if len(records) < 3:
+        return np.zeros_like(candidate)
+
+    # Components in the same text line overlap vertically or are separated by
+    # only a small fraction of their height.  Build connected row groups; a
+    # tall counter can safely bridge upper and lower counters in one glyph.
+    neighbours = [[] for _ in records]
+    for left in range(len(records)):
+        a = records[left]
+        for right in range(left + 1, len(records)):
+            b = records[right]
+            vertical_gap = max(
+                0,
+                max(a["y0"], b["y0"]) - min(a["y1"], b["y1"]) - 1,
+            )
+            allowed_gap = max(
+                4, int(round(0.35 * max(a["height"], b["height"]))))
+            if vertical_gap <= allowed_gap:
+                neighbours[left].append(right)
+                neighbours[right].append(left)
+
+    selected = np.zeros_like(candidate)
+    _visible_y, visible_x = np.nonzero(visible)
+    foreground_width = (int(visible_x.max() - visible_x.min() + 1)
+                        if len(visible_x) else w)
+    unseen = set(range(len(records)))
+    while unseen:
+        seed = unseen.pop()
+        group = [seed]
+        queue = deque([seed])
+        while queue:
+            current = queue.popleft()
+            for other in neighbours[current]:
+                if other in unseen:
+                    unseen.remove(other)
+                    group.append(other)
+                    queue.append(other)
+        if len(group) < 3:
+            continue
+        members = [records[index] for index in group]
+        horizontal_span = (max(item["x1"] for item in members)
+                           - min(item["x0"] for item in members) + 1)
+        median_width = float(np.median(
+            [item["width"] for item in members]))
+        minimum_span = max(
+            16,
+            int(round(0.10 * foreground_width)),
+            int(round(4.0 * median_width)),
+        )
+        if horizontal_span < minimum_span:
+            continue
+        for item in members:
+            selected |= labels == item["component"]
+
+    return selected
+
+
 def _prepare_image(src, max_size, background, white_threshold, alpha_threshold):
     im = Image.open(src).convert("RGBA")
     orig_w, orig_h = im.size
@@ -120,6 +280,7 @@ def _prepare_image(src, max_size, background, white_threshold, alpha_threshold):
     neutral_background = (rgb.min(axis=2) >= min(white_threshold, 190)) & (spread <= 30)
 
     removed_background = False
+    counter_mask = np.zeros(alpha.shape, dtype=bool)
     if background != "keep":
         should_remove = background == "transparent"
         if background == "auto":
@@ -158,8 +319,25 @@ def _prepare_image(src, max_size, background, white_threshold, alpha_threshold):
             if np.any(removable):
                 arr[removable, 3] = 0
                 removed_background = True
+                # White paper trapped inside several neighbouring glyphs is
+                # not border-connected, but it is still negative space.  Apply
+                # the conservative row-level counter guard to the canonical
+                # alpha here so source reference, scoring reference and trace
+                # input agree on what is transparent.
+                visible_after = arr[:, :, 3] >= alpha_threshold
+                counters = _clustered_enclosed_background_mask(
+                    visible_after, candidate)
+                if np.any(counters):
+                    arr[counters, 3] = 0
+                    counter_mask |= counters
 
-    return Image.fromarray(arr, "RGBA"), (orig_w, orig_h), removed_background
+    prepared = Image.fromarray(arr, "RGBA")
+    # In-memory provenance only: the clean reference must serialize ordinary
+    # alpha, while the fill engine may still reuse the removed paper samples
+    # to keep adaptive palette selection stable.  This attribute is never
+    # written into PNG metadata.
+    prepared._avc_background_counter_mask = counter_mask
+    return prepared, (orig_w, orig_h), removed_background
 
 
 def _quantize(im, colors):
@@ -484,6 +662,103 @@ def _loops_to_path(loops, curve=0.0):
         point_count += len(pts)
         parts.extend(_curve_path(pts, curve))
     return " ".join(parts), point_count
+
+
+def binary_mask_to_compound_path(mask, *, simplify=0.35, min_area=1.0,
+                                 smooth=0.0, curve=0.0):
+    """Trace an explicit boolean mask into one deterministic compound path.
+
+    This is a small, side-effect-free primitive for narrowly scoped repair
+    passes.  It deliberately performs no image loading, colour inference,
+    background removal, or palette quantisation: callers must provide the
+    exact two-dimensional boolean ownership mask they intend to trace.
+
+    The returned dictionary is JSON-safe. ``bbox`` is a conservative
+    ``[x, y, width, height]`` bound in mask pixel-edge coordinates; for a
+    curved path it includes every cubic control point.  An all-false mask is
+    valid and returns an empty path with zero loops/nodes and ``bbox=None``.
+    Compound subpaths are intended to be rendered with SVG
+    ``fill-rule=\"evenodd\"`` so enclosed loops remain holes.
+    """
+
+    if not isinstance(mask, np.ndarray):
+        raise TypeError("mask must be a numpy.ndarray with dtype bool")
+    if mask.dtype != np.bool_:
+        raise TypeError("mask dtype must be bool")
+    if mask.ndim != 2:
+        raise ValueError("mask must be two-dimensional")
+    if mask.shape[0] <= 0 or mask.shape[1] <= 0:
+        raise ValueError("mask dimensions must be non-zero")
+
+    def finite_number(name, value, *, maximum=None):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+            raise TypeError(f"{name} must be a finite real number")
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        if result < 0.0:
+            raise ValueError(f"{name} must be non-negative")
+        if maximum is not None and result > maximum:
+            raise ValueError(f"{name} must be at most {maximum:g}")
+        return result
+
+    simplify_value = finite_number("simplify", simplify)
+    min_area_value = finite_number("min_area", min_area)
+    smooth_value = finite_number("smooth", smooth)
+    curve_value = finite_number("curve", curve, maximum=1.0)
+
+    # A contiguous copy makes the iteration contract independent of unusual
+    # ndarray strides while preserving the caller's mask byte-for-byte.
+    working = np.ascontiguousarray(mask, dtype=np.bool_)
+    loops = _mask_to_smooth_loops(
+        working, simplify_value, min_area_value, smooth_value)
+    path, node_count = _loops_to_path(loops, curve_value)
+
+    if loops:
+        bounds_points = [
+            (float(point[0]), float(point[1]))
+            for loop in loops for point in loop
+        ]
+        if curve_value > 0.0:
+            tension = curve_value / 6.0
+            for points in loops:
+                if len(points) < 4:
+                    continue
+                count = len(points)
+                for index in range(count):
+                    p0 = points[(index - 1) % count]
+                    p1 = points[index]
+                    p2 = points[(index + 1) % count]
+                    p3 = points[(index + 2) % count]
+                    bounds_points.extend((
+                        (p1[0] + (p2[0] - p0[0]) * tension,
+                         p1[1] + (p2[1] - p0[1]) * tension),
+                        (p2[0] - (p3[0] - p1[0]) * tension,
+                         p2[1] - (p3[1] - p1[1]) * tension),
+                    ))
+        xs = [float(point[0]) for point in bounds_points]
+        ys = [float(point[1]) for point in bounds_points]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        bbox = [x0, y0, x1 - x0, y1 - y0]
+    else:
+        bbox = None
+
+    return {
+        "path": path,
+        "node_count": int(node_count),
+        "loop_count": int(len(loops)),
+        "bbox": bbox,
+        "mask_pixels": int(np.count_nonzero(working)),
+        "mask_size": [int(working.shape[1]), int(working.shape[0])],
+        "fill_rule": "evenodd",
+        "parameters": {
+            "simplify": simplify_value,
+            "min_area": min_area_value,
+            "smooth": smooth_value,
+            "curve": curve_value,
+        },
+    }
 
 
 def vectorize_file(
