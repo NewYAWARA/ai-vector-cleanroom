@@ -50,6 +50,7 @@ For instructions, see the [Traditional Chinese README](https://github.com/NewYAW
 
 ## Known limitations and scope of validation
 
+- The curve-fitting regression test against a floating-point reference allows only machine-rounding differences of up to 4 ULP for actual updates; fallback results and endpoints still require exact equality. Production geometry and visual thresholds are unchanged.
 - Text interiors, thin rays, faint tips, color bands, adjoining edges and local colors may still need manual editing or redrawing. Some regions may regress compared with v0.5; the overall average error alone is not sufficient.
 - Diagnostics may miss issues or produce too many hints. Their order does not represent design importance or editing time. No warnings, fewer nodes or a machine acceptance status do not mean that artwork is ready to deliver.
 - Complex soft edges, shadows, textures, photographs and original-typeface recovery are not this release's focus. Grouping does not recover the author's intended semantics or original layers.

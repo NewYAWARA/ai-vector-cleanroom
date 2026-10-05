@@ -37,8 +37,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "5296FD963824D081C6DDD537EF16F9DD3132773AFD2C0F2844EC1F7236223E72",
-      "size": 28313
+      "sha256": "064A5B434F2F3F08F8EE8B254B2C72CB78BE2C345BACCE02ED3AE2DF32FB5555",
+      "size": 28691
     },
     {
       "path": "CITATION.cff",
@@ -297,13 +297,13 @@
     },
     {
       "path": "release/RELEASE_NOTES.en.md",
-      "sha256": "D88FEB8DF278FD3DEAFDF104538E5C570ED07668547A1940BA91C761ABCB7CAC",
-      "size": 9494
+      "sha256": "14F141DF1D56D3F77B51154DC94D52A29CB6FF80BFB2B0F31412EF80BD5B66BD",
+      "size": 9759
     },
     {
       "path": "release/RELEASE_NOTES.md",
-      "sha256": "75224DF86F57AB6F272A854289841C7BDACBB51687D1C486E83ED0F16C55079B",
-      "size": 7378
+      "sha256": "7CA505250746EC1DFD44516E9C1C5BC634F3C19DDE3FA9B2FF36296FA111E39F",
+      "size": 7571
     },
     {
       "path": "release/__init__.py",
@@ -597,8 +597,8 @@
     },
     {
       "path": "tests/test_curve_refit.py",
-      "sha256": "07518C44049A60C51FB471A34B93B08B12D04581F57F1975C78E394CDFF61302",
-      "size": 12774
+      "sha256": "4B7BC8B050DAFB216BC95E8A670EE04CA87937810C6248CEE4A1C3BF61A43F75",
+      "size": 13822
     },
     {
       "path": "tests/test_curve_refit_stage.py",

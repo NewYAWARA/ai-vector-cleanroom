@@ -9,6 +9,7 @@
 - 轉檔、整理、逐物件接手診斷、匯出與品質門檻均延續內部 Preview 4，本次沒有新的演算法或畫質改善。研究中的細長物件重建仍未加入預設管線。
 - 來源包改為 `AI-Vector-Cleanroom-v0.6.0-alpha.zip`，發行收據改為 `SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json`。預設專用環境使用 `v0.6.0-alpha`；工作資料沿用內部相容目錄 `AIVC\designer4`，不自動搬移或重跑，既有相容結果與判斷保留。
 - 若自訂 `AVC_VENV_DIR` 指向其他版本的環境，請清除覆蓋或指定全新目錄；setup 不會略過環境版本標記，不需也不應手動改標記。
+- 曲線擬合的浮點參考回歸測試，僅對實際更新值容許最多 4 ULP 的機器捨入差，回退與端點仍精確核對；正式幾何與視覺門檻不變。The floating-point reference regression test allows at most 4 ULP of machine rounding for actual updates, with exact fallback and endpoint checks; production geometry and visual thresholds are unchanged.
 - 仍無 Illustrator 實機完稿與設計師計時驗收；本次提交的驗證以該次 CI 與發行檢查為準，不把舊測試數字改寫成本次結果。
 
 Public numbering now continues the `v0.5.0-alpha → v0.6.0-alpha` series. The mistakenly published Preview 4 tag and Release have been removed; internal development records remain below. Complete Traditional Chinese and English documentation replaces the previous partial English coverage. Conversion, refinement, handoff diagnostics, exports and quality gates are unchanged from the completed internal Preview 4 build. The source archive, receipt and default environment use the public version; compatible work data and saved decisions remain in the internal `AIVC\designer4` directory. A custom environment override pointing to another version must be cleared or changed to a fresh directory. Illustrator finishing and designer time savings have not been validated.

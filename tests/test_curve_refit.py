@@ -47,7 +47,7 @@ def _dense_polygon(vertices, samples_per_edge=50):
 
 
 class CurveRefitTests(unittest.TestCase):
-    def test_vectorized_reparameterize_matches_scalar_reference_exactly(self):
+    def test_vectorized_reparameterize_matches_scalar_reference_within_roundoff(self):
         rng = np.random.default_rng(20260719)
         fixtures = []
         for count in (2, 3, 9, 64, 257):
@@ -68,7 +68,22 @@ class CurveRefitTests(unittest.TestCase):
                 expected = _reference_reparameterize(
                     points, parameters, control)
                 actual = _reparameterize(points, parameters, control)
-                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertEqual(actual.dtype, np.dtype(np.float64))
+                self.assertTrue(np.all(np.isfinite(actual)))
+                self.assertTrue(np.all((actual >= 0.0) & (actual <= 1.0)))
+                np.testing.assert_array_equal(actual[[0, -1]], [0.0, 1.0])
+                if np.array_equal(expected, parameters):
+                    # Degenerate/non-monotone proposals must preserve the
+                    # original parameter mapping exactly, including its order.
+                    np.testing.assert_array_equal(actual, parameters)
+                else:
+                    # Scalar np.dot and vectorized component sums can round
+                    # differently (2 ULP observed on a Windows CI runner).
+                    # Permit only a few float64 steps for these fixed fixtures;
+                    # this is not the contour-fitting or visual error budget.
+                    np.testing.assert_array_max_ulp(actual, expected, maxulp=4)
+                    self.assertTrue(np.all(np.diff(actual) > 1.0e-9))
 
     def test_near_straight_open_contour_becomes_one_line(self):
         x = np.linspace(0.0, 120.0, 241)
