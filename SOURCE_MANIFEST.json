@@ -22,8 +22,8 @@
     },
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "9D4E3287576AB4ED1E193C7632C76F2CDD67AF96313A60DE4998221EB3024A46",
-      "size": 2770
+      "sha256": "E22D2E7E7EB435EA71CF92B298C29CA7A5243107E32F0312D63D1F3600748CE4",
+      "size": 2734
     },
     {
       "path": ".gitignore",
@@ -37,13 +37,13 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "D5B2ED08E2CA27FE8BEC7ED72CD597313186C157290B1A97769514721E02B14B",
-      "size": 26036
+      "sha256": "5080DB594F1876988A80EC542AADCCF767EFD44583492563C1480EAEC736E0F4",
+      "size": 28096
     },
     {
       "path": "CITATION.cff",
-      "sha256": "52A3392126A6E5CE30D25AA5405B0E55A9830EC2141DE8E03D82487E2CD82F91",
-      "size": 360
+      "sha256": "6740CE075F5C24FBE704E78A9F429E0CDDDA4FEC51B26F74EBAFAAA30984913D",
+      "size": 351
     },
     {
       "path": "CONTRIBUTING.md",
@@ -62,13 +62,18 @@
     },
     {
       "path": "PUBLISHING.md",
-      "sha256": "A907BD67D7430BBAED851070800A35F4CE28C1DBE45805314CCAF68B35F36E36",
-      "size": 3614
+      "sha256": "437292A220D83F3939C35CA74ACC28EBBA0A44F4CF43C71E8C2493BD266D14D6",
+      "size": 4371
+    },
+    {
+      "path": "README.en.md",
+      "sha256": "A718FEA6D574DB0F65EB0F703AEF72F93EA3AA9DF1790088E0A8F9CD235E2A13",
+      "size": 9321
     },
     {
       "path": "README.md",
-      "sha256": "E37A2C9B956B9F1D1E5EBA85BF0EA85CDBE5FD8F35B110C58BD4137D1B459E5E",
-      "size": 7790
+      "sha256": "04A83266FEB713014EA2E818503DDDA90AFF1E02CA8D4FC2A785A9E5CF1BCAC6",
+      "size": 7402
     },
     {
       "path": "THIRD_PARTY_NOTICES.md",
@@ -77,8 +82,8 @@
     },
     {
       "path": "VERSION.txt",
-      "sha256": "219486D09C8678677BC6DE66267DB7DADCFEE276E59C51AF65CC0BD706A181C9",
-      "size": 2492
+      "sha256": "A923376F33BD669BF21F2043194634078E04CC3297DEA5100386AE24989BC3C0",
+      "size": 2787
     },
     {
       "path": "alpha_topology.py",
@@ -102,8 +107,8 @@
     },
     {
       "path": "clean.bat",
-      "sha256": "BA6DA30837BAB1DF5B4A5D52B263B8547DD035FB86BD438A436CDD0C17DEB9FA",
-      "size": 1334
+      "sha256": "76A6FF627307F29D020BC5A6ECF5ADFF83FF3DA9C30482688D5A8E76EE7B12D5",
+      "size": 1319
     },
     {
       "path": "clean_base.py",
@@ -156,9 +161,14 @@
       "size": 151254
     },
     {
+      "path": "docs/USER_GUIDE.en.md",
+      "sha256": "CCE05A26213E41269FFF9D69AC6F2F06EA457D8D82536CB37403B1E858F23B8C",
+      "size": 26823
+    },
+    {
       "path": "docs/USER_GUIDE.md",
-      "sha256": "9B93DF413BF0777A91E2D7DA4085DD0A529F7C5F611870B4EA91DB123D09578A",
-      "size": 16298
+      "sha256": "B461CF70C8236D3C9085FEF50D67ED8D31A003FFECB2377FAF37DBBE2951BC2C",
+      "size": 20681
     },
     {
       "path": "editability_audit.py",
@@ -177,8 +187,8 @@
     },
     {
       "path": "environment_preflight.py",
-      "sha256": "AB4435A315DFDA42DAF463C83F78C16ECB4F148DD3F4BC3C779A3BADF0456AE0",
-      "size": 10645
+      "sha256": "DEC7A1E0E96D580B558634A50795798DDB748F35533F42DB1D30A369DDC96D30",
+      "size": 10636
     },
     {
       "path": "exact_native_shapes.py",
@@ -286,9 +296,14 @@
       "size": 21276
     },
     {
+      "path": "release/RELEASE_NOTES.en.md",
+      "sha256": "59B856569865B705A9176DC60AAF6F6E046E1A3FD885069B0C413DD9D4D54B82",
+      "size": 9428
+    },
+    {
       "path": "release/RELEASE_NOTES.md",
-      "sha256": "E79B8235F27B6BFF889232E547B03DF372A93454984E4C085391EA83B6CED7F1",
-      "size": 6239
+      "sha256": "0439BFF1A057195FC142F7D5698646D62B2F4FA5B942280634E4DC2B1306EAC9",
+      "size": 7408
     },
     {
       "path": "release/__init__.py",
@@ -297,8 +312,8 @@
     },
     {
       "path": "release/package_source_beta6.py",
-      "sha256": "4598CF623733AF3D1A5E47B14E942065F3B93AF7A4C1D86DC11C39671F496AA5",
-      "size": 24811
+      "sha256": "1D545275530C48DD2C0DE365C049C4C16A74960434EB1EA662777611CD05375C",
+      "size": 24874
     },
     {
       "path": "requirements-preview.txt",
@@ -332,8 +347,8 @@
     },
     {
       "path": "setup_windows.py",
-      "sha256": "0934ABF41A029B21F211B3A0F5C47802F3B21E583ABBB2CD742755F9EF2AD71B",
-      "size": 18493
+      "sha256": "19E858FFEA2E3318FF0B35581FCC4CD782E83FA18BC65BD2F30F43EB2FF9FE98",
+      "size": 18484
     },
     {
       "path": "source_boundary_evidence.py",
@@ -412,8 +427,8 @@
     },
     {
       "path": "tests/README.md",
-      "sha256": "2E1728F6B7ED7DE0CBAF9C3535927F05A367D4EE2D26CE81D1581C0ED93A44CD",
-      "size": 4738
+      "sha256": "C9E2A537AE5F038403816F4DCABA8ECD68B99A470223DBFAE9AFD1C8FC2B2A34",
+      "size": 4729
     },
     {
       "path": "tests/fixtures/line_over_fill_darkgray.png",
@@ -497,13 +512,13 @@
     },
     {
       "path": "tests/run_highres_test.bat",
-      "sha256": "181BC9B2DC7376A711F7991C002459B4218464A3F8EEC020873C56319BCA1B9B",
-      "size": 811
+      "sha256": "8609EF0A6439EE56E0E97FC3879AB57503A19682D378CA6B024818F188BDAEC5",
+      "size": 802
     },
     {
       "path": "tests/run_tests.bat",
-      "sha256": "23D5D1590F12C91B97AFCB010DAC07C850EB9276E1BDB1441DEF2354901A6B92",
-      "size": 834
+      "sha256": "451DDDEF7F0C8A10C1804C893D6519149A24094FC57AF9076ED55087B74FAF82",
+      "size": 825
     },
     {
       "path": "tests/test_adaptive_palette.py",
@@ -752,8 +767,8 @@
     },
     {
       "path": "tests/test_regression.py",
-      "sha256": "43131E41B7B8E0402B4E9B358E235BBEAFF16AD86DE9B714DFDB9FE4B2C2B91A",
-      "size": 36891
+      "sha256": "EB6F59C712DF7918C514B3131D925650435EDD22D4A98B3CE956ADE620A8B05A",
+      "size": 36855
     },
     {
       "path": "tests/test_scene_graph_postprocess.py",
@@ -762,8 +777,8 @@
     },
     {
       "path": "tests/test_setup_windows.py",
-      "sha256": "75D46C824D045DAFC259AEC60BB3218C0C6D4E7499B4A9CF9A8ED41A4C09E35C",
-      "size": 10599
+      "sha256": "17FDE130321634D0988DF2A56C2E4F2ADE438BF6FA4F354CD0BD8320BC4C4E7A",
+      "size": 10590
     },
     {
       "path": "tests/test_source_boundary_evidence.py",
@@ -812,8 +827,8 @@
     },
     {
       "path": "tests/test_source_release.py",
-      "sha256": "E8134B608ECABEA9D344A301DF9C82B527BDEA581BFCE73DCECAF5AB72F81BD0",
-      "size": 15734
+      "sha256": "308AA2368C43B95B5D761407181F45A3D0470BC4F6AC2C5F7A5555E8BFDAB770",
+      "size": 15725
     },
     {
       "path": "tests/test_source_repair_stage.py",
@@ -867,8 +882,8 @@
     },
     {
       "path": "tests/test_workbench_beta4.py",
-      "sha256": "0396C97928BB4EC1340B3EFE5658B035FE5A24FFD43728E792ACE366DA013287",
-      "size": 26489
+      "sha256": "9EC0448606A715DF77174927699C6CDF0AD3AC70051E90E4D701F9A9C9E60DB1",
+      "size": 26480
     },
     {
       "path": "tests/test_workbench_handoff_links.py",
@@ -887,13 +902,13 @@
     },
     {
       "path": "vector_cleanroom.py",
-      "sha256": "235A50681D5D3942996B15065A4B03BF2A257504A03E67A19CD28EC41C82D644",
-      "size": 301683
+      "sha256": "196713C9CBA9733CB4F758D272D6AC073294F73523DE40C575ED3E549828E12F",
+      "size": 301674
     },
     {
       "path": "workbench.bat",
-      "sha256": "7414CA31590A41B3EEFF1F826508A6FBB3C71309E24558E6E70E0B4C002D074C",
-      "size": 1237
+      "sha256": "9015089BB8581D276E9341D2B2D9DA6A8E139A098D59387CD7B591BB1CA6E187",
+      "size": 1228
     },
     {
       "path": "workbench.py",
@@ -902,22 +917,22 @@
     },
     {
       "path": "使用說明.txt",
-      "sha256": "45AB7AAADF4733D2CFABA3DBD47C6D396DFAC0D4689AC632B0973AA500E4473E",
-      "size": 11265
+      "sha256": "C30A2EEB52C1093CA2541F8AAF1BEFE70FDA9513D73B9136764469072A9D2F20",
+      "size": 11694
     },
     {
       "path": "工作台.bat",
-      "sha256": "7414CA31590A41B3EEFF1F826508A6FBB3C71309E24558E6E70E0B4C002D074C",
-      "size": 1237
+      "sha256": "9015089BB8581D276E9341D2B2D9DA6A8E139A098D59387CD7B591BB1CA6E187",
+      "size": 1228
     },
     {
       "path": "清稿.bat",
-      "sha256": "BA6DA30837BAB1DF5B4A5D52B263B8547DD035FB86BD438A436CDD0C17DEB9FA",
-      "size": 1334
+      "sha256": "76A6FF627307F29D020BC5A6ECF5ADFF83FF3DA9C30482688D5A8E76EE7B12D5",
+      "size": 1319
     }
   ],
-  "package_name": "AI-Vector-Cleanroom-Designer-Preview-4",
+  "package_name": "AI-Vector-Cleanroom-v0.6.0-alpha",
   "policy": "explicit_source_allowlist_no_runtime_or_private_evidence",
   "schema": "ai-vector-cleanroom-source-release/1",
-  "version": "v3-designer-preview.4"
+  "version": "v0.6.0-alpha"
 }

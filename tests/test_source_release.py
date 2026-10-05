@@ -60,7 +60,7 @@ class SourceReleaseTests(unittest.TestCase):
                 Path(local_app_data)
                 / "AI-Vector-Cleanroom"
                 / "venvs"
-                / "v3-designer-preview.4"
+                / "v0.6.0-alpha"
             )
 
         seen = set()

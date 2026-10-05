@@ -51,7 +51,7 @@ class SetupWindowsTests(unittest.TestCase):
 
     def test_default_runtime_key_isolated_for_gpu_lock_revision(self):
         path = setup.resolve_venv_dir({"LOCALAPPDATA": r"C:\LocalData"})
-        self.assertEqual(path.name, "v3-designer-preview.4")
+        self.assertEqual(path.name, "v0.6.0-alpha")
 
     def test_target_path_rejects_source_tree_and_reparse_root(self):
         with self.assertRaisesRegex(setup.SetupError, "原始碼目錄之外"):

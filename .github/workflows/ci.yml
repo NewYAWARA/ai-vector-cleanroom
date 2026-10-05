@@ -49,14 +49,14 @@ jobs:
         run: python -B release/package_source_beta6.py audit
       - name: Build and verify source-only archive
         run: |
-          python -B release/package_source_beta6.py build --zip "$env:RUNNER_TEMP\AI-Vector-Cleanroom-Designer-Preview-4.zip" --receipt "$env:RUNNER_TEMP\SOURCE_RELEASE_RECEIPT_Designer_Preview_4.json"
+          python -B release/package_source_beta6.py build --zip "$env:RUNNER_TEMP\AI-Vector-Cleanroom-v0.6.0-alpha.zip" --receipt "$env:RUNNER_TEMP\SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -B release/package_source_beta6.py verify --zip "$env:RUNNER_TEMP\AI-Vector-Cleanroom-Designer-Preview-4.zip" --receipt "$env:RUNNER_TEMP\SOURCE_RELEASE_RECEIPT_Designer_Preview_4.json"
+          python -B release/package_source_beta6.py verify --zip "$env:RUNNER_TEMP\AI-Vector-Cleanroom-v0.6.0-alpha.zip" --receipt "$env:RUNNER_TEMP\SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Expand-Archive -LiteralPath "$env:RUNNER_TEMP\AI-Vector-Cleanroom-Designer-Preview-4.zip" -DestinationPath "$env:RUNNER_TEMP\avc-source"
+          Expand-Archive -LiteralPath "$env:RUNNER_TEMP\AI-Vector-Cleanroom-v0.6.0-alpha.zip" -DestinationPath "$env:RUNNER_TEMP\avc-source"
       - name: Test the extracted public source, without private fixtures
         run: |
-          Set-Location "$env:RUNNER_TEMP\avc-source\AI-Vector-Cleanroom-Designer-Preview-4"
+          Set-Location "$env:RUNNER_TEMP\avc-source\AI-Vector-Cleanroom-v0.6.0-alpha"
           python -B preflight_check.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -B -m unittest discover -s tests -p 'test_*.py' -v

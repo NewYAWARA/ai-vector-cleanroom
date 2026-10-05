@@ -16,7 +16,7 @@ if defined AVC_VENV_DIR (
     echo [ERROR] LOCALAPPDATA is missing and AVC_VENV_DIR is not set.
     exit /b 2
   )
-  set "AVC_ACTIVE_VENV=%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4"
+  set "AVC_ACTIVE_VENV=%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha"
 )
 
 set "AVC_PYTHON=%AVC_ACTIVE_VENV%\Scripts\python.exe"

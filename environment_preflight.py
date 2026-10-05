@@ -24,7 +24,7 @@ from app_paths import (
     resolve_data_dir,
 )
 
-TOOL_VERSION = "v3-designer-preview.4"
+TOOL_VERSION = "v0.6.0-alpha"
 SUPPORTED_PYTHON = (3, 12)
 REQUIRED_POINTER_BITS = 64
 DEFAULT_LOCK_PATH = (

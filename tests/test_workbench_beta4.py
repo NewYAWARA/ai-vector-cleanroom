@@ -330,7 +330,7 @@ class WorkbenchBeta5Tests(unittest.TestCase):
                 page = workbench.build_blind_test()
                 body = page.read_text(encoding="utf-8")
 
-        self.assertEqual(workbench.vc.TOOL_VERSION, "v3-designer-preview.4")
+        self.assertEqual(workbench.vc.TOOL_VERSION, "v0.6.0-alpha")
         self.assertIn(
             f"version:'{workbench.vc.TOOL_VERSION}'", body)
         self.assertNotIn("v3-codex-beta.3", body)

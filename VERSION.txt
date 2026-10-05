@@ -1,8 +1,8 @@
-AI Vector Cleanroom — Designer Preview 4
-Version: v3-designer-preview.4
-Build date: 2026-10-05
+AI Vector Cleanroom — v0.6.0-alpha
+Version: v0.6.0-alpha
+Build date: 2026-10-06
 Distribution: source-only (MIT; external CPython 3.12 x64 environment)
-Default venv: %LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4
+Default venv: %LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha
 Default data root: %LOCALAPPDATA%\AIVC\designer4
 
 定位：把可用向量交給 Illustrator 接手；難修區域保留參考與人工處理清單。
@@ -28,5 +28,9 @@ Default data root: %LOCALAPPDATA%\AIVC\designer4
 
 驗證狀態：本機程式、結構與渲染檢查，不代表 Illustrator 匯入／完稿驗收。
 尚未取得設計師實際對照計時，沒有免修改率或省工比例承諾。
-本預覽版承接 Beta.6 核心，使用獨立環境與資料目錄，不自動搬移舊版資料。
+公開版號承接 v0.5.0-alpha；轉檔與接手功能與先前發布的 Preview 4 相同。
+新版使用獨立 venv，與 Preview 4 共用 designer4 資料；不自動搬移 v0.5/Beta.6 資料。
+This release corrects public numbering and restores complete English documentation;
+conversion and handoff behavior are unchanged from Designer Preview 4.
+Full English documentation: README.en.md and docs/USER_GUIDE.en.md.
 詳細用法與邊界請讀 README.md、使用說明.txt；歷史技術變更保留於 CHANGELOG.md。

@@ -36,7 +36,7 @@ setup、根目錄 launcher 與測試 launcher 共用同一個 external virtual
 environment。若有設定 `AVC_VENV_DIR` 就使用該目錄；未設定時使用：
 
 ```text
-%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4
+%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha
 ```
 
 正式回歸測試執行：

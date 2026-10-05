@@ -565,7 +565,7 @@ class VectorRegression(unittest.TestCase):
         self.assertIsInstance(report["paint_roles"], dict)
         self.assertIsInstance(report["designer_operations"], dict)
         self.assertTrue(report["preview_is_svg_render"])
-        self.assertEqual(report["tool_version"], "v3-designer-preview.4")
+        self.assertEqual(report["tool_version"], "v0.6.0-alpha")
         self.assertEqual(
             report["editability_schema"],
             "ai-vector-cleanroom.editability/v2")
@@ -782,7 +782,7 @@ class VectorRegression(unittest.TestCase):
         readme = (self.result_dir("one_px_black") / "OUTPUT_README.txt").read_text(
             encoding="utf-8")
         self.assertTrue(readme.startswith("AI 向量清稿工具｜本次輸出摘要\n"))
-        self.assertIn("工具版本：v3-designer-preview.4", readme)
+        self.assertIn("工具版本：v0.6.0-alpha", readme)
         self.assertIn("驗收狀態：accepted", readme)
         self.assertIn("前景符合度：", readme)
         self.assertIn("外觀閘門：accepted", readme)
@@ -798,7 +798,7 @@ class VectorRegression(unittest.TestCase):
 
         review = (self.result_dir("one_px_black") / "review.html").read_text(
             encoding="utf-8")
-        self.assertIn("AI Vector Cleanroom v3-designer-preview.4", review)
+        self.assertIn("AI Vector Cleanroom v0.6.0-alpha", review)
         self.assertIn("accepted：外觀與可編輯性均通過自動品質閘門", review)
         self.assertIn("局部細節 p10", review)
         self.assertIn("可編輯性", review)
@@ -811,7 +811,7 @@ class VectorRegression(unittest.TestCase):
             and element.attrib.get("id") == "ai-vector-cleanroom-metadata"
         )
         embedded = json.loads(metadata.text)
-        self.assertEqual(embedded["tool_version"], "v3-designer-preview.4")
+        self.assertEqual(embedded["tool_version"], "v0.6.0-alpha")
         self.assertEqual(embedded["options_requested"], report["options_requested"])
         self.assertEqual(embedded["options_effective"], report["options_effective"])
         self.assertEqual(embedded["visual_acceptance_status"],

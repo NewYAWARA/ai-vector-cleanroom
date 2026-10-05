@@ -2,6 +2,19 @@
 
 此檔記錄適合公開的產品變更；私有正式素材、客戶／品牌名稱、本機路徑與內部發行證據不列入公開紀錄。
 
+## v0.6.0-alpha — 2026-10-06
+
+- 公開版本接回既有 `v0.5.0-alpha → v0.6.0-alpha` 系列。先前發布的 `v3-designer-preview.4` tag 與 Release 保留，不移動、不刪除。
+- 補齊完整繁體中文與英文 README、使用指南及發布說明。新版文件分清相較 v0.5 的功能改進，以及此次相較 Preview 4 的編號與文件修正。
+- 轉檔、整理、逐物件接手診斷、匯出與品質門檻均延續 Preview 4，本次沒有新的演算法或畫質改善。研究中的細長物件重建仍未加入預設管線。
+- 來源包改為 `AI-Vector-Cleanroom-v0.6.0-alpha.zip`，發行收據改為 `SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json`。預設專用環境使用 `v0.6.0-alpha`；工作資料仍在相容 Preview 4 的 `AIVC\designer4`，不自動搬移或重跑，既有結果與判斷保留。
+- 若自訂 `AVC_VENV_DIR` 指向舊 Preview 4 環境，請清除覆蓋或指定全新目錄；setup 不會略過環境版本標記，不需也不應手動改標記。
+- 仍無 Illustrator 實機完稿與設計師計時驗收；本次提交的驗證以該次 CI 與發行檢查為準，不把舊測試數字改寫成本次結果。
+
+Public numbering now continues the `v0.5.0-alpha → v0.6.0-alpha` series. The published Preview 4 tag and Release remain intact. Complete Traditional Chinese and English documentation replaces the previous partial English coverage. Conversion, refinement, handoff diagnostics, exports and quality gates are unchanged from Preview 4. The source archive, receipt and default environment use the new public version; existing work data and saved decisions remain in the compatible `AIVC\designer4` directory. A custom environment override pointing to Preview 4 must be cleared or changed to a fresh directory. Illustrator finishing and designer time savings have not been validated.
+
+完整改版說明／Full release notes：[繁體中文](release/RELEASE_NOTES.md) · [English](release/RELEASE_NOTES.en.md)。
+
 ## GitHub 公開更新 — 2026-10-05
 
 這次 GitHub 發布從 `v0.5.0-alpha` 更新到 `v3-designer-preview.4`。中間的 Beta 與 Designer Preview 編號記錄本機開發迭代，並不表示每一版都曾在 GitHub 發布。仍屬需要人工檢查的預覽版。
@@ -10,7 +23,7 @@
 
 新版以 Windows x64 / CPython 3.12 與外部專用環境為驗證目標；使用 `setup_windows.bat` 安裝、`工作台.bat` 啟動。舊入口 `install_deps.bat` 和 `workbench.bat` 保留為相同行為的入口。新版資料使用獨立的 `designer4` 目錄，不自動搬移舊資料。
 
-各項改進和未解決問題見 [本次發布說明](release/RELEASE_NOTES.md)。沒有 Illustrator 實機完稿或設計師工時證據，不能將節點減少、測試通過或接手提示視為免修率。
+各項改進和未解決問題見 [該次發布說明](https://github.com/NewYAWARA/ai-vector-cleanroom/blob/v3-designer-preview.4/release/RELEASE_NOTES.md)。沒有 Illustrator 實機完稿或設計師工時證據，不能將節點減少、測試通過或接手提示視為免修率。
 
 ## v3-designer-preview.4 — 接手診斷預覽版，待設計師驗收
 

@@ -1,12 +1,14 @@
 # AI Vector Cleanroom
 
-繁體中文 | [English](#english)
+繁體中文 | [English — full documentation](README.en.md)
 
 把 PNG、JPG、WebP、BMP 整理成**設計師可以接手的 SVG 底稿**。能用的部分先留下，難修的部分保留參考，讓設計師決定修改或重畫。
 
-**目前版本：`v3-designer-preview.4`，Windows 原始碼預發布版。** 目標是減少設計師後續整理時間；目前尚無設計師對照計時，也尚未完成 Adobe Illustrator 實機匯入與完稿驗收。它不能保證一鍵完稿，沒有省工百分比承諾。
+**目前版本：`v0.6.0-alpha`，Windows 原始碼預發布版。** 目標是減少設計師後續整理時間；目前尚無設計師對照計時，也尚未完成 Adobe Illustrator 實機匯入與完稿驗收。它不能保證一鍵完稿，沒有省工百分比承諾。
 
 由 **張進逸（Shinichi Chang）** 開發與維護。MIT 授權。
+
+提供完整中英文文件；目前工作台介面仍以繁體中文為主，英文指南附上對應的中文按鈕名稱。
 
 ## 第一次使用
 
@@ -29,7 +31,7 @@
 | 可用原圖證據重建部分輪廓、檢查假孔與白縫 | 減少把像素階梯和中間描圖錯誤當作原設計保留下來的情況 |
 | 整張整理與受限的局部減點 | 能通過檢查的部分先整理；保留未能改善的部分，另存版本供比較 |
 | 原圖與向量左右比對、物件選取與放大 | 直接找到需要處理的位置，不只看整張圖的平均分數 |
-| Preview 4 的逐物件差異提示 | 根據真正可見的部分提醒色彩、覆蓋範圍與明暗差異，移除重複通用提醒 |
+| 逐物件差異提示 | 根據真正可見的部分提醒色彩、覆蓋範圍與明暗差異，移除重複通用提醒 |
 | 採用／待確認／交人工與接手包 | 可以帶著完整候選去編輯，也可以只留下已採用部分再補畫 |
 | 保存、重跑與版本衝突保護 | 減少覆寫已確認成果或把過期判斷套到新圖的風險 |
 
@@ -61,14 +63,18 @@
 
 ## 舊版使用者更新
 
-請把新版解壓到新目錄，執行新版的 setup，不要覆蓋還在使用的舊版環境。這版採獨立環境與資料目錄，不自動搬移舊版資料。
+公開版號承接 `v0.5.0-alpha`，本版為 `v0.6.0-alpha`。先前誤用內部代號發布的 `v3-designer-preview.4` 保留供既有連結使用；本版修正版號與完整中英文文件，轉檔及接手功能與 Preview 4 相同。
+
+請把新版解壓到新目錄，執行新版的 setup，不要覆蓋還在使用的舊版環境。從 `v0.5.0-alpha` 或 Beta.6 更新，不會自動搬移舊資料；已使用 Preview 4 的使用者則沿用同一份 `designer4` 工作資料與既有結果。啟動新版前先關閉舊工作台，同一資料目錄不可同時寫入。
 
 | 項目 | 預設位置 |
 |---|---|
-| 專用 Python 環境 | `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4` |
+| 專用 Python 環境 | `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha` |
 | 圖片與轉檔結果 | `%LOCALAPPDATA%\AIVC\designer4` 下的 `input`、`output` |
 
 需要重新處理時，可將原始圖片拖進新版；舊結果與已匯出的接手包會留在原處。此版本是 source-only 發行，不內嵌 Python，也不是可直接 `pip install ai-vector-cleanroom` 的套件。其他作業系統未列入此預覽版的使用驗證範圍。
+
+若曾設定 `AVC_VENV_DIR` 指向 Preview 4 環境，請先移除該設定或指定新的空路徑再執行 setup；舊環境的版本標記不相容，不要手動修改標記檔。
 
 自訂資料位置、批次轉檔、鍵盤操作及整理限制，見 [完整使用指南](docs/USER_GUIDE.md)。
 
@@ -88,13 +94,3 @@
 先完成 setup，再執行 `tests\run_tests.bat`。測試說明與可自行產生的合成基準見 [tests/README.md](tests/README.md)，貢獻方式見 [CONTRIBUTING.md](CONTRIBUTING.md)。程式與渲染測試不能替代 Illustrator 實機檢查或設計師計時。
 
 MIT 授權見 [LICENSE](LICENSE)，依賴聲明見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，作者與引用見 [AUTHORS.md](AUTHORS.md) 與 [CITATION.cff](CITATION.cff)。
-
-## English
-
-AI Vector Cleanroom turns flat bitmap graphics into editable SVG drafts for designer handoff. Created and maintained by **Shinichi Chang (張進逸)**. MIT licensed.
-
-`v3-designer-preview.4` is a **Windows source-only pre-release**, targeting CPython 3.12 x64. Run `setup_windows.bat`, then `工作台.bat`. Conversion runs locally; dependency installation requires internet access.
-
-The update adds source-aware cleanup, versioned refinement, object-level comparison and a handoff package. Open **`working.svg`** first: it includes the complete vector candidate and a hidden raster reference, so it is not vector-only final artwork. `accepted.svg` is initially empty until you explicitly accept objects.
-
-Output still needs human review. Font recovery, complex soft effects and reliable reconstruction of every thin detail are unsupported. No designer time-saving percentage or Illustrator import/finishing validation has been established. Please [report what you kept, edited or redrew](https://github.com/NewYAWARA/ai-vector-cleanroom/issues/new/choose), using assets you are allowed to share.

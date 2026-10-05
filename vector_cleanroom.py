@@ -52,7 +52,7 @@ BASE = CODE_DIR
 DATA_DIR = resolve_data_dir(code_dir=CODE_DIR)
 
 EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-TOOL_VERSION = "v3-designer-preview.4"
+TOOL_VERSION = "v0.6.0-alpha"
 MATERIAL_FALLBACK_GAIN = 1.0
 RECONSTRUCTION_KEYS = ("strokes", "gradients", "geometry")
 _CANDIDATE_GAIN = {

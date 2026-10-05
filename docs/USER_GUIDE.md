@@ -1,8 +1,10 @@
-# AI Vector Cleanroom — Designer Preview 4
+# AI Vector Cleanroom — v0.6.0-alpha
+
+繁體中文 | [English — full guide](USER_GUIDE.en.md)
 
 **先留下可用的向量，難修的部分交給設計師。**
 
-`v3-designer-preview.4` 是面向 Illustrator 接手流程的 Windows 原始碼預覽版。工具將 PNG、JPG、WebP、BMP 轉成 SVG，支援整張自動整理，然後直接匯出可編輯草稿。需要局部重畫時，也能標記「採用」「待確認」「交人工」。目標是減少後續整理負擔，而不是把每個像素都硬轉成更多碎路徑。
+`v0.6.0-alpha` 是面向 Illustrator 接手流程的 Windows 原始碼預覽版。工具將 PNG、JPG、WebP、BMP 轉成 SVG，支援整張自動整理，然後直接匯出可編輯草稿。需要局部重畫時，也能標記「採用」「待確認」「交人工」。目標是減少後續整理負擔，而不是把每個像素都硬轉成更多碎路徑。
 
 **目前沒有設計師實際省時比例，也未完成 Illustrator 匯入與完稿驗收。** 本機程式測試、瀏覽器預覽、節點數減少與幾何／渲染檢查，都不能替代設計師實際編輯、計時和交稿檢查。
 
@@ -110,22 +112,26 @@ Preview 4 改進接手時的問題定位。每個交接物件以真正可見的�
 
 | 項目 | 預設位置 |
 |---|---|
-| 專用 Python 環境 | `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4` |
+| 專用 Python 環境 | `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha` |
 | 工作資料 | `%LOCALAPPDATA%\AIVC\designer4` |
 | 輸入／結果 | 工作資料下的 `input`／`output` |
 
-這個預覽版使用獨立環境與資料目錄，不自動搬移 Beta.6 的 `%LOCALAPPDATA%\AIVC\b6` 資料，也不覆寫舊環境。更新原始碼或重跑 setup 不會清空工作資料。
+本版公開版號承接 `v0.5.0-alpha`；先前的 `v3-designer-preview.4` 是誤作公開版號的內部代號，本版轉檔與接手功能與其相同。請解壓到新目錄並執行 setup，建立 `v0.6.0-alpha` 專用環境。
+
+從 `v0.5.0-alpha` 或 Beta.6 更新時，不自動搬移舊資料，包括 Beta.6 的 `%LOCALAPPDATA%\AIVC\b6`。已使用 Preview 4 的使用者沿用同一個 `%LOCALAPPDATA%\AIVC\designer4` 資料目錄；保留這個目錄名稱是為了相容，並非新的公開版號。先關閉舊工作台再開新版，不要同時寫入同一資料目錄。更新原始碼或重跑 setup 不會清空工作資料，也不會自動重跑舊結果。
 
 需自訂時，在同一個命令提示字元視窗設定後啟動：
 
 ```bat
-set "AVC_VENV_DIR=D:\venvs\aivc-designer4"
+set "AVC_VENV_DIR=D:\venvs\aivc-v060"
 set "AVC_DATA_DIR=D:\AIVC-designer4"
 setup_windows.bat
 工作台.bat
 ```
 
 請使用短的絕對本機路徑。自訂環境須為新路徑，或由本 setup 建立且有有效 ownership marker 的專用環境；程式不接管其他專案的 venv。Setup 會檢查鎖定版本、Python ABI 與必要套件，修復失敗時保留原環境。依賴鎖定見 `requirements/validated-py312.lock.txt`。
+
+若 `AVC_VENV_DIR` 仍指向 Preview 4 的舊環境，請先移除 override（在命令提示字元輸入 `set "AVC_VENV_DIR="`）或改用新的空路徑，再執行 setup。舊環境的 ownership marker 與本版不相符，不要手動修改它。更新前先儲存判斷並匯出接手包；未儲存的瀏覽器草稿屬於該瀏覽器與網址，換瀏覽器或連接埠時不保證會自動出現。
 
 同一資料根目錄一次只允許一個寫入程序。不要放在 OneDrive、網路磁碟或多人共用的同步目錄。工作台只監聽 `127.0.0.1`，轉檔與接手資料保存在本機，不上傳圖片至外部服務；首次安裝依賴需連網。
 
@@ -139,9 +145,51 @@ setup_windows.bat
 
 CLI 的 `--input`／`--output` 優先於預設位置。要從工作台開啟這些結果，需使用相應資料根目錄。
 
+`clean.bat` 與 `清稿.bat` 功能相同；`workbench.bat` 是 `工作台.bat` 的英文檔名入口。執行 `clean.bat --help` 可查看現行選項：
+
+| 選項 | 預設與用途 |
+|---|---|
+| `--input`／`--output` | 工作資料下的 `input`／`output`；指定批次圖片及結果目錄 |
+| `--colors` | `0`，自動估色；可指定 2–64 固定色數 |
+| `--white-threshold` | `220`，淺色／棋盤背景清理門檻，可設 0–255 |
+| `--background` | `auto`，判斷並清理與邊界連通的淺背景；`keep` 保留背景，`transparent` 強制嘗試移除背景 |
+| `--max-size` | `2048`，描圖前長邊縮放上限；`0` 不縮放，正值至少為 16 像素 |
+| `--strokes` | `on`，嘗試恢復可調粗細的等寬筆畫；`off` 關閉 |
+| `--gradients` | `on`，嘗試重建漸層填色；`off` 關閉 |
+| `--geometry` | `conservative`，保守規則化；`normal` 另允許環帶邊緣轉為數學圓弧，`off` 關閉 |
+| `--curve-error-percent` | `0.25`，可設 0.05–2.0；曲線擬合的 p95 正規化誤差預算，定義與限制見上方「整張自動整理」 |
+| `--debug` | 預設關閉，失敗時顯示完整 traceback |
+
+舊選項 `--no-geometry` 仍是 `--geometry off` 的相容別名。這些開關只是啟用候選搜尋，不保證一定重建出筆畫、規則圖形或漸層。CLI 範例：
+
+```bat
+clean.bat --input D:\vector-jobs\input --output D:\vector-jobs\output --background keep --colors 8 --geometry conservative
+```
+
+批次結束碼：全部成功為 `0`，有失敗或沒有成功產物為 `1`，資料目錄或寫入鎖錯誤為 `2`；命令列參數錯誤也會以 `2` 結束。
+
 本版承接 Beta.6 的轉檔、保守幾何／筆畫／漸層處理、校稿與換色功能。工作台轉檔預設最多 1200 秒（20 分鐘）、16 個候選，可取消；失敗與超時不發布不完整結果。複雜多色圖的完整來源與場景檢查可能需要超過 15 分鐘，此上限不是完成時間保證。`AVC_JOB_TIMEOUT_SECONDS` 可在 30–1800 秒間設定轉檔上限，不會放寬品質檢查，也不改變局部減點的 60 秒上限。同一轉檔內，完全相同的 SVG、來源、參考圖與候選參數會重用補孔／分段及局部漸層的場景證據；快取不跨工作保存，場景不同仍重驗。WebGPU 僅在相容且驗證通過的 palette-label 運算啟用，並非整體 GPU 轉檔；可設定 `AVC_GPU_MODE=cpu`。
 
 其他歷史行為、失敗診斷與回滾紀錄見 [CHANGELOG.md](../CHANGELOG.md)。轉檔失敗診斷可能保存於資料根目錄 `.failed_jobs`，其中的部分輸出不是正式成品。
+
+## 一般轉檔輸出、校稿與換色
+
+一般轉檔結果與設計師接手包是不同的輸出。每張圖的結果存於 `output/result_名稱`，另有結果 ZIP；可從工作台結果列開啟對應功能，或直接開啟輸出目錄中的 HTML。
+
+| 檔案 | 用途 |
+|---|---|
+| `名稱_vector.svg` | 轉檔候選向量；與接手包內含參考圖的 `working.svg` 不同 |
+| `名稱_preview.png` | 成功渲染時的向量預覽；以結果報告標示的產物為準 |
+| `source_original.png` | 新轉檔保存的原始圖片參考，未去背 |
+| `source_reference.png` | 清理背景後的參考圖，不能當作未處理原圖 |
+| `review.html` | 本機瀏覽器校稿頁，可疊圖檢查輪廓與物件 |
+| `色彩調整.html` | 可用時產生的離線換色頁；依色彩角色修改並下載新的 SVG。不受支援的填色可能使此頁不產生 |
+| `report.json` | 機器可讀的參數、候選、檢查與診斷紀錄 |
+| `OUTPUT_README.txt` | 該次結果的說明、提醒與可用產物 |
+
+點結果列的「開啟校稿」或「換色」，也可在本機瀏覽器開啟對應 HTML。瀏覽器下載的換色 SVG 不會自動覆寫工作台版本或既有接手包。做完自動整理或局部簡化後，請使用新結果的校稿／換色頁，勿沿用舊頁面。渲染器失敗時，預覽可能是有標記的清理後參考圖替代品，不能當成 SVG 本身正確的證據；請核對 `report.json` 與 `OUTPUT_README.txt`。
+
+工作台的「產生盲測頁」進入 Stage 1 視覺盲評，用來收集外觀判斷，不能證明省工。「Stage 2 實作計時」產生給設計師實際編輯 SVG 的計時頁；它是收集人工證據的入口，不是自動完成的驗收。介面目前以繁體中文為主，完整英文指南列有對應按鈕名稱。
 
 ## 驗證邊界
 

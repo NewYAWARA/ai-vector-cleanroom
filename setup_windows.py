@@ -28,8 +28,8 @@ else:  # Keep source-audit/unit-test imports usable off Windows.
 from environment_preflight import PreflightError, parse_locked_requirements
 
 
-TOOL_VERSION = "v3-designer-preview.4"
-DEFAULT_VENV_KEY = "v3-designer-preview.4"
+TOOL_VERSION = "v0.6.0-alpha"
+DEFAULT_VENV_KEY = "v0.6.0-alpha"
 VENV_MARKER_NAME = ".aivc-venv.json"
 VENV_MARKER_SCHEMA = "ai-vector-cleanroom-external-venv/1"
 SUPPORTED_PYTHON = (3, 12)
@@ -555,7 +555,7 @@ def main() -> int:
         )
         return 3
 
-    print("[完成] AI Vector Cleanroom Beta.6 開源版環境已就緒。")
+    print(f"[完成] AI Vector Cleanroom {TOOL_VERSION} 開源版環境已就緒。")
     print(f"[位置] {outcome.venv_dir}")
     if outcome.backup_dir is not None:
         print(f"[舊環境備份] {outcome.backup_dir}")

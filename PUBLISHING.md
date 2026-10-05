@@ -1,6 +1,8 @@
 # 發布來源測試版
 
-在既有 `NewYAWARA/ai-vector-cleanroom` 儲存庫更新，保留網址、提交、Issue 與星號歷史。這次版本為 `v3-designer-preview.4`，屬於 **source-only pre-release**；版本編號不是品質分數。不要重新初始化儲存庫，也不要把本機工作目錄整包上傳。
+在既有 `NewYAWARA/ai-vector-cleanroom` 儲存庫更新，保留網址、提交、Issue 與星號歷史。這次版本為 `v0.6.0-alpha`，發布日期為 2026-10-06，屬於 **source-only pre-release**。公開編號接回 v0.5 系列；先前的 `v3-designer-preview.4` tag 與 Release 保留，不移動或刪除。版本編號不是品質分數。不要重新初始化儲存庫，也不要把本機工作目錄整包上傳。
+
+本次轉檔與接手行為沿用 Preview 4，修正公開編號、發行資訊並補齊完整雙語文件。預設專用環境改為 `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha`；資料仍在相容 Preview 4 的 `%LOCALAPPDATA%\AIVC\designer4`。不自動搬移或重跑資料；指向舊環境的 `AVC_VENV_DIR` 覆蓋須清除或改成新目錄，不可手改環境版本標記。
 
 ## 檢查要發布的內容
 
@@ -21,10 +23,10 @@ python -B -m unittest discover -s tests -p 'test_*.py' -v
 將產物放在儲存庫外，例如目前使用者的暫存目錄：
 
 ```powershell
-$releaseDir = Join-Path $env:TEMP 'avc-preview4-release'
+$releaseDir = Join-Path $env:TEMP 'avc-v0.6.0-alpha-release'
 New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-$sourceZip = Join-Path $releaseDir 'AI-Vector-Cleanroom-Designer-Preview-4.zip'
-$receipt = Join-Path $releaseDir 'SOURCE_RELEASE_RECEIPT_Designer_Preview_4.json'
+$sourceZip = Join-Path $releaseDir 'AI-Vector-Cleanroom-v0.6.0-alpha.zip'
+$receipt = Join-Path $releaseDir 'SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json'
 python -B release/package_source_beta6.py build --zip $sourceZip --receipt $receipt
 python -B release/package_source_beta6.py verify --zip $sourceZip --receipt $receipt
 ```
@@ -35,9 +37,9 @@ ZIP 內的 `SOURCE_MANIFEST.json` 記錄實際封裝內容。程式、文件或 
 
 ## 更新 GitHub
 
-先檢查 `git diff --stat`、完整 diff 與 `git status --short`，只提交準備好的公開來源與文件。以正常提交更新既有儲存庫，不 force-push、不刪除舊 tag。若 `v3-designer-preview.4` 已存在，改用下一個未使用的版本並同步版本常數，不移動已發布的 tag。
+先檢查 `git diff --stat`、完整 diff 與 `git status --short`，只提交準備好的公開來源與文件。以正常提交更新既有儲存庫，不 force-push、不刪除舊 tag。若 `v0.6.0-alpha` 已存在，改用下一個未使用的版本並同步版本常數，不移動已發布的 tag。
 
-在測試完成的提交建立 tag `v3-designer-preview.4`，推送提交與該 tag；GitHub Release 勾選 **Pre-release**。說明採用 `release/RELEASE_NOTES.md`，附件使用上述已驗證來源 ZIP 與收據。CI 只做檢查，不持有發布憑證、不自動上傳 Release。
+在測試完成的提交建立 tag `v0.6.0-alpha`，推送提交與該 tag；GitHub Release 勾選 **Pre-release**。發布內文依序放入 `release/RELEASE_NOTES.md` 的完整繁體中文與 `release/RELEASE_NOTES.en.md` 的完整英文，保留互相連結；不要以短英文摘要取代完整英文說明。可先將兩份內容合併成儲存庫外的 UTF-8 文字檔，再以該檔作為 Release body。附件使用上述已驗證來源 ZIP 與收據。CI 只做檢查，不持有發布憑證、不自動上傳 Release。
 
 發布後確認 tag 指向驗證過的提交、附件可下載、ZIP 與收據雜湊相符。README 保留目前支援環境、安裝方式、已知限制與回饋入口。
 

@@ -23,11 +23,11 @@ import zipfile
 
 SCHEMA = "ai-vector-cleanroom-source-release/1"
 RECEIPT_SCHEMA = "ai-vector-cleanroom-source-release-receipt/1"
-VERSION = "v3-designer-preview.4"
-PACKAGE_NAME = "AI-Vector-Cleanroom-Designer-Preview-4"
+VERSION = "v0.6.0-alpha"
+PACKAGE_NAME = "AI-Vector-Cleanroom-v0.6.0-alpha"
 MANIFEST_NAME = "SOURCE_MANIFEST.json"
-RECEIPT_NAME = "SOURCE_RELEASE_RECEIPT_Designer_Preview_4.json"
-FIXED_ZIP_TIME = (2026, 10, 5, 0, 0, 0)
+RECEIPT_NAME = "SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json"
+FIXED_ZIP_TIME = (2026, 10, 6, 0, 0, 0)
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -106,6 +106,7 @@ PUBLIC_ROOT_FILES = PRODUCT_FILES + (
     "NOTICE.md",
     "PUBLISHING.md",
     "README.md",
+    "README.en.md",
     "THIRD_PARTY_NOTICES.md",
     "VERSION.txt",
     "clean.bat",
@@ -228,7 +229,9 @@ RELEASE_FILES = (
     "release/__init__.py",
     "release/package_source_beta6.py",
     "release/RELEASE_NOTES.md",
+    "release/RELEASE_NOTES.en.md",
     "docs/USER_GUIDE.md",
+    "docs/USER_GUIDE.en.md",
     ".github/workflows/ci.yml",
     ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/ISSUE_TEMPLATE/designer_feedback.yml",

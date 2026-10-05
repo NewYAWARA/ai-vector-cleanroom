@@ -14,7 +14,7 @@ if not defined AVC_VENV_DIR (
         if not defined AVC_NO_PAUSE pause
         exit /b 2
     )
-    set "AVC_VENV_DIR=%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4"
+    set "AVC_VENV_DIR=%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha"
 )
 set "AVC_PYTHON=%AVC_VENV_DIR%\Scripts\python.exe"
 
@@ -35,7 +35,7 @@ if errorlevel 1 (
 
 echo.
 echo ==========================================
-echo   AI Vector Cleanroom ^(Open Source Designer Preview 4^)
+echo   AI Vector Cleanroom ^(Open Source v0.6.0-alpha^)
 echo ==========================================
 echo.
 "%AVC_PYTHON%" -E -s -B "%~dp0vector_cleanroom.py" %*
