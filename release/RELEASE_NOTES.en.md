@@ -6,9 +6,9 @@ Version: `v0.6.0-alpha` · 2026-10-06 · **Source-only pre-release**
 
 ## What changes in this release
 
-This release returns public version numbering to the existing `v0.5.0-alpha → v0.6.0-alpha` series and adds complete Traditional Chinese and English versions of the README, user guide and release notes. The previously published `v3-designer-preview.4` tag and Release remain available as historical records.
+This release continues the existing `v0.5.0-alpha → v0.6.0-alpha` public version series and provides complete Traditional Chinese and English versions of the README, user guide and release notes. The mistakenly published `v3-designer-preview.4` Release and tag, which used an internal development identifier, have been removed and are no longer public downloads. Internal Beta and Designer Preview development records remain in the CHANGELOG.
 
-**Conversion, refinement, handoff diagnostics and export behavior are unchanged from Designer Preview 4.** This corrects public numbering, documentation and distribution information; it is not another image-quality improvement. The dedicated Python environment now uses the name `v0.6.0-alpha`. Work data continues to use the Preview 4-compatible `AIVC\designer4` directory.
+**Preparing this public release has not changed the completed conversion, refinement, handoff diagnostics or export behavior.** The numbering and documentation corrections are not another image-quality improvement. The dedicated Python environment uses the name `v0.6.0-alpha`. Work data retains the internally compatible `AIVC\designer4` path; this directory name does not identify another public release.
 
 The goal remains to help designers take over a draft, retain useful vector work and redraw difficult areas. This is not a one-click finished-artwork release, and no percentage of designer time savings has been demonstrated. The feature changes below are **relative to the earlier public `v0.5.0-alpha` release**; they were not all introduced by this numbering correction.
 
@@ -23,7 +23,7 @@ The goal remains to help designers take over a draft, retain useful vector work 
 
 Existing SVG strokes, regular shapes, gradients, grouping, recoloring and review tools are retained. They are not all new features of this release. There is no guarantee that every object will become a stroke with adjustable width or a single gradient.
 
-Preview 4 primarily improved handoff diagnostics, and this release retains that behavior. Experimental reconstruction of thin elongated objects remains outside the default pipeline. Existing source checks have not simply been relaxed to make candidates pass.
+The final internal development iteration primarily improved handoff diagnostics, and this release retains that behavior. Experimental reconstruction of thin elongated objects remains outside the default pipeline. Existing source checks have not simply been relaxed to make candidates pass.
 
 ## Open working.svg first after export
 
@@ -40,9 +40,9 @@ Before finishing, remove reference images, hint rectangles and unnecessary hidde
 2. Download `AI-Vector-Cleanroom-v0.6.0-alpha.zip`, extract it into a new directory and run `setup_windows.bat`. The first setup needs an internet connection to install pinned dependencies.
 3. Close any older workbench using the same data directory, then run `工作台.bat`. The English-named `workbench.bat` entry point behaves identically.
 
-The default environment is `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha`. Data remains in `%LOCALAPPDATA%\AIVC\designer4`. **Preview 4 users retain the same data directory, and existing results and saved decisions remain valid despite the version-name change. This update does not automatically move data or rerun conversions.** Other data directories from earlier versions are not imported automatically. Keep previous outputs and handoff packages. Do not overwrite a program directory that is still running or run two workbenches writing to the same data directory.
+The default environment is `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha`. Data is stored in `%LOCALAPPDATA%\AIVC\designer4`, retaining the compatible internal development path. **This release does not automatically move old data or rerun conversions.** Keep previous outputs and handoff packages. Do not overwrite a program directory that is still running or run two workbenches writing to the same data directory.
 
-If `AVC_VENV_DIR` points to a Preview 4 environment, the new setup will refuse to reuse it because its environment version marker differs. Clear that override to use the new default environment, or choose a fresh directory; do not edit the environment marker manually. Custom `AVC_DATA_DIR` settings and work data are unaffected by the environment-name correction.
+If a custom `AVC_VENV_DIR` points to an environment for another version, setup will refuse to reuse it because its environment version marker differs. Clear that override to use the new default environment, or choose a fresh directory; do not edit the environment marker manually. Custom `AVC_DATA_DIR` settings and existing compatible work data are unaffected by the environment name.
 
 No Python runtime is bundled. The validated environment is Windows x64 / CPython 3.12.x; other platforms and Python versions have not been formally validated. The release receipt is `SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json`.
 

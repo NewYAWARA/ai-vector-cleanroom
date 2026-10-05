@@ -37,7 +37,7 @@ Compared with `v0.5.0-alpha`, this update focuses on what happens **after conver
 
 Hints are leads to investigate, **not a list of mandatory fixes**. No hint does not mean human approval. Missing source images, comparison failures and computational limits are reported explicitly. This update does not claim that every image or every region is better than in the old version.
 
-`v0.6.0-alpha` continues the public `v0.5.0-alpha` version series. It corrects the previously published internal name `v3-designer-preview.4` and restores full English documentation. The conversion algorithms are unchanged from that Preview 4 release; the earlier tag is retained.
+`v0.6.0-alpha` follows `v0.5.0-alpha` in the public release series and provides full Chinese and English documentation. It packages the completed internal designer-handoff build; correcting the release name and documentation does not change that build's conversion algorithms.
 
 See the [release notes](release/RELEASE_NOTES.en.md) for this release and [CHANGELOG.md](CHANGELOG.md) for the history.
 
@@ -72,12 +72,11 @@ Extract this version into a new folder and run its setup. Do not overwrite an ol
 | Dedicated Python environment | `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v0.6.0-alpha` |
 | Images and conversion results | `input` and `output` under `%LOCALAPPDATA%\AIVC\designer4` |
 
-- **From `v0.5.0-alpha` or earlier development versions:** old data is not migrated automatically. Drag the original images into the new workbench if you want to convert them again. Old results and exported handoff packages remain in their original locations.
-- **From `v3-designer-preview.4`:** the default data location remains `designer4`, so existing results and saved decisions are reused unchanged. The Python environment is new. Close the old workbench before opening this one; do not run both against the same data folder at once. If you used a custom `AVC_DATA_DIR`, use that same setting to access those results.
+When updating from `v0.5.0-alpha`, old data is not migrated automatically. Drag the original images into the new workbench if you want to convert them again. Old results and exported packages remain in their original locations. The `designer4` folder name is a storage identifier retained from development, not a public version number. Close any old workbench before starting this one; do not run two writers against the same data folder.
 
 This is a source-only release: Python is not bundled, and the project is not a package you can install with `pip install ai-vector-cleanroom`. Other operating systems are outside this preview's usage-validation scope.
 
-If `AVC_VENV_DIR` still points to a Preview 4 environment, remove that override or choose a new empty path before running setup. The old environment's version marker is incompatible; do not edit its marker file manually.
+If `AVC_VENV_DIR` points to an environment from an older development build, remove that override or choose a new empty path before running setup. An old environment's version marker may be incompatible; do not edit its marker file manually.
 
 See the [full user guide](docs/USER_GUIDE.en.md) for custom data locations, batch conversion, keyboard controls and cleanup limits.
 

@@ -8,7 +8,7 @@
 
 **There is no measured designer time-saving percentage, and Illustrator import and finishing have not been validated in the actual application.** Local program tests, browser previews, node reductions, and geometry/rendering checks cannot replace real editing, timing and final artwork checks by a designer.
 
-This public release continues the `v0.5.0-alpha` series. It corrects the previously published internal version name `v3-designer-preview.4` and provides full English documentation. Its conversion algorithms are unchanged from Preview 4, and the earlier release tag remains available.
+This release follows `v0.5.0-alpha` in the public series and provides full English documentation. It packages the completed internal designer-handoff build as `v0.6.0-alpha`; the release-name and documentation corrections do not change that build's conversion algorithms.
 
 The handoff view locates problems by comparing each unit's actually visible contribution against the original image. It can flag differences in color, thickness or opacity, lost tonal variation, and extra paint on near-white or transparent source areas. It no longer flags an entire group just because its bounding box intersects a problem area. Occlusion, grouping and translucent compositing are considered together; generic reminders are not repeated when there is no specific finding. Hints do not change the artwork or accept objects for you.
 
@@ -120,9 +120,7 @@ This release provides MIT-licensed source code. It does not bundle a Python runt
 
 The dedicated `v0.6.0-alpha` environment does not overwrite an older environment. Updating the source or rerunning setup does not clear working data.
 
-- **Users of `v0.5.0-alpha`:** data from the old source folder is not migrated automatically. Keep old results and exported packages where they are, and import the original images into this release if you want new conversions.
-- **Users of earlier development builds such as Beta.6:** data in `%LOCALAPPDATA%\AIVC\b6` is not migrated automatically either.
-- **Users of `v3-designer-preview.4`:** the default data root deliberately remains `designer4`. Existing results and saved decisions are reused unchanged; only the dedicated environment and release identity change. Close the previous workbench before starting this one. If you previously used `AVC_DATA_DIR`, set the same custom path to access that data.
+When updating from `v0.5.0-alpha`, data in the old source folder is not migrated automatically. Keep old results and exported packages where they are, and import the original images into this release if you want new conversions. The `designer4` folder name is a storage identifier retained from development, not a public version number. Existing data at the configured root is not cleared or automatically reconverted. Close any previous workbench before starting this one.
 
 To customize paths, set them in the same Command Prompt window before running setup and the launcher:
 
@@ -135,7 +133,7 @@ setup_windows.bat
 
 Use short, absolute local paths. A custom environment must be a new location or a dedicated environment created by this setup with a valid ownership marker. The program does not take over another project's virtual environment. Setup checks pinned versions, the Python ABI and required packages, and preserves the existing environment if a repair fails. The dependency lock is `requirements/validated-py312.lock.txt`.
 
-If `AVC_VENV_DIR` still points to a Preview 4 environment, remove the override with `set "AVC_VENV_DIR="` in Command Prompt, or choose a new empty path, before running setup. The previous environment's ownership marker does not match this version; do not edit it manually. Save decisions and export a handoff package before updating. Unsaved browser drafts belong to that browser and URL, and may not appear automatically if you change browsers or ports.
+If `AVC_VENV_DIR` points to an environment from an older development build, remove the override with `set "AVC_VENV_DIR="` in Command Prompt, or choose a new empty path, before running setup. An old environment's ownership marker may not match this version; do not edit it manually. Save any decisions and export a handoff package before replacing an existing working setup. Unsaved browser drafts belong to that browser and URL, and may not appear automatically if you change browsers or ports.
 
 Only one process may write to the same data root at a time. Do not place it on OneDrive, a network drive or a shared synchronization folder. The workbench listens only on `127.0.0.1`; conversion and handoff data stay on the local machine, with no image upload to external services. Initial dependency installation needs internet access.
 

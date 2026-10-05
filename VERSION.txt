@@ -29,7 +29,7 @@ Default data root: %LOCALAPPDATA%\AIVC\designer4
 驗證狀態：本機程式、結構與渲染檢查，不代表 Illustrator 匯入／完稿驗收。
 尚未取得設計師實際對照計時，沒有免修改率或省工比例承諾。
 公開版號承接 v0.5.0-alpha；轉檔與接手功能與先前發布的 Preview 4 相同。
-新版使用獨立 venv，與 Preview 4 共用 designer4 資料；不自動搬移 v0.5/Beta.6 資料。
+新版使用獨立 venv，資料目錄沿用開發期 designer4 名稱；不自動搬移 v0.5/Beta.6 資料。
 This release corrects public numbering and restores complete English documentation;
 conversion and handoff behavior are unchanged from Designer Preview 4.
 Full English documentation: README.en.md and docs/USER_GUIDE.en.md.

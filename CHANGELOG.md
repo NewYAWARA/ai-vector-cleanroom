@@ -4,28 +4,28 @@
 
 ## v0.6.0-alpha — 2026-10-06
 
-- 公開版本接回既有 `v0.5.0-alpha → v0.6.0-alpha` 系列。先前發布的 `v3-designer-preview.4` tag 與 Release 保留，不移動、不刪除。
-- 補齊完整繁體中文與英文 README、使用指南及發布說明。新版文件分清相較 v0.5 的功能改進，以及此次相較 Preview 4 的編號與文件修正。
-- 轉檔、整理、逐物件接手診斷、匯出與品質門檻均延續 Preview 4，本次沒有新的演算法或畫質改善。研究中的細長物件重建仍未加入預設管線。
-- 來源包改為 `AI-Vector-Cleanroom-v0.6.0-alpha.zip`，發行收據改為 `SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json`。預設專用環境使用 `v0.6.0-alpha`；工作資料仍在相容 Preview 4 的 `AIVC\designer4`，不自動搬移或重跑，既有結果與判斷保留。
-- 若自訂 `AVC_VENV_DIR` 指向舊 Preview 4 環境，請清除覆蓋或指定全新目錄；setup 不會略過環境版本標記，不需也不應手動改標記。
+- 公開版本接回既有 `v0.5.0-alpha → v0.6.0-alpha` 系列。誤用內部編號的 `v3-designer-preview.4` Release 與 tag 已撤下，不再提供該下載版本；下方保留內部開發紀錄。
+- 補齊完整繁體中文與英文 README、使用指南及發布說明。新版文件分清相較 v0.5 的功能改進，以及此次相較內部 Preview 4 的編號與文件修正。
+- 轉檔、整理、逐物件接手診斷、匯出與品質門檻均延續內部 Preview 4，本次沒有新的演算法或畫質改善。研究中的細長物件重建仍未加入預設管線。
+- 來源包改為 `AI-Vector-Cleanroom-v0.6.0-alpha.zip`，發行收據改為 `SOURCE_RELEASE_RECEIPT_v0.6.0-alpha.json`。預設專用環境使用 `v0.6.0-alpha`；工作資料沿用內部相容目錄 `AIVC\designer4`，不自動搬移或重跑，既有相容結果與判斷保留。
+- 若自訂 `AVC_VENV_DIR` 指向其他版本的環境，請清除覆蓋或指定全新目錄；setup 不會略過環境版本標記，不需也不應手動改標記。
 - 仍無 Illustrator 實機完稿與設計師計時驗收；本次提交的驗證以該次 CI 與發行檢查為準，不把舊測試數字改寫成本次結果。
 
-Public numbering now continues the `v0.5.0-alpha → v0.6.0-alpha` series. The published Preview 4 tag and Release remain intact. Complete Traditional Chinese and English documentation replaces the previous partial English coverage. Conversion, refinement, handoff diagnostics, exports and quality gates are unchanged from Preview 4. The source archive, receipt and default environment use the new public version; existing work data and saved decisions remain in the compatible `AIVC\designer4` directory. A custom environment override pointing to Preview 4 must be cleared or changed to a fresh directory. Illustrator finishing and designer time savings have not been validated.
+Public numbering now continues the `v0.5.0-alpha → v0.6.0-alpha` series. The mistakenly published Preview 4 tag and Release have been removed; internal development records remain below. Complete Traditional Chinese and English documentation replaces the previous partial English coverage. Conversion, refinement, handoff diagnostics, exports and quality gates are unchanged from the completed internal Preview 4 build. The source archive, receipt and default environment use the public version; compatible work data and saved decisions remain in the internal `AIVC\designer4` directory. A custom environment override pointing to another version must be cleared or changed to a fresh directory. Illustrator finishing and designer time savings have not been validated.
 
 完整改版說明／Full release notes：[繁體中文](release/RELEASE_NOTES.md) · [English](release/RELEASE_NOTES.en.md)。
 
-## GitHub 公開更新 — 2026-10-05
+## 公開發行準備紀錄（內部開發）— 2026-10-05
 
-這次 GitHub 發布從 `v0.5.0-alpha` 更新到 `v3-designer-preview.4`。中間的 Beta 與 Designer Preview 編號記錄本機開發迭代，並不表示每一版都曾在 GitHub 發布。仍屬需要人工檢查的預覽版。
+這次準備以 `v0.5.0-alpha` 為公開基線，彙整至內部 `v3-designer-preview.4` 的開發成果。誤用該開發編號的公開 Release 與 tag 隨後撤下；正式公開系列改接 `v0.6.0-alpha`。以下 Beta 與 Designer Preview 編號用於保留開發迭代紀錄，不表示它們是可下載的公開版本。
 
 相較上一個公開版，主要新增完整 Illustrator 接手流程、整張／局部整理、真正原圖保存、原圖邊緣與孔洞檢查，以及逐物件可見差異提示。原生筆畫、幾何、漸層、分組及換色是承接既有能力，不是這次才首次提供。
 
 新版以 Windows x64 / CPython 3.12 與外部專用環境為驗證目標；使用 `setup_windows.bat` 安裝、`工作台.bat` 啟動。舊入口 `install_deps.bat` 和 `workbench.bat` 保留為相同行為的入口。新版資料使用獨立的 `designer4` 目錄，不自動搬移舊資料。
 
-各項改進和未解決問題見 [該次發布說明](https://github.com/NewYAWARA/ai-vector-cleanroom/blob/v3-designer-preview.4/release/RELEASE_NOTES.md)。沒有 Illustrator 實機完稿或設計師工時證據，不能將節點減少、測試通過或接手提示視為免修率。
+這些改進與未解決問題已整理到 [v0.6.0-alpha 發布說明](release/RELEASE_NOTES.md)。沒有 Illustrator 實機完稿或設計師工時證據，不能將節點減少、測試通過或接手提示視為免修率。
 
-## v3-designer-preview.4 — 接手診斷預覽版，待設計師驗收
+## v3-designer-preview.4 — 內部接手診斷迭代，待設計師驗收
 
 - 接手時以真正原圖和最終 SVG 的可見像素比對每個交接單位，指出顏色／粗細／透明度差異、明暗變化減少與近白／透明區域上色。保留遮擋、群組、裁切、半透明合成和非方形原生畫布映射，不以固定內縮漏掉薄線。
 - 移除低資訊量的通用理由；不再只因外框相交就把全圖孔洞／連通問題歸給每個碰到的物件。無法逐物件歸屬的來源問題仍保留為全圖待查。
