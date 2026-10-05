@@ -43,7 +43,7 @@ ZIP 內的 `SOURCE_MANIFEST.json` 記錄實際封裝內容。程式、文件或 
 
 確認尚未發布的 `v0.6.0-alpha` 草稿所用 tag 指向最終測試完成的提交，推送提交與該 tag；GitHub Release 勾選 **Pre-release**，驗證後才將草稿公開。發布內文依序放入 `release/RELEASE_NOTES.md` 的完整繁體中文與 `release/RELEASE_NOTES.en.md` 的完整英文，保留互相連結；不要以短英文摘要取代完整英文說明。可先將兩份內容合併成儲存庫外的 UTF-8 文字檔，再以該檔作為 Release body。附件使用上述已驗證來源 ZIP 與收據。CI 只做檢查，不持有發布憑證、不自動上傳 Release。
 
-發布後確認 tag 指向驗證過的提交、附件可下載、ZIP 與收據雜湊相符。README 保留目前支援環境、安裝方式、已知限制與回饋入口。
+發布後確認 tag 指向驗證過的提交、附件可下載、ZIP 與收據雜湊相符。README 保留目前支援環境、安裝方式與已知限制；不要加入公開試用意見徵集或回覆承諾。
 
 ## 說明的界線
 

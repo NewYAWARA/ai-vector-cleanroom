@@ -233,9 +233,6 @@ RELEASE_FILES = (
     "docs/USER_GUIDE.md",
     "docs/USER_GUIDE.en.md",
     ".github/workflows/ci.yml",
-    ".github/ISSUE_TEMPLATE/bug_report.yml",
-    ".github/ISSUE_TEMPLATE/designer_feedback.yml",
-    ".github/ISSUE_TEMPLATE/config.yml",
 )
 
 PUBLIC_FILES = tuple(sorted(

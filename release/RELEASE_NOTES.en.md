@@ -56,9 +56,3 @@ For instructions, see the [Traditional Chinese README](https://github.com/NewYAW
 - Complex soft edges, shadows, textures, photographs and original-typeface recovery are not this release's focus. Grouping does not recover the author's intended semantics or original layers.
 - The earlier frozen Preview 4 development build had a local record of **975 unittest cases, 5 skipped and 0 failures**. Another run covered 36 synthetic benchmarks: 33 were machine-accepted and 3 required manual review. Diagnostic negative controls on 36 known-correct images produced no new difference hints. These are limited historical results, not a claim that this public commit has completed the same validation. They cannot establish that all real images are free of false warnings or regressions.
 - **There has been no hands-on Illustrator import or finished-artwork acceptance test, and no timed designer comparison.** Test counts are not quality scores or time-saving percentages. Checks for this public commit are recorded in its own CI and release verification. Tests skipped because private fixtures are unavailable are not counted as passes.
-
-## Feedback that matters most
-
-Please use [Issues](https://github.com/NewYAWARA/ai-vector-cleanroom/issues/new/choose) to tell us which parts you kept, edited or redrew, and which step took the most time. Time estimates may be unknown; you do not need to repeat the work solely to report feedback. If you already have a comparison using the same finishing requirements, include the time taken with the handoff and with your usual method. These practical costs will guide subsequent priorities.
-
-You may attach a minimal example you are allowed to publish. Do not submit client, private or unclearly licensed artwork. Public source includes programmatically generated synthetic test fixtures; production artwork, internal research outputs and local verification records are not included in the release package.

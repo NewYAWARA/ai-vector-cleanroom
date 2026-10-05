@@ -80,17 +80,6 @@ If `AVC_VENV_DIR` points to an environment from an older development build, remo
 
 See the [full user guide](docs/USER_GUIDE.en.md) for custom data locations, batch conversion, keyboard controls and cleanup limits.
 
-## Feedback from real design work
-
-Please [open an issue](https://github.com/NewYAWARA/ai-vector-cleanroom/issues/new/choose). These details are more useful for deciding what to improve than a single overall score:
-
-- Which parts did you keep immediately, keep after editing, or redraw entirely?
-- What took the most time: finding objects, adjusting shapes, recoloring, or cleaning up fragments?
-- If you compared workflows, how long did the tool-assisted and your usual methods take to reach the same quality?
-- Include the tool version, Windows and Illustrator versions, steps to reproduce, and a shareable screenshot or small synthetic example.
-
-Do not upload client artwork, private images or work you do not have permission to share. A minimal example you create yourself is welcome.
-
 ## Development, licensing and validation
 
 Complete setup, then run `tests\run_tests.bat`. See [tests/README.md](tests/README.md) for test instructions and generated synthetic benchmarks, and [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance. Program and rendering tests cannot replace checks in Illustrator or timed designer tasks.

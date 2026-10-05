@@ -78,17 +78,6 @@
 
 自訂資料位置、批次轉檔、鍵盤操作及整理限制，見 [完整使用指南](docs/USER_GUIDE.md)。
 
-## 歡迎提供真實工作反饋
-
-請到 [Issues 回報](https://github.com/NewYAWARA/ai-vector-cleanroom/issues/new/choose)。比起只給整體分數，以下資訊更能決定下一步要改什麼：
-
-- 哪些部分直接留下、修改後留下、最後仍然重畫？
-- 最花時間的是找物件、修形、換色，還是整理碎片？
-- 若有比較，完成相同品質的任務，工具接手與原本方法各花多久？
-- 使用的版本、Windows 與 Illustrator 版本、重現步驟，以及可分享的截圖或小型合成反例。
-
-請勿上傳客戶圖、私人圖片或未取得分享授權的作品；可以改用自己製作的最小反例。
-
 ## 開發、授權與驗證
 
 先完成 setup，再執行 `tests\run_tests.bat`。測試說明與可自行產生的合成基準見 [tests/README.md](tests/README.md)，貢獻方式見 [CONTRIBUTING.md](CONTRIBUTING.md)。程式與渲染測試不能替代 Illustrator 實機檢查或設計師計時。
