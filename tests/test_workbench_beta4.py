@@ -56,9 +56,11 @@ def _base_report(name: str) -> dict:
         "strokes": 4,
         "gradients": 2,
         "nodes_total": 90,
+        "designer_anchors_total": 104,
         "hotspots": [],
         "preview_is_svg_render": True,
-        "options": {"background": "auto", "geometry": "conservative"},
+        "options": {"background": "auto", "geometry": "conservative",
+                    "curve_error_percent": 0.25},
         "acceptance_status": "accepted",
     }
 
@@ -70,6 +72,55 @@ class WorkbenchBeta5Tests(unittest.TestCase):
             OUTPUT_DIR=output,
             HISTORY_DIR=output / "_history",
         )
+
+    def test_job_timeout_default_and_override_are_bounded(self):
+        with mock.patch.dict(workbench.os.environ, {}, clear=True):
+            self.assertEqual(workbench._job_timeout_seconds(), 1200.0)
+        for invalid in ("", "invalid", "nan", "inf", "-inf"):
+            with self.subTest(invalid=invalid), mock.patch.dict(
+                    workbench.os.environ,
+                    {"AVC_JOB_TIMEOUT_SECONDS": invalid}, clear=True):
+                self.assertEqual(workbench._job_timeout_seconds(), 1200.0)
+        with mock.patch.dict(workbench.os.environ,
+                             {"AVC_JOB_TIMEOUT_SECONDS": "900"}, clear=True):
+            self.assertEqual(workbench._job_timeout_seconds(), 900.0)
+        with mock.patch.dict(
+                workbench.os.environ,
+                {"AVC_JOB_TIMEOUT_SECONDS": "1"}, clear=True):
+            self.assertEqual(workbench._job_timeout_seconds(), 30.0)
+        with mock.patch.dict(
+                workbench.os.environ,
+                {"AVC_JOB_TIMEOUT_SECONDS": "99999"}, clear=True):
+            self.assertEqual(workbench._job_timeout_seconds(), 1800.0)
+
+    def test_current_result_exposes_zip_and_explicit_download_actions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            _write_result(output, "download", _base_report("download"))
+            (output / "result_download.zip").write_bytes(b"zip")
+            with self._patch_output(output):
+                item = workbench._list_results()[0]
+
+        self.assertEqual(item["zip"], "result_download.zip")
+        self.assertIn("function outputUrl", workbench.APP_HTML)
+        self.assertIn("split('/').map(encodeURIComponent)", workbench.APP_HTML)
+        self.assertIn("開啟校稿", workbench.APP_HTML)
+        self.assertIn("下載 SVG", workbench.APP_HTML)
+        self.assertIn("下載完整 ZIP", workbench.APP_HTML)
+
+    def test_default_io_uses_external_data_root_and_bounds_upload_names(self):
+        self.assertEqual(workbench.INPUT_DIR, workbench.DATA_DIR / "input")
+        self.assertEqual(workbench.OUTPUT_DIR, workbench.DATA_DIR / "output")
+        self.assertNotEqual(workbench.DATA_DIR, workbench.BASE)
+        safe = workbench._safe_name("很長的圖片名稱" * 30 + ".png")
+        self.assertTrue(safe.endswith(".png"))
+        self.assertRegex(Path(safe).stem, r"_[0-9a-f]{12}$")
+
+        long_stem = "同名而且非常長" * 20
+        paths = [Path(long_stem + ".png"), Path(long_stem + ".jpg")]
+        planned = workbench.vc.plan_output_names(paths)
+        self.assertEqual(len(set(planned.values())), 2)
+        self.assertTrue(all(len(value) <= 48 for value in planned.values()))
 
     def test_report_features_are_exposed_and_recolor_needs_real_file(self):
         report = _base_report("new")
@@ -149,6 +200,10 @@ class WorkbenchBeta5Tests(unittest.TestCase):
             self.assertEqual(item["native_primitives"], 8)
             self.assertEqual(item["native_lines"], 2)
             self.assertEqual(item["native_polylines"], 1)
+            self.assertEqual(item["nodes"], 90)
+            self.assertEqual(item["designer_anchors"], 104)
+            self.assertEqual(
+                item["designer_anchor_source"], "canonical_svg_geometry")
 
             (directory / "色彩調整.html").unlink()
             with self._patch_output(output):
@@ -157,6 +212,7 @@ class WorkbenchBeta5Tests(unittest.TestCase):
 
     def test_legacy_beta2_report_remains_compatible(self):
         report = _base_report("legacy")
+        report.pop("designer_anchors_total")
         for key in (
                 "native_circles", "native_rectangles", "native_ellipses",
                 "native_lines", "native_polylines", "native_polygons"):
@@ -179,11 +235,14 @@ class WorkbenchBeta5Tests(unittest.TestCase):
             item["designer_operations"]["human_acceptance"], "not_audited")
         self.assertIsNone(item["designer_operations"]["total_operations"])
         self.assertEqual(item["recolor"], "")
+        self.assertEqual(item["designer_anchors"], 90)
+        self.assertEqual(item["designer_anchor_source"], "legacy_nodes_total")
 
     def test_rejected_result_is_visible_but_never_presented_as_done(self):
         report = _base_report("rejected")
         report.update({
             "acceptance_status": "rejected",
+            "output_base": "rejected",
             "visual_acceptance_status": "rejected",
             "manual_review_required": True,
             "visual_gate": {"reasons": ["多項失守：顏色、局部低分區"]},
@@ -196,23 +255,31 @@ class WorkbenchBeta5Tests(unittest.TestCase):
             image = input_dir / "rejected.png"
             Image.new("RGB", (4, 4), "white").save(image)
 
-            def fake_process(_image, out_base, _args, output_dir):
-                _write_result(output_dir, out_base, report)
-                (output_dir / f"result_{out_base}.zip").write_bytes(b"zip")
+            def fake_execute(_job_id, _image, out_base, _overrides,
+                             staging_root, _timeout):
+                staging_output = staging_root / "output"
+                _write_result(staging_output, out_base, report)
+                (staging_output / f"result_{out_base}.zip").write_bytes(b"zip")
+                return {"staging_output": staging_output, "report": report,
+                        "receipt": {"status": "complete"}}
 
             jobs = [{"id": 1, "name": image.name, "status": "queued",
                      "detail": "", "t": "00:00:00"}]
             with mock.patch.multiple(
                     workbench, INPUT_DIR=input_dir, OUTPUT_DIR=output,
-                    HISTORY_DIR=output / "_history", _jobs=jobs), \
-                    mock.patch.object(workbench.vc, "process_one",
-                                      side_effect=fake_process):
+                    HISTORY_DIR=output / "_history", JOB_ROOT=root / ".jobs",
+                    _jobs=jobs,
+                    _job_runtime={1: {"cancel_requested": False,
+                                      "process": None,
+                                      "started_monotonic": None}}), \
+                    mock.patch.object(workbench, "_execute_job_subprocess",
+                                      side_effect=fake_execute):
                 workbench._run_one(image, {}, requested_base="rejected",
                                    job_id=1)
                 listed = workbench._list_results()[0]
 
             self.assertEqual(jobs[0]["status"], "rejected")
-            self.assertIn("勿交付", jobs[0]["detail"])
+            self.assertIn("尚需人工修整", jobs[0]["detail"])
             self.assertTrue(listed["manual_review_required"])
             self.assertEqual(listed["visual_acceptance_status"], "rejected")
             self.assertIn("外觀未達標", workbench.APP_HTML)
@@ -263,7 +330,7 @@ class WorkbenchBeta5Tests(unittest.TestCase):
                 page = workbench.build_blind_test()
                 body = page.read_text(encoding="utf-8")
 
-        self.assertEqual(workbench.vc.TOOL_VERSION, "v3-codex-beta.5")
+        self.assertEqual(workbench.vc.TOOL_VERSION, "v3-designer-preview.4")
         self.assertIn(
             f"version:'{workbench.vc.TOOL_VERSION}'", body)
         self.assertNotIn("v3-codex-beta.3", body)
@@ -278,6 +345,156 @@ class WorkbenchBeta5Tests(unittest.TestCase):
         self.assertIn("描點收尾", workbench.APP_HTML)
         self.assertIn("Stage 2 實作計時", workbench.APP_HTML)
         self.assertIn("/api/editingtest", workbench.APP_HTML)
+        self.assertIn('data-k="curve_error_percent"', workbench.APP_HTML)
+        self.assertIn("先限制幾何誤差，再最小化錨點", workbench.APP_HTML)
+        self.assertIn("/api/cancel", workbench.APP_HTML)
+        self.assertIn("timed_out:'已逾時'", workbench.APP_HTML)
+
+    def test_timed_out_rerun_never_touches_previous_success(self):
+        report = _base_report("stable")
+        report["output_base"] = "stable"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            input_dir = root / "input"
+            output = root / "output"
+            input_dir.mkdir()
+            image = input_dir / "stable.png"
+            Image.new("RGB", (2, 2), "white").save(image)
+            old_dir = _write_result(output, "stable", report)
+            marker = old_dir / "old-success.txt"
+            marker.write_text("keep me", encoding="utf-8")
+            old_zip = output / "result_stable.zip"
+            old_zip.write_bytes(b"old zip")
+            jobs = [{"id": 7, "name": image.name, "status": "queued",
+                     "detail": "", "t": "00:00:00"}]
+            runtime = {7: {"cancel_requested": False, "process": None,
+                           "started_monotonic": None}}
+            with mock.patch.multiple(
+                    workbench, INPUT_DIR=input_dir, OUTPUT_DIR=output,
+                    HISTORY_DIR=output / "_history", JOB_ROOT=root / ".jobs",
+                    _jobs=jobs, _job_runtime=runtime), \
+                    mock.patch.object(
+                        workbench, "_execute_job_subprocess",
+                        side_effect=workbench._JobTimedOut("bounded timeout")):
+                workbench._run_one(image, {}, requested_base="stable",
+                                   job_id=7)
+
+            self.assertEqual(jobs[0]["status"], "timed_out")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep me")
+            self.assertEqual(old_zip.read_bytes(), b"old zip")
+            self.assertFalse((output / "_history").exists())
+
+    def test_transactional_commit_archives_old_result_only_after_success(self):
+        old_report = _base_report("swap")
+        old_report["output_base"] = "swap"
+        new_report = dict(old_report, source_match_percent=99.5)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            output = root / "output"
+            staging_output = root / ".jobs" / "one" / "output"
+            old_dir = _write_result(output, "swap", old_report)
+            (old_dir / "old-only.txt").write_text("old", encoding="utf-8")
+            (output / "result_swap.zip").write_bytes(b"old zip")
+            _write_result(staging_output, "swap", new_report)
+            (staging_output / "result_swap.zip").write_bytes(b"new zip")
+
+            with mock.patch.multiple(
+                    workbench, OUTPUT_DIR=output,
+                    HISTORY_DIR=output / "_history"):
+                archive = workbench._commit_staged_result(
+                    staging_output, "swap")
+
+            committed = json.loads((output / "result_swap" / "report.json")
+                                   .read_text(encoding="utf-8"))
+            self.assertEqual(committed["source_match_percent"], 99.5)
+            self.assertEqual((output / "result_swap.zip").read_bytes(),
+                             b"new zip")
+            self.assertFalse((output / "result_swap" / "old-only.txt").exists())
+            self.assertTrue(archive.is_file())
+
+    def test_queued_job_can_be_cancelled_before_worker_start(self):
+        jobs = [{"id": 9, "name": "queued.png", "status": "queued",
+                 "detail": "", "t": "00:00:00", "cancellable": True}]
+        runtime = {9: {"cancel_requested": False, "process": None,
+                       "started_monotonic": None}}
+        with mock.patch.multiple(workbench, _jobs=jobs, _job_runtime=runtime):
+            self.assertEqual(workbench._cancel_job(9), "cancelled")
+            self.assertTrue(runtime[9]["cancel_requested"])
+            self.assertEqual(jobs[0]["status"], "cancelled")
+
+    def test_supervisor_hard_timeout_terminates_worker_process(self):
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            image = root / "timeout.png"
+            Image.new("RGB", (1, 1), "white").save(image)
+            staging = root / ".jobs" / "timeout"
+            staging.mkdir(parents=True)
+            process = FakeProcess()
+            runtime = {3: {"cancel_requested": False, "process": None,
+                           "started_monotonic": None}}
+            jobs = [{"id": 3, "name": image.name, "status": "running",
+                     "elapsed_seconds": 0.0}]
+            with mock.patch.multiple(
+                    workbench, _job_runtime=runtime, _jobs=jobs,
+                    JOB_WORKER=root / "job_worker.py"), \
+                    mock.patch.object(workbench.subprocess, "Popen",
+                                      return_value=process), \
+                    mock.patch.object(workbench.time, "monotonic",
+                                      side_effect=[0.0, 31.0]), \
+                    mock.patch.object(workbench.time, "sleep"):
+                with self.assertRaises(workbench._JobTimedOut):
+                    workbench._execute_job_subprocess(
+                        3, image, "timeout", {}, staging, 30.0)
+            self.assertTrue(process.terminated)
+            self.assertEqual(jobs[0]["elapsed_seconds"], 31.0)
+
+    def test_tampered_completion_receipt_cannot_be_committed(self):
+        report = _base_report("receipt")
+        report["output_base"] = "receipt"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            image = root / "receipt.png"
+            Image.new("RGB", (1, 1), "white").save(image)
+            staging = root / "job"
+            output = staging / "output"
+            _write_result(output, "receipt", report)
+            zip_path = output / "result_receipt.zip"
+            zip_path.write_bytes(b"verified")
+            input_sha = workbench._sha256(image)
+            token = "a" * 32
+            receipt = {
+                "schema": workbench.JOB_SCHEMA, "token": token,
+                "job_id": 4, "status": "complete",
+                "input_name": image.name, "input_sha256": input_sha,
+                "out_base": "receipt", "acceptance_status": "accepted",
+                "report_sha256": workbench._sha256(
+                    output / "result_receipt" / "report.json"),
+                "zip_sha256": workbench._sha256(zip_path),
+            }
+            (staging / "receipt.json").write_text(
+                json.dumps(receipt), encoding="utf-8")
+            zip_path.write_bytes(b"tampered")
+            with self.assertRaisesRegex(RuntimeError, "雜湊"):
+                workbench._validate_receipt(
+                    staging, token, 4, image, input_sha, "receipt")
 
     def test_stage2_page_is_generated_from_real_result_files(self):
         report = _base_report("timed")
@@ -289,7 +506,7 @@ class WorkbenchBeta5Tests(unittest.TestCase):
                 body = page.read_text(encoding="utf-8")
         self.assertIn("timed_vector.svg", body)
         self.assertIn("timed-designer-editing-stage2", body)
-        self.assertIn("不計入 80% 省工驗收", body)
+        self.assertIn("空白、0、估算、未完成與失敗", body)
 
     def test_two_uploads_are_both_accepted_and_stay_visible_in_queue(self):
         """Regression: a later waiting file must not look like it vanished."""
@@ -308,6 +525,7 @@ class WorkbenchBeta5Tests(unittest.TestCase):
                     WB_TOKEN="test-token",
                     _queue=local_queue,
                     _jobs=[],
+                    _job_runtime={},
                     _job_sequence=0):
                 server = workbench.ThreadingHTTPServer(
                     ("127.0.0.1", 0), workbench.Handler)

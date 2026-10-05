@@ -500,6 +500,49 @@ def compute_hotspots(
     )["hotspots"]
 
 
+def source_structure_hotspots(audit, viewbox):
+    """Locate verified native-pixel concerns without inventing a quality score.
+
+    Generated cleanroom SVG uses xMidYMid meet. Account for letterboxing on
+    non-square, rounded working dimensions; independent x/y scaling is wrong.
+    """
+    if not isinstance(audit, dict) or audit.get('status') != 'completed':
+        return []
+    renderer = audit.get('renderer') or {}
+    width, height = renderer.get('width', 0), renderer.get('height', 0)
+    if not width or not height or len(viewbox) != 4 or min(viewbox[2:]) <= 0:
+        return []
+    vx, vy, vw, vh = map(float, viewbox)
+    scale = min(width / vw, height / vh)
+    ox, oy = (width-vw*scale)/2, (height-vh*scale)/2
+    labels = {'source_components_merged': '原本分開的部分黏在一起',
+              'source_component_split': '原本相連的部分斷開',
+              'paper_colored_channel_filled': '原圖的白縫被填住',
+              'opaque_paint_on_source_paper': '原圖白底出現不透明色塊',
+              'source_paper_unexpected_opaque_color': '原圖白底出現不透明色塊'}
+    result = []
+    seen = set()
+    for defect in audit.get('stable_defects', []):
+        box = defect.get('bbox_xyxy')
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        key = (tuple(box), defect.get('kind'))
+        if key in seen:
+            continue
+        seen.add(key)
+        x0, y0, x1, y1 = map(float, box)
+        if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+            continue
+        result.append({'x': vx+(x0-ox)/scale, 'y': vy+(y0-oy)/scale,
+                       'w': (x1-x0)/scale, 'h': (y1-y0)/scale,
+                       'severity': 1.0, 'score_percent': None,
+                       'source_ink_pixels': 0, 'structural_defect': True,
+                       'kind': defect.get('kind'), 'native_bbox_xyxy': list(box),
+                       'label': labels.get(defect.get('kind'), '原圖局部結構需要檢查'),
+                       'scope': 'localized_concern_not_automatic_redraw_or_deletion'})
+    return result
+
+
 __all__ = [
     "compute_hotspots",
     "compute_quality_diagnostics",

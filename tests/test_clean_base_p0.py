@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import redirect_stdout
+import io
+import json
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -21,6 +24,46 @@ def _fake_vtracer(_src, dst, **_kwargs):
 
 
 class CleanBaseP0Tests(unittest.TestCase):
+    def test_native_circle_ids_are_stable_unique_and_directly_selectable(self):
+        from generate_designer_benchmark import fixture_cases
+        from svg_renderer import render_svg_reference
+        from vector_cleanroom import process_one
+        options = SimpleNamespace(strokes='on', gradients='on', geometry='conservative',
+                                  background='auto', colors=0, white_threshold=220,
+                                  max_size=2048, curve_error_percent=0.25)
+        cases = {c['id']: c for c in fixture_cases()}
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            output = folder / 'output'
+            output.mkdir()
+            for name in ['01_circle', '10_radial_gradient']:
+                with self.subTest(name=name):
+                    svg = folder / f'{name}.svg'
+                    svg.write_text(cases[name]['svg'], encoding='utf-8')
+                    source = svg.with_suffix('.png')
+                    render_svg_reference(svg, source, width=128, background='#ffffff')
+                    identifiers = []
+                    for number in range(2):
+                        with redirect_stdout(io.StringIO()):
+                            process_one(source, f'case{number}', options, output)
+                        result = output / f'result_case{number}'
+                        root = ET.parse(next(result.glob('*_vector.svg'))).getroot()
+                        ids = [e.get('id') for e in root.iter() if e.get('id')]
+                        circles = [e for e in root.iter() if e.tag.split('}')[-1] == 'circle']
+                        self.assertEqual(len(circles), 1)
+                        self.assertTrue(circles[0].get('id'))
+                        self.assertEqual(len(ids), len(set(ids)))
+                        identifiers.append(circles[0].get('id'))
+                        report = json.loads((result / 'report.json').read_text(encoding='utf-8'))
+                        proof = report['editability_details']['direct_single_drawable_selection']
+                        self.assertTrue(proof['available'])
+                        self.assertFalse(proof['semantic_group_created'])
+                        self.assertEqual(report['acceptance_status'], 'accepted')
+                        if name == '10_radial_gradient':
+                            self.assertEqual(circles[0].get('id'), 'avc-gradient-drawable-grad1')
+                            self.assertEqual(report['gradient_object_gate']['status'], 'passed')
+                    self.assertEqual(identifiers[0], identifiers[1])
+
     def test_fragmented_linear_detail_is_unified_but_compact_shape_is_not(self):
         palette = np.asarray(((213, 200, 147), (225, 179, 47),
                               (243, 247, 244)), dtype=np.uint8)
@@ -471,7 +514,7 @@ class CleanBaseP0Tests(unittest.TestCase):
                 d="M 0 5 L 9 5", n_nodes=2, closed=False,
             )
 
-            def fake_extract(_mask, _den, _palette, _bg, alpha=None):
+            def fake_extract(_mask, _den, _palette, _bg, alpha=None, **_kwargs):
                 return [stroke], np.ones((10, 10), dtype=bool)
 
             with patch.object(
@@ -487,6 +530,8 @@ class CleanBaseP0Tests(unittest.TestCase):
             self.assertIn('stroke="#211815"', dst.read_text(encoding="utf-8"))
 
     def test_final_palette_uses_real_middle_gradient_stop(self):
+        from gradient_reconstruction_stage import encode_mask_rle
+
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             src = td / "gradient.png"
@@ -496,24 +541,59 @@ class CleanBaseP0Tests(unittest.TestCase):
             rgba[:, 16:, :3] = (204, 255, 34)
             Image.fromarray(rgba, "RGBA").save(src)
 
-            region = {
-                "mask": np.ones((32, 32), dtype=bool),
+            mask = np.ones((32, 32), dtype=bool)
+            proposal = {
+                "proposal_id": "gradient-object-test",
+                "candidate_id": "gradient-candidate-test",
+                "candidate_family": "monotonic_chain",
+                "mask": encode_mask_rle(mask),
                 "area": 32 * 32,
-                "x1": 0.0, "y1": 16.0, "x2": 31.0, "y2": 16.0,
+                "model": {
+                    "type": "linear", "svg_type": "linearGradient",
+                    "x1": 0.0, "y1": 16.0, "x2": 31.0, "y2": 16.0,
+                    "stop_count": 3,
+                },
                 "stops": [
-                    (0.0, (0, 102, 0)),
-                    (0.5, (51, 170, 51)),
-                    (1.0, (204, 255, 34)),
+                    {"offset": 0.0, "color": "#006600", "rgb": [0, 102, 0]},
+                    {"offset": 0.5, "color": "#33aa33", "rgb": [51, 170, 51]},
+                    {"offset": 1.0, "color": "#ccff22", "rgb": [204, 255, 34]},
                 ],
+                "confidence": 0.9,
+                "path": "M0 0 L31 0 L31 31 L0 31 Z",
+                "fill_rule": "evenodd",
+                "geometry": {
+                    "path": "M0 0 L31 0 L31 31 L0 31 Z",
+                    "fill_rule": "evenodd", "native_primitives": [],
+                    "anchor_count": 4, "designer_anchor_count": 4,
+                    "segment_count": 4, "anchors_before": 128,
+                    "primitive_first": True,
+                    "topology": {"components": 1, "holes": 0,
+                                 "topology_preserved": True},
+                    "error_budget": {
+                        "passed": True,
+                        "requested_max_percent": 0.25,
+                        "actual_p95_error_percent": 0.08,
+                        "actual_max_error_percent": 0.12,
+                    },
+                },
+                "heldout_evidence": {"validation": {"passed": True}},
+            }
+            stage = {
+                "schema": "ai-vector-cleanroom.gradient-reconstruction-stage/v1",
+                "status": "proposed", "proposals": [proposal],
+                "summary": {"objects_selected": 1},
+                "objective": {}, "parameters": {}, "decisions": [],
             }
 
             def fake_paths(_raw):
-                key = "#{:02x}{:02x}{:02x}".format(*region["key"])
                 return iter((("M 0 0 L 31 0 L 31 31 L 0 31 Z",
-                              key, 0.0, 0.0),))
+                              "#f103f7", 0.0, 0.0),))
 
-            with patch.object(clean_base, "_detect_gradients",
-                              return_value=[region]), \
+            with patch(
+                    "gradient_reconstruction_stage.propose_gradient_reconstruction",
+                    return_value=stage), \
+                    patch.object(clean_base, "_allocate_gradient_keys",
+                                 return_value=[(241, 3, 247)]), \
                     patch.object(clean_base.vtracer,
                                  "convert_image_to_svg_py",
                                  side_effect=_fake_vtracer), \

@@ -159,6 +159,26 @@ class AnnulusDetectorTests(unittest.TestCase):
             self.assertFalse(rejected["accepted"])
             self.assertLess(rejected["ink_recall_percent"], 80.0)
 
+    def test_optional_legacy_fixture_coalesces_green_ring(self):
+        svg_files = list((ROOT / "tests" / "optional_fixtures" / "legacy_beta2").rglob(
+            "*_vector.svg"))
+        if not svg_files:
+            self.skipTest("optional legacy annulus SVG is not included in this package")
+        candidates = detect_svg_annuli(svg_files[0])
+        candidate = next(
+            (item for item in candidates
+             if {"stroke-69", "stroke-87"}.issubset(item.source_ids)),
+            None,
+        )
+        self.assertIsNotNone(candidate)
+        self.assertTrue(candidate.safe_to_replace)
+        self.assertEqual(candidate.paint, "#8cfe01")
+        self.assertEqual(candidate.linecap, "round")
+        self.assertGreater(candidate.coverage_degrees, 220.0)
+        self.assertLess(candidate.residual_p95, 1.5)
+        self.assertGreater(candidate.raster_recall, 0.99)
+        self.assertGreater(candidate.raster_precision, 0.99)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2,7 +2,7 @@
 
 This module never opens or modifies an SVG.  It reconstructs the exact
 strong-ink source labels used by the topology diagnostic and, only for small
-isolated opaque single-colour components, returns an append-on-top SVG
+gap-separated opaque single-colour components, returns an append-on-top SVG
 fragment for a later transactional validator to consider.
 """
 
@@ -27,6 +27,14 @@ from trace_engine import binary_mask_to_compound_path
 SCHEMA = "ai-vector-cleanroom.component-repair-proposal/v1"
 TRANSACTION_SCHEMA = "ai-vector-cleanroom.component-repair-transaction/v1"
 SVG_NS = "http://www.w3.org/2000/svg"
+DEFAULT_MAX_COMPONENTS = 8
+SOURCE_GAP_RADIUS = 1
+RENDER_ALIGNMENT_TOLERANCE = 1
+MAX_SEPARATION_CARVE_SHARE = 0.05
+MAX_SEPARATION_CARVE_PIXELS = 32
+SHIFTED_DUPLICATE_RENDER_COVERAGE_MIN = 0.85
+SHIFTED_DUPLICATE_SOURCE_SUPPORT_MIN = 0.90
+SHIFTED_DUPLICATE_SCAN_WORK_LIMIT = 4_000_000
 
 
 def _load_rgba(value, name):
@@ -92,6 +100,96 @@ def _bbox(mask):
             int(yy.max() - yy.min() + 1)]
 
 
+def _shifted_duplicate_scan(component, core_render, source_supported_render,
+                            outer_neighbourhood, moat_radius):
+    """Find a nearby rendered translation not owned by other source ink.
+
+    Only target-shaped translations are tested.  This catches a shifted copy
+    whose leading pixels happen to overlap a legitimate neighbour's support
+    halo, without making an unrelated large neighbouring render component
+    responsible for approximation differences far from the target.
+    """
+
+    box = _bbox(component)
+    yy, xx = np.nonzero(component)
+    area = len(xx)
+    if not box or not area:
+        return {"status": "scan_limit", "reason": "empty_target"}
+    _x, _y, width, height = box
+    dx_limit = width + moat_radius
+    dy_limit = height + moat_radius
+    translation_count = (
+        (2 * dx_limit + 1) * (2 * dy_limit + 1) - 1)
+    work = int(translation_count * area)
+    audit = {
+        "status": "clear",
+        "translation_count": int(translation_count),
+        "work": work,
+        "work_limit": SHIFTED_DUPLICATE_SCAN_WORK_LIMIT,
+        "render_coverage_min": SHIFTED_DUPLICATE_RENDER_COVERAGE_MIN,
+        "source_support_min": SHIFTED_DUPLICATE_SOURCE_SUPPORT_MIN,
+        "matches_considered": 0,
+        "least_supported_matches": [],
+    }
+    if work > SHIFTED_DUPLICATE_SCAN_WORK_LIMIT:
+        audit.update({
+            "status": "scan_limit",
+            "reason": "shifted_duplicate_scan_limit",
+        })
+        return audit
+
+    min_rendered = int(math.ceil(
+        area * SHIFTED_DUPLICATE_RENDER_COVERAGE_MIN))
+    matches = []
+    image_height, image_width = component.shape
+    for dy in range(-dy_limit, dy_limit + 1):
+        for dx in range(-dx_limit, dx_limit + 1):
+            if dx == 0 and dy == 0:
+                continue
+            shifted_y = yy + dy
+            shifted_x = xx + dx
+            if (shifted_x.min() < 0 or shifted_y.min() < 0
+                    or shifted_x.max() >= image_width
+                    or shifted_y.max() >= image_height):
+                continue
+            rendered = core_render[shifted_y, shifted_x]
+            rendered_count = int(np.count_nonzero(rendered))
+            if rendered_count < min_rendered:
+                continue
+            rendered_y = shifted_y[rendered]
+            rendered_x = shifted_x[rendered]
+            if not np.any(outer_neighbourhood[rendered_y, rendered_x]):
+                continue
+            supported_count = int(np.count_nonzero(
+                source_supported_render[rendered_y, rendered_x]))
+            render_fraction = rendered_count / area
+            support_fraction = supported_count / max(1, rendered_count)
+            matches.append({
+                "dx": int(dx),
+                "dy": int(dy),
+                "rendered_pixels": rendered_count,
+                "render_coverage": round(float(render_fraction), 6),
+                "source_supported_pixels": supported_count,
+                "source_support": round(float(support_fraction), 6),
+            })
+    matches.sort(key=lambda item: (
+        item["source_support"], -item["render_coverage"],
+        abs(item["dx"]) + abs(item["dy"]), item["dy"], item["dx"]))
+    audit["matches_considered"] = len(matches)
+    audit["least_supported_matches"] = matches[:5]
+    detected = next((item for item in matches
+                     if (item["source_supported_pixels"]
+                         / max(1, item["rendered_pixels"]))
+                     < SHIFTED_DUPLICATE_SOURCE_SUPPORT_MIN), None)
+    if detected is not None:
+        audit.update({
+            "status": "detected",
+            "reason": "shifted_duplicate_detected",
+            "detected_match": detected,
+        })
+    return audit
+
+
 def _normalise_viewbox(viewbox, width, height):
     try:
         values = list(viewbox)
@@ -145,7 +243,8 @@ def _skip_result(audit, reason):
 
 def propose_missing_component_repairs(
         source_reference, render, flat, failed_examples, *, viewbox,
-        max_components=4, max_component_area=4096, max_total_area=8192,
+        max_components=DEFAULT_MAX_COMPONENTS,
+        max_component_area=4096, max_total_area=8192,
         max_component_nodes=512, max_total_nodes=1024,
         edge_margin=3, moat_radius=3, dominant_color_min=0.90,
         opaque_alpha_min=250, max_failed_score=5.0,
@@ -195,7 +294,9 @@ def propose_missing_component_repairs(
     audit = {
         "schema": SCHEMA,
         "status": "evaluating",
-        "policy": "missing_isolated_opaque_single_colour_append_only",
+        "policy": (
+            "missing_gap_separated_source_owned_neighbour_"
+            "locally_carved_opaque_single_colour_append_only"),
         "source_original_size": list(source_original_size),
         "measurement_size": [width, height],
         "render_size": list(render_image.size),
@@ -217,6 +318,16 @@ def propose_missing_component_repairs(
             "dominant_color_min": dominant_color_min,
             "opaque_alpha_min": opaque_alpha_min,
             "max_failed_score": max_failed_score,
+            "source_gap_radius": SOURCE_GAP_RADIUS,
+            "render_alignment_tolerance": RENDER_ALIGNMENT_TOLERANCE,
+            "max_separation_carve_share": MAX_SEPARATION_CARVE_SHARE,
+            "max_separation_carve_pixels": MAX_SEPARATION_CARVE_PIXELS,
+            "shifted_duplicate_render_coverage_min": (
+                SHIFTED_DUPLICATE_RENDER_COVERAGE_MIN),
+            "shifted_duplicate_source_support_min": (
+                SHIFTED_DUPLICATE_SOURCE_SUPPORT_MIN),
+            "shifted_duplicate_scan_work_limit": (
+                SHIFTED_DUPLICATE_SCAN_WORK_LIMIT),
         },
         "trace_parameters": {
             "simplify": simplify,
@@ -274,16 +385,26 @@ def propose_missing_component_repairs(
     core_source_ink_pixels = int(core_source.sum())
     topology_min_area = max(
         16, min(128, int(round(core_source_ink_pixels * 1e-4))))
+    source_component_areas = np.bincount(
+        source_labels.reshape(-1), minlength=source_count + 1)
+    source_support_labels = np.flatnonzero(
+        source_component_areas >= topology_min_area)
+    source_support_labels = source_support_labels[
+        source_support_labels > 0]
+    source_support_mask = np.isin(source_labels, source_support_labels)
 
     render_rgb = _composite_white(render_image)
     background = np.asarray(roi["background_rgb"], dtype=np.float32)
     render_strength = np.abs(
         render_rgb.astype(np.float32) - background).max(axis=2)
     core_render = render_strength >= core_threshold
+    render_labels, render_count = connected_components(core_render)
     flat_rgba = np.asarray(flat_image, dtype=np.uint8)
 
     audit.update({
         "source_component_count": int(source_count),
+        "source_support_component_count": int(len(source_support_labels)),
+        "render_component_count": int(render_count),
         "source_ink_pixels": source_ink_pixels,
         "core_source_ink_pixels": core_source_ink_pixels,
         "topology_minimum_component_area": topology_min_area,
@@ -387,25 +508,161 @@ def propose_missing_component_repairs(
             record["status"] = "skipped"
             record["reason"] = "component_touches_edge_guard"
             continue
+        inner_neighbourhood = _dilate(component, SOURCE_GAP_RADIUS)
         neighbourhood = _dilate(component, moat_radius)
-        source_moat_pixels = int(np.count_nonzero(
-            neighbourhood & core_source & ~component))
-        render_moat_pixels = int(np.count_nonzero(
-            neighbourhood & core_render))
+        outer_neighbourhood = neighbourhood & ~inner_neighbourhood
+        source_other = core_source & ~component
+        source_support_other = source_support_mask & ~component
+        source_moat = neighbourhood & source_other
+        source_gap = inner_neighbourhood & source_other
+        render_target = component & core_render
+        render_inner_gap = inner_neighbourhood & core_render & ~component
+        render_moat = neighbourhood & core_render & ~component
+        render_outer_moat = outer_neighbourhood & core_render
+        # A nearby rendered pixel is safe only when it is independently
+        # explained by another non-noise source topology component within the
+        # same one-pixel spatial tolerance used by the visual diagnostics.
+        # The complete 8-connected render component is checked, rather than
+        # only its pixels inside the local moat, so an unsupported tail cannot
+        # escape the audit window.  The inner one-pixel gap is separately
+        # required to remain empty so source-owned neighbours cannot bridge to
+        # the repaired target through alignment tolerance.
+        source_supported_render = _dilate(
+            source_support_other, RENDER_ALIGNMENT_TOLERANCE)
+        supported_render_moat = render_moat & source_supported_render
+        unexpected_render_moat = render_moat & ~source_supported_render
+        unexpected_render_inner_gap = (
+            render_inner_gap & ~source_supported_render)
+        shifted_duplicate = _shifted_duplicate_scan(
+            component, core_render, source_supported_render,
+            outer_neighbourhood, moat_radius)
+        touching_render_component_ids = sorted(
+            int(value) for value in np.unique(
+                render_labels[render_outer_moat]) if int(value) > 0)
+        touching_render = np.isin(
+            render_labels, touching_render_component_ids
+        ) if touching_render_component_ids else (
+                np.zeros_like(core_render, dtype=bool))
+        touching_render_supported = touching_render & source_supported_render
+        touching_render_unsupported = touching_render & ~source_supported_render
+        touching_records = []
+        support_label_union = set()
+        for render_label in touching_render_component_ids:
+            render_component = render_labels == render_label
+            supported = render_component & source_supported_render
+            unsupported = render_component & ~source_supported_render
+            support_labels = sorted(
+                int(value) for value in np.unique(source_labels[
+                    _dilate(render_component, RENDER_ALIGNMENT_TOLERANCE)
+                    & source_support_other]) if int(value) > 0)
+            support_label_union.update(support_labels)
+            touching_records.append({
+                "render_component": render_label,
+                "bbox_px": _bbox(render_component),
+                "pixels": int(np.count_nonzero(render_component)),
+                "supported_pixels": int(np.count_nonzero(supported)),
+                "unsupported_pixels": int(np.count_nonzero(unsupported)),
+                "source_support_components": support_labels,
+            })
+        source_moat_pixels = int(np.count_nonzero(source_moat))
+        source_gap_pixels = int(np.count_nonzero(source_gap))
+        render_target_pixels = int(np.count_nonzero(render_target))
+        render_inner_gap_pixels = int(np.count_nonzero(render_inner_gap))
+        unexpected_render_inner_gap_pixels = int(np.count_nonzero(
+            unexpected_render_inner_gap))
+        render_moat_pixels = int(np.count_nonzero(render_moat))
+        render_outer_moat_pixels = int(np.count_nonzero(render_outer_moat))
+        supported_render_moat_pixels = int(np.count_nonzero(
+            supported_render_moat))
+        unexpected_render_moat_pixels = int(np.count_nonzero(
+            unexpected_render_moat))
+        touching_render_pixels = int(np.count_nonzero(touching_render))
+        touching_render_supported_pixels = int(np.count_nonzero(
+            touching_render_supported))
+        touching_render_unsupported_pixels = int(np.count_nonzero(
+            touching_render_unsupported))
         record.update({
             "source_moat_pixels": source_moat_pixels,
+            "source_gap_pixels": source_gap_pixels,
+            "render_target_pixels": render_target_pixels,
+            "render_inner_gap_pixels": render_inner_gap_pixels,
+            "render_inner_gap_unexpected_pixels": (
+                unexpected_render_inner_gap_pixels),
             "render_moat_pixels": render_moat_pixels,
+            "render_outer_moat_pixels": render_outer_moat_pixels,
+            "render_moat_supported_pixels": supported_render_moat_pixels,
+            "render_moat_unexpected_pixels": unexpected_render_moat_pixels,
+            "touching_render_component_ids": (
+                touching_render_component_ids),
+            "touching_render_component_pixels": touching_render_pixels,
+            "touching_render_component_supported_pixels": (
+                touching_render_supported_pixels),
+            "touching_render_component_unsupported_pixels": (
+                touching_render_unsupported_pixels),
+            "source_support_components": sorted(support_label_union),
+            "touching_render_components": touching_records,
+            "shifted_duplicate_scan": shifted_duplicate,
         })
-        if source_moat_pixels:
+        if source_gap_pixels:
             record["status"] = "skipped"
-            record["reason"] = "source_moat_not_clear"
+            record["reason"] = "source_inner_gap_not_clear"
             continue
-        if render_moat_pixels:
+        if render_target_pixels:
+            record["status"] = "skipped"
+            record["reason"] = "target_component_already_rendered"
+            continue
+        if unexpected_render_inner_gap_pixels:
+            record["status"] = "skipped"
+            record["reason"] = "render_inner_gap_not_source_supported"
+            continue
+        if unexpected_render_moat_pixels:
             record["status"] = "skipped"
             record["reason"] = "render_moat_not_clear"
             continue
+        if shifted_duplicate.get("status") == "scan_limit":
+            record["status"] = "skipped"
+            record["reason"] = "shifted_duplicate_scan_limit"
+            continue
+        if shifted_duplicate.get("status") == "detected":
+            record["status"] = "skipped"
+            record["reason"] = "shifted_duplicate_detected"
+            continue
 
-        component_rgba = flat_rgba[component]
+        trace_component = component
+        separation_carve = np.zeros_like(component, dtype=bool)
+        if render_inner_gap_pixels:
+            separation_carve = component & _dilate(
+                render_inner_gap, RENDER_ALIGNMENT_TOLERANCE)
+            trace_component = component & ~separation_carve
+        separation_carve_pixels = int(np.count_nonzero(separation_carve))
+        separation_carve_share = (
+            separation_carve_pixels / max(1, int(record["area_px"])))
+        _trace_labels, trace_component_count = connected_components(
+            trace_component)
+        trace_area = int(np.count_nonzero(trace_component))
+        record.update({
+            "separation_carve_pixels": separation_carve_pixels,
+            "separation_carve_share": round(
+                float(separation_carve_share), 6),
+            "trace_area_px": trace_area,
+            "trace_component_count": int(trace_component_count),
+        })
+        if (separation_carve_pixels > MAX_SEPARATION_CARVE_PIXELS
+                or separation_carve_share > MAX_SEPARATION_CARVE_SHARE):
+            record["status"] = "skipped"
+            record["reason"] = "separation_carve_limit"
+            continue
+        # Eligibility is authenticated against the original source component,
+        # which already met the topology minimum.  A bounded separation carve
+        # may legitimately leave that trace one or two pixels below the global
+        # source-area threshold; the 95% retention cap and final rendered
+        # topology transaction are the relevant safety evidence here.
+        if trace_area < 1 or trace_component_count != 1:
+            record["status"] = "skipped"
+            record["reason"] = "separation_carve_fragmented_component"
+            continue
+
+        component_rgba = flat_rgba[trace_component]
         alpha_min = int(component_rgba[:, 3].min())
         record["flat_alpha_min"] = alpha_min
         if alpha_min < opaque_alpha_min:
@@ -435,7 +692,7 @@ def propose_missing_component_repairs(
             continue
 
         traced = binary_mask_to_compound_path(
-            component, simplify=simplify, min_area=min_area,
+            trace_component, simplify=simplify, min_area=min_area,
             smooth=smooth, curve=curve)
         if not traced["path"] or traced["loop_count"] < 1:
             record["status"] = "skipped"
@@ -449,6 +706,10 @@ def propose_missing_component_repairs(
         mask_digest = hashlib.sha256(
             np.packbits(component.reshape(-1), bitorder="little").tobytes()
         ).hexdigest()
+        trace_mask_digest = hashlib.sha256(
+            np.packbits(
+                trace_component.reshape(-1), bitorder="little").tobytes()
+        ).hexdigest()
         repair = {
             "source_component": label,
             "id": path_id,
@@ -460,6 +721,9 @@ def propose_missing_component_repairs(
             "bbox": traced["bbox"],
             "area_px": record["area_px"],
             "mask_sha256": mask_digest,
+            "trace_area_px": trace_area,
+            "trace_mask_sha256": trace_mask_digest,
+            "separation_carve_pixels": separation_carve_pixels,
         }
         record.update({
             "status": "proposed",
@@ -468,6 +732,7 @@ def propose_missing_component_repairs(
             "path_nodes": traced["node_count"],
             "path_loops": traced["loop_count"],
             "mask_sha256": mask_digest,
+            "trace_mask_sha256": trace_mask_digest,
         })
         proposals.append(repair)
 
@@ -624,7 +889,8 @@ def _failure_labels(scores):
 
 def validate_repair_transaction(
         proposal, before_scores, after_scores, before_gate, after_gate,
-        before_render, after_render, *, bbox_padding=2):
+        before_render, after_render, *, source_reference=None,
+        bbox_padding=2):
     """Validate a rendered repair proposal and return an auditable verdict."""
 
     bbox_padding = _positive_int("bbox_padding", bbox_padding)
@@ -700,6 +966,161 @@ def validate_repair_transaction(
         audit["reasons"].append("proposal_render_unchanged")
     if outside_changed:
         audit["reasons"].append("render_changed_outside_repair_bbox")
+
+    # Reconstruct the authenticated source component masks and verify that the
+    # renderer did not turn the required one-pixel source gap into strong ink.
+    # The topology score alone cannot prove this: its alignment dilation can
+    # tolerate a target and neighbour being merged into one render component.
+    if source_reference is None:
+        audit["reasons"].append("source_reference_missing")
+    else:
+        try:
+            source_image = _load_rgba(source_reference, "source_reference")
+            if source_image.size != after_image.size:
+                source_ratio = source_image.width / max(
+                    1.0, float(source_image.height))
+                render_ratio = after_image.width / max(
+                    1.0, float(after_image.height))
+                relative_aspect_error = abs(
+                    source_ratio - render_ratio) / max(1e-9, source_ratio)
+                if relative_aspect_error > 0.002:
+                    raise ValueError("source/render aspect mismatch")
+                resampling = getattr(Image, "Resampling", Image).LANCZOS
+                source_image = source_image.resize(
+                    after_image.size, resampling)
+            roi = source_ink_roi(source_image)
+            source_mask = np.asarray(roi["mask"], dtype=bool)
+            source_strength = np.asarray(
+                roi["strength"], dtype=np.float32)
+            core_threshold = structural_core_threshold(
+                float(roi["ink_threshold"]))
+            core_source = source_mask & (
+                source_strength >= core_threshold)
+            source_labels, source_count = connected_components(core_source)
+            background = np.asarray(
+                roi["background_rgb"], dtype=np.float32)
+
+            def _render_core(image):
+                rgb = _composite_white(image).astype(np.float32)
+                strength = np.abs(rgb - background).max(axis=2)
+                return strength >= core_threshold
+
+            before_core = _render_core(before_image)
+            after_core = _render_core(after_image)
+            after_render_labels, _after_render_count = connected_components(
+                after_core)
+            gap_records = []
+            after_ids_by_target = {}
+            for repair in repairs:
+                label = int(repair["source_component"])
+                component = source_labels == label
+                actual_area = int(np.count_nonzero(component))
+                mask_digest = hashlib.sha256(
+                    np.packbits(
+                        component.reshape(-1), bitorder="little"
+                    ).tobytes()
+                ).hexdigest()
+                expected_digest = repair.get("mask_sha256")
+                before_inner_gap = (
+                    _dilate(component, SOURCE_GAP_RADIUS) & ~component
+                    & before_core)
+                expected_trace = component & ~_dilate(
+                    before_inner_gap, RENDER_ALIGNMENT_TOLERANCE)
+                trace_mask_digest = hashlib.sha256(
+                    np.packbits(
+                        expected_trace.reshape(-1), bitorder="little"
+                    ).tobytes()
+                ).hexdigest()
+                expected_trace_digest = repair.get("trace_mask_sha256")
+                record = {
+                    "source_component": label,
+                    "source_area_px": actual_area,
+                    "source_bbox_px": _bbox(component),
+                    "source_mask_sha256": mask_digest,
+                    "proposal_mask_sha256": expected_digest,
+                    "expected_trace_mask_sha256": trace_mask_digest,
+                    "proposal_trace_mask_sha256": expected_trace_digest,
+                }
+                if (label <= 0 or label > source_count or actual_area == 0
+                        or not isinstance(expected_digest, str)
+                        or expected_digest != mask_digest
+                        or not isinstance(expected_trace_digest, str)
+                        or expected_trace_digest != trace_mask_digest):
+                    record["status"] = "rejected"
+                    record["reason"] = "source_component_authentication_failed"
+                    audit["reasons"].append(
+                        "source_component_authentication_failed")
+                    gap_records.append(record)
+                    continue
+                inner_gap = _dilate(component, SOURCE_GAP_RADIUS) & ~component
+                before_gap_pixels = int(np.count_nonzero(
+                    before_core & inner_gap))
+                after_gap_pixels = int(np.count_nonzero(
+                    after_core & inner_gap))
+                new_core = after_core & ~before_core
+                new_gap = new_core & inner_gap
+                new_target_core = new_core & _dilate(
+                    component, SOURCE_GAP_RADIUS)
+                preexisting_connections = (
+                    _dilate(new_target_core, RENDER_ALIGNMENT_TOLERANCE)
+                    & before_core)
+                after_render_ids = sorted(
+                    int(value) for value in np.unique(
+                        after_render_labels[component]) if int(value) > 0)
+                after_ids_by_target[label] = set(after_render_ids)
+                new_gap_pixels = int(np.count_nonzero(new_gap))
+                connection_pixels = int(np.count_nonzero(
+                    preexisting_connections))
+                record.update({
+                    "status": (
+                        "accepted" if new_gap_pixels == 0
+                        and connection_pixels == 0 else "rejected"),
+                    "source_inner_gap_pixels": int(np.count_nonzero(inner_gap)),
+                    "before_render_inner_gap_core_pixels": before_gap_pixels,
+                    "after_render_inner_gap_core_pixels": after_gap_pixels,
+                    "new_render_inner_gap_core_pixels": new_gap_pixels,
+                    "new_render_to_preexisting_connection_pixels": (
+                        connection_pixels),
+                    "after_render_component_ids": after_render_ids,
+                })
+                if new_gap_pixels:
+                    audit["reasons"].append(
+                        "post_render_added_inner_gap_core")
+                if connection_pixels:
+                    audit["reasons"].append(
+                        "post_render_connected_to_preexisting_component")
+                gap_records.append(record)
+            target_rows = sorted(after_ids_by_target.items())
+            merged_target_pairs = []
+            for index, (left_label, left_ids) in enumerate(target_rows):
+                for right_label, right_ids in target_rows[index + 1:]:
+                    shared = sorted(left_ids & right_ids)
+                    if shared:
+                        merged_target_pairs.append({
+                            "source_components": [left_label, right_label],
+                            "after_render_component_ids": shared,
+                        })
+            if merged_target_pairs:
+                audit["reasons"].append("repaired_components_merged")
+            audit["post_render_gap_guard"] = {
+                "status": (
+                    "accepted" if all(
+                        item.get("status") == "accepted"
+                        for item in gap_records)
+                    and not merged_target_pairs else "rejected"),
+                "source_component_count": int(source_count),
+                "source_measurement_size": list(source_image.size),
+                "source_gap_radius": SOURCE_GAP_RADIUS,
+                "core_threshold": round(float(core_threshold), 6),
+                "merged_target_pairs": merged_target_pairs,
+                "records": gap_records,
+            }
+        except Exception as exc:
+            audit["reasons"].append("post_render_gap_evidence_unavailable")
+            audit["post_render_gap_guard"] = {
+                "status": "rejected",
+                "error": repr(exc)[:240],
+            }
 
     before_failures = _failure_labels(before_scores)
     after_failures = _failure_labels(after_scores)

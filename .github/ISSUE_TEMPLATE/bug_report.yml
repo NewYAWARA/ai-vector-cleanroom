@@ -1,0 +1,27 @@
+name: 錯誤回報
+description: 安裝、轉檔、接手頁或匯出出現可重現的問題。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        請勿公開客戶原稿、私人路徑、權杖或未授權素材。可以用自行繪製的簡單替代圖，或只描述步驟。
+  - type: input
+    id: environment
+    attributes:
+      label: 版本與環境
+      placeholder: 工具版本、Windows 版本、Python 版本；如為匯出問題，另附 Illustrator 版本。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 如何重現？預期與實際結果？
+      description: 寫出最少步驟、影響的區域，以及是否每次發生。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 錯誤訊息或可公開的重現例（選填）
+      description: 貼上相關錯誤段落即可；先移除個人名稱、客戶資訊與本機私人路徑。

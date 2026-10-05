@@ -13,6 +13,8 @@ Only the Python standard library is used.  The SVG is never rewritten.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from collections import Counter
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -37,6 +39,8 @@ _COMMAND_ARITY = {
 }
 _COMMAND_TOKEN = re.compile(r"^[A-Za-z]$")
 _URL_PAINT = re.compile(r"^url\s*\(", re.IGNORECASE)
+_URL_REFERENCE = re.compile(
+    r"^url\(\s*['\"]?#([^)'\"\s]+)['\"]?\s*\)$", re.IGNORECASE)
 _TRAILING_NUMBER = re.compile(r"(?:[-_ ]?\d+)+$")
 _GENERIC_LAYER_WORDS = {
     "color", "colour", "fill", "gradient", "layer", "paint", "path",
@@ -325,6 +329,276 @@ def _load_report_or_stats(value: object, svg_path: Path) -> dict[str, object]:
     return result
 
 
+def _designer_certified_gradient_paths(
+        supplied: Mapping[str, object], svg_sha256: str,
+        root: ET.Element,
+        path_elements: list[tuple[ET.Element, dict[str, str]]],
+) -> dict[str, object]:
+    """Authenticate compound paths that are one source-topology colour field.
+
+    A generic many-subpath warning assumes unrelated shapes were coupled into
+    one path.  It is inapplicable only when the designer audit, for these exact
+    SVG bytes, already proved that the path is one ownership-closed gradient
+    object whose source topology and final geometry are authoritative.
+    """
+    result: dict[str, object] = {
+        "available": False,
+        "authoritative": False,
+        "certified_path_ids": [],
+        "failure_reasons": [],
+        "invalid_path_ids": [],
+        "scope": (
+            "exact_final_svg_source_topology_gradient_compound_paths"),
+    }
+    quality = supplied.get("designer_quality")
+    if not isinstance(quality, Mapping):
+        return result
+    result["available"] = True
+    failures: list[str] = []
+    source = quality.get("source")
+    if (not isinstance(source, Mapping)
+            or str(source.get("sha256") or "").lower()
+            != svg_sha256.lower()):
+        failures.append("designer_quality_svg_sha256_mismatch")
+    gradient_gate = quality.get("gradient_object_gate")
+    gradient_gate = gradient_gate if isinstance(gradient_gate, Mapping) else {}
+    source_evidence = gradient_gate.get("source_space_field_evidence")
+    source_evidence = (source_evidence
+                       if isinstance(source_evidence, Mapping) else {})
+    if source_evidence.get("authoritative") is not True:
+        failures.append("source_topology_gradient_evidence_not_authoritative")
+    objects = source_evidence.get("objects")
+    if not isinstance(objects, list):
+        failures.append("source_topology_gradient_objects_missing")
+        objects = []
+
+    curve_gate = quality.get("curve_economy_gate")
+    curve_gate = curve_gate if isinstance(curve_gate, Mapping) else {}
+    optimizer = curve_gate.get("optimizer_economy_evidence")
+    optimizer = optimizer if isinstance(optimizer, Mapping) else {}
+    gradient_optimizer = optimizer.get("gradient")
+    gradient_optimizer = (gradient_optimizer
+                          if isinstance(gradient_optimizer, Mapping) else {})
+    if gradient_optimizer.get("authoritative") is not True:
+        failures.append("gradient_optimizer_evidence_not_authoritative")
+    certified_optimizer_ids = {
+        str(value) for value in gradient_optimizer.get(
+            "certified_path_ids", [])
+        if isinstance(value, str) and value
+    }
+
+    parents = {child: parent for parent in root.iter() for child in parent}
+
+    def inherited(element: ET.Element, name: str) -> str | None:
+        node: ET.Element | None = element
+        while node is not None:
+            value = node.attrib.get(name)
+            if value is not None:
+                return value.strip()
+            node = parents.get(node)
+        return None
+
+    paths_by_id: dict[str, list[tuple[ET.Element, dict[str, str]]]] = {}
+    for element, presentation in path_elements:
+        identifier = element.attrib.get("id", "").strip()
+        if identifier:
+            paths_by_id.setdefault(identifier, []).append(
+                (element, presentation))
+
+    certified: list[str] = []
+    invalid: list[str] = []
+    seen_candidates: set[str] = set()
+    for index, raw in enumerate(objects):
+        item = raw if isinstance(raw, Mapping) else {}
+        if item.get("final_element") != "path":
+            continue
+        identifier = str(item.get("final_drawable_id") or "")
+        candidate = str(item.get("candidate_id") or "")
+        item_failures: list[str] = []
+        if not candidate or candidate in seen_candidates:
+            item_failures.append("candidate_identity_missing_or_duplicate")
+        seen_candidates.add(candidate)
+        if (item.get("passed") is not True
+                or item.get("economy_certificate_passed") is not True):
+            item_failures.append("gradient_object_certificate_not_passed")
+        if not identifier or identifier not in certified_optimizer_ids:
+            item_failures.append("gradient_path_not_optimizer_certified")
+        matches = paths_by_id.get(identifier, [])
+        if len(matches) != 1:
+            item_failures.append("final_gradient_path_id_not_unique")
+        else:
+            element, presentation = matches[0]
+            fill_match = _URL_REFERENCE.fullmatch(
+                str(presentation.get("fill") or "").strip())
+            if (fill_match is None
+                    or fill_match.group(1) != str(item.get("gradient_id") or "")):
+                item_failures.append("gradient_resource_identity_mismatch")
+            if inherited(element, "data-avc-gradient-object") != str(
+                    item.get("gradient_object_id") or ""):
+                item_failures.append("gradient_object_identity_mismatch")
+        if item_failures:
+            label = identifier or f"gradient-path-{index + 1}"
+            invalid.append(label)
+            failures.extend(f"{label}:{reason}" for reason in item_failures)
+        else:
+            certified.append(identifier)
+
+    authoritative = not failures
+    result.update({
+        "authoritative": authoritative,
+        "certified_path_ids": sorted(set(certified)) if authoritative else [],
+        "failure_reasons": failures[:60],
+        "invalid_path_ids": invalid[:30],
+    })
+    return result
+
+
+def _designer_certified_curve_paths(
+        supplied: Mapping[str, object], svg_sha256: str,
+        root: ET.Element,
+        path_elements: list[tuple[ET.Element, dict[str, str]]],
+) -> dict[str, object]:
+    """Authenticate exact final-SVG paths covered by the curve optimiser.
+
+    This deliberately consumes the fail-closed certificate emitted by
+    ``designer_quality`` instead of reinterpreting a curve-refit proposal.  A
+    path is excluded from generic redraw heuristics only when that certificate
+    is authoritative for these exact SVG bytes, internally coherent, and tied
+    to one unique final path ID.  Raw SVG complexity remains reported
+    separately regardless of certification.
+    """
+    result: dict[str, object] = {
+        "available": False,
+        "authoritative": False,
+        "certified_refit_path_ids": [],
+        "certified_retained_identity_path_ids": [],
+        "certified_path_ids": [],
+        "failure_reasons": [],
+        "invalid_path_ids": [],
+        "scope": (
+            "exact_final_svg_transaction_backed_curve_optimizer_paths"),
+    }
+    quality = supplied.get("designer_quality")
+    if not isinstance(quality, Mapping):
+        return result
+    curve_gate = quality.get("curve_economy_gate")
+    curve_gate = curve_gate if isinstance(curve_gate, Mapping) else {}
+    optimizer = curve_gate.get("optimizer_economy_evidence")
+    optimizer = optimizer if isinstance(optimizer, Mapping) else {}
+    curve = optimizer.get("curve_refit")
+    if not isinstance(curve, Mapping):
+        return result
+    result["available"] = True
+    failures: list[str] = []
+    invalid: list[str] = []
+
+    source = quality.get("source")
+    if (not isinstance(source, Mapping)
+            or str(source.get("sha256") or "").lower()
+            != svg_sha256.lower()):
+        failures.append("designer_quality_svg_sha256_mismatch")
+    if curve.get("available") is not True:
+        failures.append("curve_optimizer_certificate_not_available")
+    if curve.get("authoritative") is not True:
+        failures.append("curve_optimizer_evidence_not_authoritative")
+    if curve.get("scope") != (
+            "transaction_backed_geometry_only_optimizer_economy_certificate"):
+        failures.append("curve_optimizer_certificate_scope_invalid")
+    if curve.get("transaction_status") != "committed":
+        failures.append("curve_optimizer_transaction_not_committed")
+    if curve.get("proposal_schema") != (
+            "ai-vector-cleanroom.curve-refit-proposal/v3"):
+        failures.append("curve_optimizer_proposal_schema_invalid")
+    if curve.get("proposal_status") != "proposed":
+        failures.append("curve_optimizer_proposal_status_invalid")
+    if curve.get("failure_reasons") != []:
+        failures.append("curve_optimizer_certificate_has_failures")
+    if curve.get("invalid_detail_ids") != []:
+        failures.append("curve_optimizer_certificate_has_invalid_details")
+
+    def exact_id_list(name: str) -> list[str]:
+        value = curve.get(name)
+        if (not isinstance(value, list)
+                or any(not isinstance(item, str) or not item for item in value)
+                or len(value) != len(set(value))):
+            failures.append(f"curve_optimizer_{name}_invalid")
+            return []
+        return list(value)
+
+    refit_ids = exact_id_list("certified_refit_path_ids")
+    retained_ids = exact_id_list("certified_retained_identity_path_ids")
+    certified_ids = exact_id_list("certified_path_ids")
+    if set(refit_ids) & set(retained_ids):
+        failures.append("curve_optimizer_certificate_classes_overlap")
+    expected_ids = set(refit_ids) | set(retained_ids)
+    if set(certified_ids) != expected_ids or len(certified_ids) != len(
+            expected_ids):
+        failures.append("curve_optimizer_certified_path_union_mismatch")
+    try:
+        certified_count = int(curve.get("certified_path_count"))
+    except (TypeError, ValueError, OverflowError):
+        certified_count = -1
+    if certified_count != len(expected_ids):
+        failures.append("curve_optimizer_certified_path_count_mismatch")
+
+    uncertified = curve.get("uncertified_evaluation_ids")
+    if (not isinstance(uncertified, list)
+            or any(not isinstance(item, str) or not item for item in uncertified)
+            or len(uncertified) != len(set(uncertified))
+            or expected_ids.intersection(uncertified)):
+        failures.append("curve_optimizer_uncertified_id_evidence_invalid")
+
+    parents = {child: parent for parent in root.iter() for child in parent}
+
+    def inherited(element: ET.Element, name: str) -> str | None:
+        node: ET.Element | None = element
+        while node is not None:
+            value = node.attrib.get(name)
+            if value is not None:
+                return value.strip()
+            node = parents.get(node)
+        return None
+
+    paths_by_id: dict[str, list[ET.Element]] = {}
+    for element, _presentation in path_elements:
+        identifier = element.attrib.get("id", "").strip()
+        if identifier:
+            paths_by_id.setdefault(identifier, []).append(element)
+
+    for identifier in sorted(expected_ids):
+        item_failures: list[str] = []
+        matches = paths_by_id.get(identifier, [])
+        if len(matches) != 1:
+            item_failures.append("final_curve_path_id_not_unique")
+        elif identifier in refit_ids:
+            if inherited(matches[0], "data-avc-curve-refit") != (
+                    "geometry-budgeted"):
+                item_failures.append("committed_curve_refit_claim_missing")
+        else:
+            if inherited(matches[0], "data-avc-curve-refit"):
+                item_failures.append("retained_identity_has_refit_claim")
+            if inherited(matches[0], "data-avc-gradient-object"):
+                item_failures.append("retained_identity_has_gradient_claim")
+        if item_failures:
+            invalid.append(identifier)
+            failures.extend(
+                f"{identifier}:{reason}" for reason in item_failures)
+
+    authoritative = not failures
+    result.update({
+        "authoritative": authoritative,
+        "certified_refit_path_ids": (
+            sorted(refit_ids) if authoritative else []),
+        "certified_retained_identity_path_ids": (
+            sorted(retained_ids) if authoritative else []),
+        "certified_path_ids": (
+            sorted(expected_ids) if authoritative else []),
+        "failure_reasons": failures[:80],
+        "invalid_path_ids": invalid[:30],
+    })
+    return result
+
+
 def _scaled_penalty(value: float, free: float, severe: float,
                     maximum: float) -> float:
     if value <= free:
@@ -333,6 +607,79 @@ def _scaled_penalty(value: float, free: float, severe: float,
         return maximum
     fraction = min(1.0, (value - free) / (severe - free))
     return maximum * fraction
+
+
+def _single_drawable_selection(root, drawables, unique_ids):
+    """Prove a direct selection target without inventing a semantic group."""
+    evidence = {"available": False, "drawable_id": None,
+                "basis": "single_identifiable_visible_drawable",
+                "semantic_group_created": False}
+    if len(drawables) != 1 or any(_local_name(e.tag) == "style" for e in root.iter()):
+        return evidence
+    element, presentation = drawables[0]
+    identifier = element.get("id", "").strip()
+    tag = _local_name(element.tag)
+    if not identifier or identifier not in unique_ids or tag not in _NATIVE_TAGS | {"path"}:
+        return evidence
+    parents = {child: parent for parent in root.iter() for child in parent}
+    node = element
+    fill_visible = presentation.get("fill", "#000000").lower() not in {"none", "transparent"}
+    stroke_visible = _has_visible_stroke(presentation)
+    while node is not None:
+        style = _style_map(node.get("style", ""))
+        if (style.get("display", node.get("display", "")).lower() == "none"
+                or style.get("visibility", node.get("visibility", "")).lower() in {"hidden", "collapse"}
+                or node.get("class")):
+            return evidence
+        if any(style.get(key, node.get(key, "none")).lower() != "none"
+               for key in ("clip-path", "mask", "filter")):
+            return evidence
+        try:
+            from svg_bounds import parse_transform
+            transform = parse_transform(style.get("transform", node.get("transform", "")))
+            if abs(transform[0] * transform[3] - transform[1] * transform[2]) <= 1e-12:
+                return evidence
+            opacity = float(style.get("opacity", node.get("opacity", "1")))
+            if not math.isfinite(opacity) or opacity <= 0:
+                return evidence
+            fill_visible &= float(style.get("fill-opacity", node.get("fill-opacity", "1"))) > 0
+            stroke_visible &= float(style.get("stroke-opacity", node.get("stroke-opacity", "1"))) > 0
+        except ValueError:
+            return evidence
+        node = parents.get(node)
+    if not (fill_visible or stroke_visible) or (tag == "line" and not stroke_visible):
+        return evidence
+    try:
+        def number(name):
+            value = float(element.get(name, "0"))
+            if not math.isfinite(value):
+                raise ValueError("nonfinite native geometry")
+            return value
+        if tag == "circle":
+            extent = number("r") > 0
+        elif tag == "ellipse":
+            extent = number("rx") > 0 and number("ry") > 0
+        elif tag == "rect":
+            extent = number("width") > 0 and number("height") > 0
+        elif tag == "line":
+            extent = number("x1") != number("x2") or number("y1") != number("y2")
+        elif tag == "path":
+            data = element.get("d", "")
+            commands, subpaths, anchors = _path_metrics(data)
+            values = [float(t) for t in _PATH_TOKEN_RE.findall(data) if not _COMMAND_TOKEN.match(t)]
+            extent = (subpaths == 1 and commands >= 2 and anchors >= 2 and values
+                      and all(math.isfinite(v) for v in values) and max(values) > min(values)
+                      and (stroke_visible or "z" in data.lower()))
+        else:
+            values = [float(t) for t in re.split(r"[\s,]+", element.get("points", "").strip()) if t]
+            extent = (len(values) >= (6 if tag == "polygon" else 4)
+                      and len(values) % 2 == 0 and all(math.isfinite(v) for v in values)
+                      and (len(set(values[::2])) > 1 or len(set(values[1::2])) > 1))
+    except (ValueError, OverflowError):
+        return evidence
+    if extent:
+        evidence.update(available=True, drawable_id=identifier, drawable_type=tag)
+    return evidence
 
 
 def audit_editability(svg_path: str | Path,
@@ -345,7 +692,9 @@ def audit_editability(svg_path: str | Path,
     so a stale report cannot conceal structural complexity.
     """
     path = Path(svg_path)
-    root = ET.parse(path).getroot()
+    payload = path.read_bytes()
+    svg_sha256 = hashlib.sha256(payload).hexdigest()
+    root = ET.fromstring(payload)
     supplied = _load_report_or_stats(report_or_stats, path)
     named_operation_evidence = _named_operation_evidence(supplied)
     scene_graph_metadata = _embedded_metadata_object(
@@ -353,13 +702,36 @@ def audit_editability(svg_path: str | Path,
 
     groups: list[ET.Element] = []
     drawables: list[tuple[ET.Element, dict[str, str]]] = []
+    drawable_paint_roles: dict[ET.Element, dict[str, str]] = {}
     gradient_elements: list[ET.Element] = []
 
     def walk(element: ET.Element, inherited: Mapping[str, str],
-             in_defs: bool = False) -> None:
+             in_defs: bool = False,
+             inherited_paint_roles: Mapping[str, str] | None = None) -> None:
         tag = _local_name(element.tag)
         now_in_defs = in_defs or tag == "defs"
         presentation = _presentation(element, inherited)
+        paint_roles = dict(inherited_paint_roles or {})
+        inline_style = _style_map(element.attrib.get("style", ""))
+        for property_name in ("fill", "stroke"):
+            if property_name in inline_style:
+                declared_value = inline_style[property_name].strip().lower()
+                declared_here = True
+            elif property_name in element.attrib:
+                declared_value = element.attrib[property_name].strip().lower()
+                declared_here = True
+            else:
+                declared_value = ""
+                declared_here = False
+            if declared_here and declared_value not in {"inherit", "unset"}:
+                role_id = _local_attribute(
+                    element, "data-paint-role-" + property_name).strip()
+                if role_id:
+                    paint_roles[property_name] = role_id
+                else:
+                    # A local paint declaration severs the parent's control.
+                    # Do not credit an ancestor role for a child override.
+                    paint_roles.pop(property_name, None)
         if tag in {"linearGradient", "radialGradient"}:
             gradient_elements.append(element)
         if not now_in_defs:
@@ -367,15 +739,27 @@ def audit_editability(svg_path: str | Path,
                 groups.append(element)
             if tag in _DRAWABLE_TAGS:
                 drawables.append((element, presentation))
+                drawable_paint_roles[element] = paint_roles
         for child in element:
-            walk(child, presentation, now_in_defs)
+            walk(child, presentation, now_in_defs, paint_roles)
 
     walk(root, {"fill": "#000000", "stroke": "none", "stroke-width": "1"})
 
     path_elements = [item for item in drawables if _local_name(item[0].tag) == "path"]
+    certified_gradient_paths = _designer_certified_gradient_paths(
+        supplied, svg_sha256, root, path_elements)
+    certified_gradient_path_ids = set(
+        certified_gradient_paths.get("certified_path_ids", []))
+    certified_curve_paths = _designer_certified_curve_paths(
+        supplied, svg_sha256, root, path_elements)
+    certified_curve_path_ids = set(
+        certified_curve_paths.get("certified_path_ids", []))
+    certified_optimizer_path_ids = (
+        certified_gradient_path_ids | certified_curve_path_ids)
     command_counts: list[int] = []
     subpath_counts: list[int] = []
     control_point_counts: list[int] = []
+    path_metric_records: list[dict[str, object]] = []
     estimated_path_anchors = 0
     for element, _presentation_data in path_elements:
         commands, subpaths, anchors, controls = _path_metrics_detailed(
@@ -384,6 +768,13 @@ def audit_editability(svg_path: str | Path,
         subpath_counts.append(subpaths)
         control_point_counts.append(controls)
         estimated_path_anchors += anchors
+        path_metric_records.append({
+            "id": element.attrib.get("id", "").strip() or None,
+            "commands": commands,
+            "subpaths": subpaths,
+            "anchors": anchors,
+            "controls": controls,
+        })
 
     native_breakdown = {
         tag: sum(1 for element, _ in drawables if _local_name(element.tag) == tag)
@@ -409,9 +800,13 @@ def audit_editability(svg_path: str | Path,
             if paint is not None:
                 solid_paints.add(paint)
 
+    all_ids = [element.get("id", "").strip() for element in root.iter()
+               if element.get("id", "").strip()]
+    id_counts = Counter(all_ids)
+    unique_ids = {identifier for identifier, count in id_counts.items() if count == 1}
     object_ids = [
         element.attrib["id"] for element, _ in drawables
-        if element.attrib.get("id", "").strip()
+        if element.attrib.get("id", "").strip() in unique_ids
     ]
     color_layer_count = sum(_looks_like_color_layer(group) for group in groups)
     semantic_group_count = len(groups) - color_layer_count
@@ -432,15 +827,13 @@ def audit_editability(svg_path: str | Path,
         if element in drawable_elements
     }
     paint_role_ids: set[str] = set()
-    paint_role_drawables: set[ET.Element] = set()
     for element in root.iter():
-        annotated = False
         for attribute, value in element.attrib.items():
             if _local_name(attribute).startswith("data-paint-role-") and value:
                 paint_role_ids.add(value)
-                annotated = True
-        if annotated and element in drawable_elements:
-            paint_role_drawables.add(element)
+    paint_role_drawables = {
+        element for element, roles in drawable_paint_roles.items() if roles
+    }
     only_color_layers = (
         bool(groups) and color_layer_count == len(groups)
         and semantic_group_count == 0
@@ -503,6 +896,72 @@ def audit_editability(svg_path: str | Path,
     max_control_points = max(control_point_counts, default=0)
     multi_subpath_paths = sum(count > 1 for count in subpath_counts)
     max_subpaths = max(subpath_counts, default=0)
+    generic_path_metric_records = [
+        item for item in path_metric_records
+        if item.get("id") not in certified_optimizer_path_ids
+    ]
+    certified_path_metric_records = [
+        item for item in path_metric_records
+        if item.get("id") in certified_optimizer_path_ids
+    ]
+    generic_path_count = len(generic_path_metric_records)
+    generic_path_anchors = sum(
+        int(item["anchors"]) for item in generic_path_metric_records)
+    certified_path_anchors = sum(
+        int(item["anchors"]) for item in certified_path_metric_records)
+    certified_total_commands = sum(
+        int(item["commands"]) for item in certified_path_metric_records)
+    certified_total_subpaths = sum(
+        int(item["subpaths"]) for item in certified_path_metric_records)
+    certified_total_control_points = sum(
+        int(item["controls"]) for item in certified_path_metric_records)
+    certified_max_commands = max(
+        (int(item["commands"]) for item in certified_path_metric_records),
+        default=0)
+    certified_max_subpaths = max(
+        (int(item["subpaths"]) for item in certified_path_metric_records),
+        default=0)
+    # Preserve any conservative report-only node surplus in the uncertified
+    # scope.  Exact SVG path anchors can be subtracted safely; opaque report
+    # counts cannot be attributed to certified paths and therefore remain a
+    # generic burden instead of being silently forgiven.
+    report_only_node_surplus = max(
+        0, (reported_nodes or 0) - svg_estimated_nodes)
+    generic_node_count = (
+        generic_path_anchors + report_only_node_surplus
+        if certified_optimizer_path_ids else node_count)
+    generic_command_counts = sorted(
+        int(item["commands"]) for item in generic_path_metric_records)
+    generic_subpath_counts = [
+        int(item["subpaths"]) for item in generic_path_metric_records]
+    generic_control_point_counts = [
+        int(item["controls"]) for item in generic_path_metric_records]
+    generic_total_commands = sum(generic_command_counts)
+    generic_total_control_points = sum(generic_control_point_counts)
+    generic_max_control_points = max(generic_control_point_counts, default=0)
+    if generic_command_counts:
+        generic_median_commands = float(statistics.median(
+            generic_command_counts))
+        generic_p95_index = max(
+            0, math.ceil(0.95 * len(generic_command_counts)) - 1)
+        generic_p95_commands = generic_command_counts[generic_p95_index]
+        generic_max_commands = generic_command_counts[-1]
+        generic_max_command_share = (
+            generic_max_commands / generic_total_commands
+            if generic_total_commands else 0.0)
+    else:
+        generic_median_commands = 0.0
+        generic_p95_commands = 0
+        generic_max_commands = 0
+        generic_max_command_share = 0.0
+    generic_coupling_max_subpaths = max(
+        generic_subpath_counts,
+        default=0)
+    certified_compound_records = [
+        item for item in path_metric_records
+        if item.get("id") in certified_gradient_path_ids
+        and int(item["subpaths"]) > 20
+    ]
     drawable_count = len(drawables)
     object_id_count = len(object_ids)
 
@@ -511,6 +970,10 @@ def audit_editability(svg_path: str | Path,
         len(semantically_grouped_drawables) / drawable_count
         if drawable_count else 0.0
     )
+    direct_selection = _single_drawable_selection(root, drawables, unique_ids)
+    selection_coverage = (1.0 if direct_selection["available"]
+                          else semantic_group_coverage)
+    needs_semantic_grouping = only_color_layers and not direct_selection["available"]
     paint_role_coverage = (
         len(paint_role_drawables) / drawable_count if drawable_count else 0.0
     )
@@ -522,7 +985,7 @@ def audit_editability(svg_path: str | Path,
     automation_components: dict[str, float] = {
         "object_identity": 30.0 * min(1.0, object_id_coverage / 0.80)
         if drawable_count else 0.0,
-        "semantic_selection": 25.0 * min(1.0, semantic_group_coverage / 0.40)
+        "semantic_selection": 25.0 * min(1.0, selection_coverage / 0.40)
         if drawable_count else 0.0,
         "paint_roles": (
             20.0 * min(1.0, paint_role_coverage / 0.80)
@@ -535,11 +998,11 @@ def audit_editability(svg_path: str | Path,
         ),
     }
     isolation_score = 10.0
-    if max_commands >= 500:
+    if generic_max_commands >= 500:
         isolation_score -= 4.0
-    if max_subpaths > 20:
+    if generic_coupling_max_subpaths > 20:
         isolation_score -= 4.0
-    if max_command_share > 0.45:
+    if generic_max_command_share > 0.45:
         isolation_score -= 2.0
     automation_components["object_isolation"] = max(0.0, isolation_score)
     automation_score = round(min(100.0, sum(automation_components.values())), 1)
@@ -549,36 +1012,70 @@ def audit_editability(svg_path: str | Path,
         else "limited"
     )
 
-    # Raw indicators remain visible, but correlated warnings are combined by
-    # maximum within a family. Paths and nodes describe the same global volume;
-    # maximum commands/subpaths/concentration describe the same worst object.
-    # Summing all of them made deliberate brush texture count three times.
-    risk_indicators: dict[str, float] = {}
+    # The delivered SVG's raw structure is always retained below.  Only paths
+    # bound to an authoritative exact-SVG optimiser certificate are removed
+    # from this generic redraw scope.  Correlated warnings are still combined
+    # by maximum within each family; no thresholds are relaxed.
+    def build_risk_indicators(
+            *, scope_path_count: int, scope_node_count: int,
+            scope_control_points: int, scope_median_commands: float,
+            scope_p95_commands: int, scope_max_commands: int,
+            scope_max_control_points: int, scope_max_subpaths: int,
+            scope_max_command_share: float) -> dict[str, float]:
+        indicators: dict[str, float] = {}
 
-    def add_scaled(name: str, value: float, free: float, severe: float,
-                   maximum: float) -> None:
-        penalty = _scaled_penalty(value, free, severe, maximum)
-        if penalty:
-            risk_indicators[name] = penalty
+        def add_scaled(name: str, value: float, free: float, severe: float,
+                       maximum: float) -> None:
+            penalty = _scaled_penalty(value, free, severe, maximum)
+            if penalty:
+                indicators[name] = penalty
 
-    add_scaled("many_paths", path_count, 40, 300, 22)
-    add_scaled("many_nodes", node_count, 500, 5000, 24)
-    add_scaled("many_bezier_control_points", total_control_points,
-               500, 5000, 18)
-    add_scaled("excessive_group_navigation", len(groups), 60, 180, 6)
-    add_scaled("high_median_path_commands", median_commands, 40, 150, 8)
-    add_scaled("high_p95_path_commands", p95_commands, 120, 450, 10)
-    add_scaled("single_very_complex_path", max_commands, 250, 800, 12)
-    add_scaled("single_path_many_bezier_controls", max_control_points,
-               100, 1200, 10)
-    add_scaled("many_subpaths_in_one_path", max_subpaths, 20, 100, 6)
-    add_scaled("path_command_concentration", max_command_share, 0.45, 0.85, 6)
-    if drawable_count >= 20 and object_id_count == 0:
-        risk_indicators["no_object_ids"] = 8.0
-    elif drawable_count >= 50 and object_id_coverage < 0.10:
-        risk_indicators["very_low_object_id_coverage"] = 5.0
-    if only_color_layers:
-        risk_indicators["color_layers_without_semantic_groups"] = 10.0
+        add_scaled("many_paths", scope_path_count, 40, 300, 22)
+        add_scaled("many_nodes", scope_node_count, 500, 5000, 24)
+        add_scaled("many_bezier_control_points", scope_control_points,
+                   500, 5000, 18)
+        add_scaled("excessive_group_navigation", len(groups), 60, 180, 6)
+        add_scaled("high_median_path_commands", scope_median_commands,
+                   40, 150, 8)
+        add_scaled("high_p95_path_commands", scope_p95_commands, 120, 450, 10)
+        add_scaled("single_very_complex_path", scope_max_commands,
+                   250, 800, 12)
+        add_scaled("single_path_many_bezier_controls",
+                   scope_max_control_points, 100, 1200, 10)
+        add_scaled("many_subpaths_in_one_path", scope_max_subpaths,
+                   20, 100, 6)
+        add_scaled("path_command_concentration", scope_max_command_share,
+                   0.45, 0.85, 6)
+        if drawable_count >= 20 and object_id_count == 0:
+            indicators["no_object_ids"] = 8.0
+        elif drawable_count >= 50 and object_id_coverage < 0.10:
+            indicators["very_low_object_id_coverage"] = 5.0
+        if needs_semantic_grouping:
+            indicators["color_layers_without_semantic_groups"] = 10.0
+        return indicators
+
+    raw_risk_indicators = build_risk_indicators(
+        scope_path_count=path_count,
+        scope_node_count=node_count,
+        scope_control_points=total_control_points,
+        scope_median_commands=median_commands,
+        scope_p95_commands=p95_commands,
+        scope_max_commands=max_commands,
+        scope_max_control_points=max_control_points,
+        scope_max_subpaths=max_subpaths,
+        scope_max_command_share=max_command_share,
+    )
+    risk_indicators = build_risk_indicators(
+        scope_path_count=generic_path_count,
+        scope_node_count=generic_node_count,
+        scope_control_points=generic_total_control_points,
+        scope_median_commands=generic_median_commands,
+        scope_p95_commands=generic_p95_commands,
+        scope_max_commands=generic_max_commands,
+        scope_max_control_points=generic_max_control_points,
+        scope_max_subpaths=generic_coupling_max_subpaths,
+        scope_max_command_share=generic_max_command_share,
+    )
 
     def family_max(*names: str) -> float:
         return max((risk_indicators.get(name, 0.0) for name in names), default=0.0)
@@ -617,19 +1114,38 @@ def audit_editability(svg_path: str | Path,
     # and the combined value exists only as an acceptance guardrail.
     combined_structural_ease = round(
         max(0.0, 100.0 - redraw_burden - workflow_burden), 1)
-    review_triggers: list[str] = []
-    if path_count >= 200:
-        review_triggers.append("path_count_at_least_200")
-    if node_count >= 4000:
-        review_triggers.append("node_count_at_least_4000")
-    if max_commands >= 500:
-        review_triggers.append("one_path_at_least_500_commands")
-    if max_subpaths >= 50:
-        review_triggers.append("one_path_at_least_50_subpaths")
-    if only_color_layers and len(groups) >= 20:
-        review_triggers.append("twenty_plus_color_layers_without_semantic_groups")
-    if drawable_count >= 100 and object_id_count == 0:
-        review_triggers.append("one_hundred_plus_objects_without_ids")
+    def build_review_triggers(*, scope_path_count: int,
+                              scope_node_count: int,
+                              scope_max_commands: int,
+                              scope_max_subpaths: int) -> list[str]:
+        triggers: list[str] = []
+        if scope_path_count >= 200:
+            triggers.append("path_count_at_least_200")
+        if scope_node_count >= 4000:
+            triggers.append("node_count_at_least_4000")
+        if scope_max_commands >= 500:
+            triggers.append("one_path_at_least_500_commands")
+        if scope_max_subpaths >= 50:
+            triggers.append("one_path_at_least_50_subpaths")
+        if only_color_layers and len(groups) >= 20:
+            triggers.append(
+                "twenty_plus_color_layers_without_semantic_groups")
+        if drawable_count >= 100 and object_id_count == 0:
+            triggers.append("one_hundred_plus_objects_without_ids")
+        return triggers
+
+    raw_review_triggers = build_review_triggers(
+        scope_path_count=path_count,
+        scope_node_count=node_count,
+        scope_max_commands=max_commands,
+        scope_max_subpaths=max_subpaths,
+    )
+    review_triggers = build_review_triggers(
+        scope_path_count=generic_path_count,
+        scope_node_count=generic_node_count,
+        scope_max_commands=generic_max_commands,
+        scope_max_subpaths=generic_coupling_max_subpaths,
+    )
     outline_trigger_names = {
         "path_count_at_least_200",
         "node_count_at_least_4000",
@@ -639,6 +1155,9 @@ def audit_editability(svg_path: str | Path,
     outline_review_triggers = [
         item for item in review_triggers if item in outline_trigger_names
     ]
+    raw_outline_review_triggers = [
+        item for item in raw_review_triggers if item in outline_trigger_names
+    ]
     status = (
         "accepted"
         if (score >= 75.0 and combined_structural_ease >= 75.0
@@ -647,7 +1166,7 @@ def audit_editability(svg_path: str | Path,
     )
     if score >= 85.0 and not outline_review_triggers:
         redraw_level = "low"
-    elif score >= 70.0 and max_commands < 500:
+    elif score >= 70.0 and generic_max_commands < 500:
         redraw_level = "moderate"
     elif score >= 50.0:
         redraw_level = "high"
@@ -663,14 +1182,16 @@ def audit_editability(svg_path: str | Path,
         workflow_level = "very_high"
 
     reasons: list[str] = []
-    if path_count > 40 or node_count > 500:
+    if generic_path_count > 40 or generic_node_count > 500:
         reasons.append(
-            f"Bulk reshaping spans {path_count} paths and {node_count} nodes; "
+            "Uncertified bulk reshaping spans "
+            f"{generic_path_count} paths and {generic_node_count} nodes; "
             "these correlated volume signals are penalized once."
         )
-    if max_commands > 250:
+    if generic_max_commands > 250:
         reasons.append(
-            f"The largest path has {max_commands} commands and is costly to reshape."
+            "The largest uncertified path has "
+            f"{generic_max_commands} commands and is costly to reshape."
         )
     if len(groups) > 60:
         reasons.append(f"{len(groups)} groups/layers make stack navigation heavier.")
@@ -682,13 +1203,26 @@ def audit_editability(svg_path: str | Path,
         reasons.append(
             f"Only {object_id_count} of {drawable_count} drawable objects has an ID."
         )
-    if only_color_layers:
+    if needs_semantic_grouping:
         reasons.append(
             "Groups separate paint layers only; no semantic object grouping was detected."
         )
-    if max_subpaths > 20:
+    if generic_coupling_max_subpaths > 20:
         reasons.append(
-            f"One path contains {max_subpaths} subpaths, coupling many shapes together."
+            f"One uncertified path contains {generic_coupling_max_subpaths} "
+            "subpaths, coupling many shapes together."
+        )
+    if certified_compound_records:
+        reasons.append(
+            f"{len(certified_compound_records)} source-topology-certified "
+            "gradient compound path(s) retain their closed loops as one "
+            "ownership object instead of fragmenting the colour field."
+        )
+    if certified_curve_path_ids:
+        reasons.append(
+            f"{len(certified_curve_path_ids)} exact-SVG curve-optimizer path(s) "
+            "are disclosed in raw totals but excluded from generic cleanup "
+            "heuristics under their geometry-error contracts."
         )
     if automation_status == "ready_for_common_operations" and status != "accepted":
         reasons.append(
@@ -710,6 +1244,69 @@ def audit_editability(svg_path: str | Path,
         "gradient_resource_count": gradient_resource_count,
         "node_count": node_count,
         "svg_estimated_node_count": svg_estimated_nodes,
+        "raw_scope_metrics": {
+            "scope": "all_final_svg_paths_and_conservative_report_counts",
+            "path_count": path_count,
+            "node_count": node_count,
+            "svg_path_anchor_count": estimated_path_anchors,
+            "command_count": total_commands,
+            "control_point_count": total_control_points,
+            "subpath_count": total_subpaths,
+            "max_commands_in_one_path": max_commands,
+            "max_subpaths_in_one_path": max_subpaths,
+            "review_triggers": raw_review_triggers,
+            "outline_review_triggers": raw_outline_review_triggers,
+            "scope_note": (
+                "Disclosure only: authoritative optimiser certificates never "
+                "remove paths, nodes, commands or subpaths from these raw "
+                "delivered-SVG totals."),
+        },
+        "certified_optimizer_scope": {
+            "scope": "exact_final_svg_authoritative_optimizer_certificates",
+            "path_count": len(certified_path_metric_records),
+            "path_ids": sorted(str(item) for item in
+                               certified_optimizer_path_ids),
+            "curve_path_count": len(certified_curve_path_ids),
+            "gradient_path_count": len(certified_gradient_path_ids),
+            "curve_gradient_overlap_count": len(
+                certified_curve_path_ids & certified_gradient_path_ids),
+            "path_anchor_count": certified_path_anchors,
+            "command_count": certified_total_commands,
+            "control_point_count": certified_total_control_points,
+            "subpath_count": certified_total_subpaths,
+            "max_commands_in_one_path": certified_max_commands,
+            "max_subpaths_in_one_path": certified_max_subpaths,
+            "curve_evidence": certified_curve_paths,
+            "gradient_evidence": certified_gradient_paths,
+            "scope_note": (
+                "These exact paths remain fully disclosed above. They are "
+                "excluded only from generic redraw heuristics after fail-closed "
+                "SHA, certificate, transaction and unique-final-ID checks."),
+        },
+        "generic_uncertified_redraw_scope": {
+            "scope": "final_svg_paths_without_authoritative_optimizer_certificate",
+            "path_count": generic_path_count,
+            "node_count": generic_node_count,
+            "svg_path_anchor_count": generic_path_anchors,
+            "report_only_node_surplus": report_only_node_surplus,
+            "unattributed_conservative_node_count": max(
+                0, generic_node_count - generic_path_anchors),
+            "command_count": generic_total_commands,
+            "control_point_count": generic_total_control_points,
+            "subpath_count": sum(generic_subpath_counts),
+            "median_commands_per_path": generic_median_commands,
+            "p95_commands_per_path": generic_p95_commands,
+            "max_commands_in_one_path": generic_max_commands,
+            "max_control_points_in_one_path": generic_max_control_points,
+            "max_subpaths_in_one_path": generic_coupling_max_subpaths,
+            "max_path_command_share": round(
+                generic_max_command_share, 6),
+            "review_triggers": review_triggers,
+            "outline_review_triggers": outline_review_triggers,
+            "scope_note": (
+                "Only this uncertified redraw scope feeds outline penalties "
+                "and formal structural acceptance; thresholds are unchanged."),
+        },
         "group_count": len(groups),
         "color_layer_group_count": color_layer_count,
         "semantic_group_count": semantic_group_count,
@@ -718,6 +1315,12 @@ def audit_editability(svg_path: str | Path,
         "semantically_grouped_drawable_count": len(
             semantically_grouped_drawables),
         "semantic_group_coverage": round(semantic_group_coverage, 6),
+        "direct_single_drawable_selection": direct_selection,
+        "effective_selection_coverage": round(selection_coverage, 6),
+        "selection_coverage_basis": (
+            "single_identifiable_visible_drawable" if direct_selection["available"]
+            else "semantic_group_coverage"),
+        "duplicate_document_ids": sorted(identifier for identifier, count in id_counts.items() if count > 1),
         "unique_solid_paint_count": len(solid_paints),
         "unique_solid_paints": sorted(solid_paints),
         "paint_role_count": len(paint_role_ids),
@@ -727,6 +1330,11 @@ def audit_editability(svg_path: str | Path,
         "total_subpaths": total_subpaths,
         "multi_subpath_path_count": multi_subpath_paths,
         "max_subpaths_per_path": max_subpaths,
+        "generic_coupling_max_subpaths": generic_coupling_max_subpaths,
+        "source_topology_certified_compound_path_ids": sorted(
+            str(item["id"]) for item in certified_compound_records),
+        "source_topology_gradient_evidence": certified_gradient_paths,
+        "curve_optimizer_certificate_evidence": certified_curve_paths,
         "total_path_commands": total_commands,
         "explicit_bezier_control_point_count": total_control_points,
         "max_explicit_bezier_control_points_per_path": max_control_points,
@@ -756,6 +1364,10 @@ def audit_editability(svg_path: str | Path,
             name: round(value, 2)
             for name, value in sorted(risk_indicators.items())
         },
+        "raw_risk_penalties": {
+            name: round(value, 2)
+            for name, value in sorted(raw_risk_indicators.items())
+        },
         "applied_penalty_families": {
             name: round(value, 2)
             for name, value in sorted(all_penalty_families.items())
@@ -769,6 +1381,8 @@ def audit_editability(svg_path: str | Path,
             for name, value in sorted(workflow_penalty_families.items())
         },
         "penalty_combination": (
+            "Raw structure remains disclosed; outline indicators use only "
+            "paths without an authoritative exact-SVG optimiser certificate. "
             "Correlated indicators use the maximum within each family, then "
             "outline families and workflow-friction families are scored on "
             "separate axes. Their sum is retained only for the conservative "
@@ -777,7 +1391,10 @@ def audit_editability(svg_path: str | Path,
         ),
         "visual_style_discount_applied": False,
         "review_triggers": review_triggers,
+        "generic_review_triggers": review_triggers,
+        "raw_review_triggers": raw_review_triggers,
         "outline_review_triggers": outline_review_triggers,
+        "raw_outline_review_triggers": raw_outline_review_triggers,
         "automation_readiness": {
             "score": automation_score,
             "status": automation_status,
@@ -788,7 +1405,7 @@ def audit_editability(svg_path: str | Path,
                 for name, value in sorted(automation_components.items())
             },
             "scope_note": (
-                "Measures dependable IDs, semantic selection groups, paint-role "
+                "Measures dependable IDs, direct single-drawable or semantic-group selection, paint-role "
                 "targets and native SVG handles. This score is not a task count. "
                 "Named-operation evidence is audited separately."
             ),
@@ -802,9 +1419,11 @@ def audit_editability(svg_path: str | Path,
                 for name, value in sorted(outline_penalty_families.items())
             },
             "scope_note": (
-                "Measures freeform point-level reshaping and cleanup burden. "
-                "Intentional brush edges remain real redraw complexity even when "
-                "common automated operations pass."
+                "Measures freeform point-level reshaping and cleanup burden in "
+                "the generic uncertified path scope. Raw final-SVG complexity "
+                "remains separately disclosed. Intentional brush edges remain "
+                "real redraw complexity even when common automated operations "
+                "pass."
             ),
         },
         "workflow_friction": {
@@ -855,11 +1474,14 @@ def audit_editability(svg_path: str | Path,
             "combined_structural_ease": combined_structural_ease,
             "automation_readiness": automation_score,
             "review_trigger_count": len(review_triggers),
+            "generic_review_trigger_count": len(review_triggers),
+            "raw_review_trigger_count": len(raw_review_triggers),
         },
         "scope_note": (
-            "Passing this guardrail means only that no encoded structural "
-            "editability blocker fired. It is not visual acceptance, a human "
-            "task pass, timed labour evidence, or final designer approval."
+            "Passing this guardrail means only that no encoded blocker fired "
+            "in the generic uncertified redraw scope or workflow structure. "
+            "Raw totals remain disclosed. It is not visual acceptance, a "
+            "human task pass, timed labour evidence, or final designer approval."
         ),
     }
     result: dict[str, object] = {

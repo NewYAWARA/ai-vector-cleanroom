@@ -7,10 +7,84 @@ import unittest
 
 import numpy as np
 
+import trace_engine as te
 from trace_engine import binary_mask_to_compound_path
 
 
+def _legacy_mask_to_smooth_loops(mask, simplify, min_area, smooth):
+    """Reference implementation preserving the former nested cell scan."""
+    if smooth <= 0:
+        return te._mask_to_loops(mask, simplify, min_area)
+
+    h, w = mask.shape
+    img = te.Image.fromarray((mask.astype(np.uint8) * 255), "L")
+    img = img.filter(te.ImageFilter.GaussianBlur(float(smooth)))
+    field = np.pad(
+        np.asarray(img).astype(np.float32) / 255.0,
+        1, mode="constant")
+    level = 0.5
+    segments = []
+    edge_pairs = {
+        1: [(3, 0)], 2: [(0, 1)], 3: [(3, 1)], 4: [(1, 2)],
+        5: [(0, 3), (1, 2)], 6: [(0, 2)], 7: [(3, 2)],
+        8: [(2, 3)], 9: [(0, 2)], 10: [(0, 1), (3, 2)],
+        11: [(1, 2)], 12: [(3, 1)], 13: [(0, 1)], 14: [(3, 0)],
+    }
+    fh, fw = field.shape
+    for y in range(fh - 1):
+        for x in range(fw - 1):
+            v0 = field[y, x]
+            v1 = field[y, x + 1]
+            v2 = field[y + 1, x + 1]
+            v3 = field[y + 1, x]
+            case = (
+                (1 if v0 >= level else 0)
+                | (2 if v1 >= level else 0)
+                | (4 if v2 >= level else 0)
+                | (8 if v3 >= level else 0)
+            )
+            if case == 0 or case == 15:
+                continue
+            p0 = (x - 1.0, y - 1.0)
+            p1 = (x, y - 1.0)
+            p2 = (x, y)
+            p3 = (x - 1.0, y)
+            edge_points = {
+                0: te._interp(level, p0, p1, v0, v1),
+                1: te._interp(level, p1, p2, v1, v2),
+                2: te._interp(level, p3, p2, v3, v2),
+                3: te._interp(level, p0, p3, v0, v3),
+            }
+            for edge_a, edge_b in edge_pairs.get(case, []):
+                a = edge_points[edge_a]
+                b = edge_points[edge_b]
+                a = (min(max(a[0], 0.0), float(w)),
+                     min(max(a[1], 0.0), float(h)))
+                b = (min(max(b[0], 0.0), float(w)),
+                     min(max(b[1], 0.0), float(h)))
+                if te._segment_key(a) != te._segment_key(b):
+                    segments.append((a, b))
+    return te._segments_to_loops(segments, simplify, min_area)
+
+
 class BinaryMaskCompoundPathTests(unittest.TestCase):
+    def test_vectorized_smooth_case_scan_matches_legacy_row_major_output(self):
+        structured = np.zeros((27, 31), dtype=bool)
+        structured[2:23, 3:12] = True
+        structured[16:25, 10:28] = True
+        structured[6:12, 18:27] = True
+        structured[18:21, 14:18] = False
+        random_mask = np.random.default_rng(20260719).random((23, 29)) > 0.58
+
+        for mask in (structured, random_mask):
+            for smooth in (0.35, 0.6, 1.0):
+                with self.subTest(shape=mask.shape, smooth=smooth):
+                    expected = _legacy_mask_to_smooth_loops(
+                        mask, simplify=0.0, min_area=1.0, smooth=smooth)
+                    actual = te._mask_to_smooth_loops(
+                        mask, simplify=0.0, min_area=1.0, smooth=smooth)
+                    self.assertEqual(actual, expected)
+
     def test_outer_contour_and_inner_hole_form_one_compound_path(self):
         mask = np.zeros((12, 12), dtype=bool)
         mask[1:10, 1:10] = True

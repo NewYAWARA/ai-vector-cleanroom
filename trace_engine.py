@@ -169,10 +169,9 @@ def _clustered_enclosed_background_mask(visible, background_like):
             continue
 
         # Keep this distance tied to the canvas, not to the white component.
-        # Real white wordmarks in the dark-wordmark validation logo are 11--16 px
-        # from transparency, while the light tea logo's trapped glyph counters are 1--5 px
-        # away.  A component-relative radius grows too far for large letters
-        # and would incorrectly turn those real white shapes into holes.
+        # Opaque white letter shapes can be farther from transparency than
+        # enclosed glyph counters. A component-relative radius grows too far
+        # for large letters and can turn real white shapes into holes.
         search = max(3, int(np.ceil(0.004 * min(h, w))))
         pad = search + 1
         xa, xb = max(0, x0 - pad), min(w, x1 + pad + 1)
@@ -581,38 +580,44 @@ def _mask_to_smooth_loops(mask, simplify, min_area, smooth):
         14: [(3, 0)],
     }
 
-    fh, fw = field.shape
-    for y in range(fh - 1):
-        for x in range(fw - 1):
-            v0 = field[y, x]
-            v1 = field[y, x + 1]
-            v2 = field[y + 1, x + 1]
-            v3 = field[y + 1, x]
-            case = (
-                (1 if v0 >= level else 0)
-                | (2 if v1 >= level else 0)
-                | (4 if v2 >= level else 0)
-                | (8 if v3 >= level else 0)
-            )
-            if case == 0 or case == 15:
-                continue
-            p0 = (x - 1.0, y - 1.0)
-            p1 = (x, y - 1.0)
-            p2 = (x, y)
-            p3 = (x - 1.0, y)
-            edge_points = {
-                0: _interp(level, p0, p1, v0, v1),
-                1: _interp(level, p1, p2, v1, v2),
-                2: _interp(level, p3, p2, v3, v2),
-                3: _interp(level, p0, p3, v0, v3),
-            }
-            for ea, eb in edge_pairs.get(case, []):
-                a = edge_points[ea]
-                b = edge_points[eb]
-                a = (min(max(a[0], 0.0), float(w)), min(max(a[1], 0.0), float(h)))
-                b = (min(max(b[0], 0.0), float(w)), min(max(b[1], 0.0), float(h)))
-                if _segment_key(a) != _segment_key(b):
-                    segments.append((a, b))
+    # Determine all marching-squares cases in NumPy, then retain the original
+    # scalar interpolation only for boundary cells.  ``np.nonzero`` traverses
+    # this C-contiguous matrix in row-major order, exactly matching the former
+    # nested ``for y`` / ``for x`` loops; segment order and ambiguous-case
+    # decisions therefore remain byte-for-byte deterministic.
+    cases = (
+        (field[:-1, :-1] >= level).astype(np.uint8)
+        | ((field[:-1, 1:] >= level).astype(np.uint8) << 1)
+        | ((field[1:, 1:] >= level).astype(np.uint8) << 2)
+        | ((field[1:, :-1] >= level).astype(np.uint8) << 3)
+    )
+    boundary_y, boundary_x = np.nonzero((cases != 0) & (cases != 15))
+    for raw_y, raw_x in zip(boundary_y, boundary_x):
+        # Convert NumPy indices back to Python ints so point arithmetic has the
+        # same scalar types and rounding behaviour as the previous loops.
+        y, x = int(raw_y), int(raw_x)
+        v0 = field[y, x]
+        v1 = field[y, x + 1]
+        v2 = field[y + 1, x + 1]
+        v3 = field[y + 1, x]
+        case = int(cases[y, x])
+        p0 = (x - 1.0, y - 1.0)
+        p1 = (x, y - 1.0)
+        p2 = (x, y)
+        p3 = (x - 1.0, y)
+        edge_points = {
+            0: _interp(level, p0, p1, v0, v1),
+            1: _interp(level, p1, p2, v1, v2),
+            2: _interp(level, p3, p2, v3, v2),
+            3: _interp(level, p0, p3, v0, v3),
+        }
+        for ea, eb in edge_pairs.get(case, []):
+            a = edge_points[ea]
+            b = edge_points[eb]
+            a = (min(max(a[0], 0.0), float(w)), min(max(a[1], 0.0), float(h)))
+            b = (min(max(b[0], 0.0), float(w)), min(max(b[1], 0.0), float(h)))
+            if _segment_key(a) != _segment_key(b):
+                segments.append((a, b))
 
     return _segments_to_loops(segments, simplify, min_area)
 

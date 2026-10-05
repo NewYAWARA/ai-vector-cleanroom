@@ -5,7 +5,7 @@ Monoline stroke reconstruction engine.
 Detects near-uniform-width line work (heartbeat lines, field lines, frame
 outlines, simple line art) in a color-labeled image and rebuilds each as a
 real SVG stroke: a fitted center-line path with `fill="none"`,
-`stroke-width`, and round caps/joins — instead of a high-node filled
+`stroke-width`, source-validated straight caps and round curve joins — instead of a high-node filled
 outline pair.
 
 Conservative by design: a component is converted only when it passes strict
@@ -16,11 +16,14 @@ fill tracer. Pure numpy, no OpenCV dependency.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import io
+import re
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-MAX_HALF_WIDTH = 13          # px at trace scale; wider shapes are not strokes
+MAX_HALF_WIDTH = 13          # baseline for small images
+MAX_SCALED_HALF_WIDTH = 32   # bounded high-resolution stroke search
 MIN_STROKE_LEN = 10.0        # px; shorter skeletons are blobs, not strokes
 JUNCTION_ARM_STRAIGHTNESS_MIN = 0.90
 MULTICOLOR_CURVE_STRAIGHTNESS_MIN = 0.95
@@ -49,6 +52,8 @@ class Stroke:
     shape_width: float = 0.0
     height: float = 0.0
     sample_points: list = field(default_factory=list, repr=False)
+    source_fit: dict = field(default_factory=dict, repr=False)
+    linecap: str = "round"       # straight paths require native-source cap proof
 
 
 # ---------- connected components (run-based union-find, 4-connectivity) ----
@@ -617,8 +622,907 @@ def _group_eligible_component_pixels(labels, n, min_area, max_area):
     return areas, eligible, grouped_flat, starts, ends
 
 
+def _render_native_strokes(strokes, native_roi, working_shape, native_shape):
+    """Render exact four-decimal emitted stroke parameters into a native ROI."""
+    import resvg_py
+    from PIL import Image
+    height,width=working_shape
+    nh,nw=native_shape
+    scale=min(nw/float(width),nh/float(height))
+    ox,oy=(nw-width*scale)/2,(nh-height*scale)/2
+    x0,y0,x1,y1=map(int,native_roi)
+    w,h=x1-x0,y1-y0
+    if w*h>262144 or min(w,h)<1:
+        raise ValueError('native_stroke_group_render_budget_exceeded')
+    paths=[]
+    for stroke in strokes:
+        if stroke.primitive:
+            raise ValueError('native_stroke_group_requires_paths')
+        color='#{:02x}{:02x}{:02x}'.format(*stroke.color)
+        paths.append(f'<path d="{stroke.d}" fill="none" stroke="{color}" '
+                     f'stroke-width="{stroke.width:.4f}" stroke-opacity="{stroke.opacity:.4f}" '
+                     f'stroke-linecap="{stroke.linecap}" stroke-linejoin="round"/>')
+    svg=(f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+         f'viewBox="{(x0-ox)/scale:.9f} {(y0-oy)/scale:.9f} {w/scale:.9f} {h/scale:.9f}">'
+         +''.join(paths)+'</svg>')
+    data=resvg_py.svg_to_bytes(svg_string=svg,width=w,height=h,skip_system_fonts=True,
+        log_information=False,shape_rendering='geometric_precision')
+    with Image.open(io.BytesIO(data)) as image:
+        return np.asarray(image.convert('RGBA'))
+
+
+def _refine_transparent_straight(stroke, den, palette, bg, component, labels,
+                                 component_id, alpha, source_rgba):
+    """Use alpha coverage for a single-colour line on transparent surroundings.
+
+    RGB hidden in transparent pixels is not paper and cannot determine line
+    geometry. Normalised alpha supplies that geometry, then the original RGBA
+    and exact emitted opacity are checked independently.
+    """
+    if source_rgba is None or stroke.n_nodes!=2 or stroke.primitive or stroke.closed:
+        return None
+    original=np.asarray(source_rgba)
+    nh,nw=original.shape[:2];h,w=den.shape[:2]
+    scale=min(nw/float(w),nh/float(h));offset=np.array([(nw-w*scale)/2,(nh-h*scale)/2])
+    yy,xx=component[:,0],component[:,1]
+    x0=max(0,int(math.floor(xx.min()*scale+offset[0]))-4)
+    y0=max(0,int(math.floor(yy.min()*scale+offset[1]))-4)
+    x1=min(nw,int(math.ceil((xx.max()+1)*scale+offset[0]))+4)
+    y1=min(nh,int(math.ceil((yy.max()+1)*scale+offset[1]))+4)
+    if (x1-x0)*(y1-y0)>32768:
+        return None
+    source=original[y0:y1,x0:x1]
+    a=source[:,:,3]
+    border=np.r_[a[0],a[-1],a[:,0],a[:,-1]]
+    if np.any(border>0) or not np.any(a>=16):
+        return None
+    peak=int(a.max())
+    core=source[:,:,:3][a>=max(16,peak*.95)].astype(float)
+    pigment=tuple(map(int,np.rint(np.median(core,axis=0))))
+    if np.max(np.abs(core-pigment))>3:
+        return None
+    # No RGB or alpha mutation of the user's source. This is only a synthetic
+    # coverage measurement plane, never exported as the source reference.
+    fake=np.empty_like(original)
+    coverage=np.clip(original[:,:,3].astype(float)/peak,0,1)
+    fake[:,:,:3]=np.rint(255*(1-coverage))[:,:,None]
+    fake[:,:,3]=255
+    proposal=replace(stroke,color=(0,0,0),opacity=1.,source_fit={})
+    fitted=_refine_straight_aa_stroke(proposal,den,np.array([[0,0,0]],dtype=np.uint8),
+        np.array([255,255,255]),component,labels,component_id,None,source_rgba=fake)
+    if fitted is None:
+        return None
+    fitted.color=pigment
+    fitted.opacity=round(peak/255.,4)
+    preview=_render_native_strokes([fitted],[x0,y0,x1,y1],den.shape[:2],original.shape[:2])
+    aa=preview[:,:,3].astype(float)
+    union=(a>=max(4,peak*.05)) | (aa>=max(4,peak*.05))
+    if not union.any():
+        return None
+    alpha_error=float(np.abs(a.astype(float)-aa)[union].mean())
+    pm_source=source[:,:,:3].astype(float)*a[:,:,None]/255
+    pm_candidate=preview[:,:,:3].astype(float)*aa[:,:,None]/255
+    premult_error=float(np.abs(pm_source-pm_candidate).max(2)[union].mean())
+    sa=a>=peak*.5;ca=aa>=peak*.5
+    iou=float((sa&ca).sum()/max(1,(sa|ca).sum()))
+    if alpha_error>3 or premult_error>3 or iou<.97:
+        return None
+    fitted.source_fit.update(policy='straight_caps_native_alpha_and_premultiplied_rgb',
+        source_alpha_peak=peak,serialized_opacity=fitted.opacity,
+        native_alpha_mean_error=alpha_error,native_premultiplied_rgb_mean_error=premult_error,
+        native_alpha_iou=iou,original_alpha_jointly_validated=True)
+    return fitted
+
+
+def _refine_native_component_strokes(strokes, den, component, source_rgba):
+    """Validate a bounded complete straight graph against its native colour ink.
+
+    This is a separate component proof, not a relaxation of the thin capsule
+    error thresholds. Only the one-native-pixel AA boundary may differ;
+    original solid cores, paint seams and component/hole topology must survive.
+    """
+    if not 1<=len(strokes)<=8 or any(s.closed or s.primitive or s.n_nodes!=2 or s.opacity!=1 for s in strokes):
+        return None
+    if source_rgba is None:
+        source_rgba=np.dstack((np.asarray(den,dtype=np.uint8),np.full(den.shape[:2],255,np.uint8)))
+    original=np.asarray(source_rgba)
+    nh,nw=original.shape[:2];h,w=den.shape[:2]
+    scale=min(nw/float(w),nh/float(h));offset=np.array([(nw-w*scale)/2,(nh-h*scale)/2])
+    yy,xx=component[:,0],component[:,1]
+    x0=max(0,int(math.floor(xx.min()*scale+offset[0]))-4)
+    y0=max(0,int(math.floor(yy.min()*scale+offset[1]))-4)
+    x1=min(nw,int(math.ceil((xx.max()+1)*scale+offset[0]))+4)
+    y1=min(nh,int(math.ceil((yy.max()+1)*scale+offset[1]))+4)
+    if (x1-x0)*(y1-y0)>262144:
+        return None
+    source=original[y0:y1,x0:x1]
+    if np.any(source[:,:,3]!=255):
+        return None  # alpha has its own stricter coverage/PM-RGB route
+    raw=source[:,:,:3].astype(float)
+    border=np.concatenate((raw[0],raw[-1],raw[:,0],raw[:,-1]))
+    background=np.median(border,axis=0)
+    if np.max(np.abs(border-background))>3:
+        return None
+    colors=sorted({s.color for s in strokes})
+    delta=raw-background
+    residual=np.full(raw.shape[:2],np.inf)
+    source_coverage=np.zeros(raw.shape[:2],float)
+    for color in colors:
+        pigment=np.asarray(color,dtype=float)-background
+        magnitude=float(pigment@pigment)
+        if magnitude<24**2:
+            return None
+        coverage=np.sum(delta*pigment,axis=2)/magnitude
+        error=np.max(np.abs(delta-coverage[:,:,None]*pigment),axis=2)
+        best=error<residual
+        source_coverage[best]=coverage[best]
+        residual[best]=error[best]
+    signal=np.max(np.abs(delta),axis=2)>8
+    if (not signal.any() or np.percentile(residual[signal],95)>3
+            or np.max(source_coverage)>1.025):
+        return None
+    source_coverage=np.clip(source_coverage,0,1)
+    def near(mask):
+        pad=np.pad(mask,1);rh,rw=mask.shape
+        return np.logical_or.reduce([pad[dy:dy+rh,dx:dx+rw] for dy in range(3) for dx in range(3)])
+    def core(mask):
+        pad=np.pad(mask,1);rh,rw=mask.shape
+        return np.logical_and.reduce([pad[dy:dy+rh,dx:dx+rw] for dy in range(3) for dx in range(3)])
+    source_core=core(source_coverage>=.5)&(source_coverage>=.9)
+    if int(source_core.sum())<16:
+        return None  # a thin AA colour fringe is not an independent pigment
+    endpoints=[]
+    for stroke in strokes:
+        numbers=[float(v) for v in re.findall(r'[-+]?(?:\d*\.\d+|\d+)',stroke.d)]
+        if len(numbers)!=4 or re.sub(r'[-+]?(?:\d*\.\d+|\d+)','',stroke.d).strip().replace(' ','')!='ML':
+            return None
+        endpoints.append(np.array(numbers).reshape(2,2))
+    shared=[]
+    for index,points in enumerate(endpoints):
+        shared.append([any(np.linalg.norm(point-other)<2/scale for j,ends in enumerate(endpoints)
+                          if j!=index for other in ends) for point in points])
+    original_endpoints=[points.copy() for points in endpoints]
+    # Skeleton junction centroids can be 1--2 pixels off the straight arms.
+    # Estimate each arm from its interior, then intersect those observed axes.
+    # This fixes the geometry rather than declaring the old kink equivalent.
+    axes=[];centres=[]
+    for stroke,points in zip(strokes,endpoints):
+        samples=np.asarray(stroke.sample_points,dtype=float)
+        if len(samples)<8:
+            return None
+        distances=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(samples,axis=0),axis=1))]
+        inner=samples[(distances>stroke.width*2)&(distances<distances[-1]-stroke.width*2)]
+        if len(inner)<4:
+            inner=samples
+        centre=np.mean(inner,axis=0)
+        _,vectors=np.linalg.eigh((inner-centre).T@(inner-centre))
+        axis=vectors[:,-1]
+        if (points[1]-points[0])@axis<0:axis=-axis
+        # Recover the centre of the original ink cross-section. Skeleton
+        # pixels can be biased by half a pixel for even-width raster lines.
+        gy,gx=np.nonzero(source_coverage>=.5)
+        cloud=(np.column_stack((gx+.5+x0,gy+.5+y0))-offset)/scale
+        along=(cloud-centre)@axis
+        normal=np.array([-axis[1],axis[0]])
+        across=(cloud-centre)@normal
+        span=(inner-centre)@axis
+        selected=cloud[(along>=span.min())&(along<=span.max())&(np.abs(across)<stroke.width)]
+        if len(selected)>=16:
+            centre=np.mean(selected,axis=0)
+            _,vectors=np.linalg.eigh((selected-centre).T@(selected-centre))
+            observed=vectors[:,-1]
+            if observed@axis<0:observed=-observed
+            if abs(float(observed@axis))>.995:axis=observed
+        axes.append(axis);centres.append(centre)
+    normals=np.array([[-axis[1],axis[0]] for axis in axes])
+    constants=np.array([normal@centre for normal,centre in zip(normals,centres)])
+    junction=None
+    if np.linalg.matrix_rank(normals)==2 and all(any(flags) for flags in shared):
+        junction=np.linalg.lstsq(normals,constants,rcond=None)[0]
+        if any(np.linalg.norm(junction-point)>3/scale for points,flags in zip(endpoints,shared)
+               for point,is_shared in zip(points,flags) if is_shared):
+            return None
+    for index,(points,axis,centre) in enumerate(zip(endpoints,axes,centres)):
+        for endpoint in range(2):
+            endpoints[index][endpoint]=(junction if shared[index][endpoint] and junction is not None
+                else centre+axis*((points[endpoint]-centre)@axis))
+    native_endpoints=[points.copy() for points in endpoints]
+    gy,gx=np.nonzero(source_coverage>=.5)
+    cloud=(np.column_stack((gx+.5+x0,gy+.5+y0))-offset)/scale
+    for index,(points,axis,centre) in enumerate(zip(native_endpoints,axes,centres)):
+        normal=np.array([-axis[1],axis[0]])
+        selected=cloud[np.abs((cloud-centre)@normal)<strokes[index].width*.65]
+        projections=(selected-centre)@axis
+        edge=.5*(abs(axis[0])+abs(axis[1]))/scale
+        for endpoint in range(2):
+            if not shared[index][endpoint]:
+                value=(projections.min()-edge if endpoint==0 else projections.max()+edge)
+                points[endpoint]=centre+axis*value
+    median_width=float(np.median([s.width for s in strokes]))*scale
+    widths=sorted({round(median_width*f,4) for f in (.90,.95,1.,1.05,1.10)}
+                  | {float(round(median_width)),float(math.floor(median_width)),float(math.ceil(median_width))})
+    best=None;evaluations=0
+    # Keep the old axes in the candidate set: fitting a new centre must not
+    # silently remove a better original proposal. Square caps cover the
+    # shared junction; their outer endpoints are inset by half their width.
+    families=[(original_endpoints,False),(endpoints,False),(native_endpoints,True)]
+    for family,measured_tips in families:
+      for cap in ('butt','round','square'):
+        for extension in ((0.,) if measured_tips else (0.,.5)):
+            for native_width in widths:
+                if native_width<=0:
+                    continue
+                trial=[]
+                for index,(stroke,points) in enumerate(zip(strokes,family)):
+                    axis=(points[1]-points[0]);length=float(np.linalg.norm(axis))
+                    if length<=0:
+                        return None
+                    axis/=length
+                    first,last=points.copy()
+                    if not shared[index][0]:first-=axis*native_width*extension/scale
+                    if not shared[index][1]:last+=axis*native_width*extension/scale
+                    if measured_tips and cap in ('round','square'):
+                        if not shared[index][0]:first+=axis*native_width*.5/scale
+                        if not shared[index][1]:last-=axis*native_width*.5/scale
+                    proposal=replace(stroke,width=round(native_width/scale,4),linecap=cap,
+                        d=f'M{first[0]:.4f} {first[1]:.4f} L{last[0]:.4f} {last[1]:.4f}',source_fit={})
+                    trial.append(proposal)
+                preview=_render_native_strokes(trial,[x0,y0,x1,y1],den.shape[:2],original.shape[:2])
+                evaluations+=1
+                coverage=preview[:,:,3].astype(float)/255
+                predicted=preview[:,:,:3]*coverage[:,:,None]+background*(1-coverage[:,:,None])
+                if (np.any((coverage>=.125)&~near(source_coverage>=.125))
+                        or np.any((source_coverage>=.125)&~near(coverage>=.125))
+                        or np.any(source_core&(coverage<.5))):
+                    continue
+                protected=source_core | core(coverage>=.5)
+                protected_error=float(np.abs(predicted-raw).max(2)[protected].max())
+                if protected_error>6:
+                    continue
+                union=(source_coverage>.05)|(coverage>.05)
+                score=float(np.abs(predicted-raw).max(2)[union].mean())
+                if best is None or score<best[0]:
+                    best=(score,trial,preview,protected_error)
+    if best is None:
+        return None
+    score,trial,preview,protected_error=best
+    if score>12:
+        return None
+    from source_scene_guard import _components, _holes
+    source_alpha=np.rint(source_coverage*255).astype(np.uint8)
+    topology=[]
+    for threshold in (32,128,224):
+        _,a=_components(source_alpha>=threshold);_,b=_components(preview[:,:,3]>=threshold)
+        _,ha=_holes(source_alpha,threshold);_,hb=_holes(preview[:,:,3],threshold)
+        if a!=b or int(ha.sum())!=int(hb.sum()):
+            return None
+        topology.append({'alpha_threshold':threshold,'components':a,'holes':int(ha.sum())})
+    proof={'policy':'native_whole_straight_component_core_and_aa_boundary',
+        'serialized_geometry_validated':True,'source_color_jointly_validated':True,
+        'native_roi':[x0,y0,x1,y1],'source_dimensions':[nw,nh],
+        'maximum_boundary_tolerance_native_pixels':1,'boundary_neighbourhood':'Chebyshev',
+        'original_solid_core_max_rgb_error':protected_error,'ink_mean_max_channel_error':score,
+        'topology':topology,'component_strokes':len(trial),'render_evaluations':evaluations,
+        'scope':'native_raster_equivalence_with_one_pixel_AA_boundary_not_original_authoring_intent'}
+    for stroke in trial:
+        stroke.source_fit={**proof,'linecap':stroke.linecap}
+    return trial
+
+
+def _refine_opaque_palette_straight(stroke, den, component, source_rgba):
+    """Prove a solid line on varying flat fills without claiming their paint.
+
+    This narrow branch requires native opaque, discrete paint pixels and a
+    substantial solid pigment core. A palette fringe around a large fill has
+    no such core and cannot use this exception to the whole-ink ownership rule.
+    Only the stroke's observed colour occupancy is reconstructed; the ordinary
+    composed scene validation still checks the underlying fill representation.
+    """
+    if source_rgba is None or stroke.n_nodes!=2 or stroke.closed or stroke.primitive:
+        return None
+    source=np.asarray(source_rgba)
+    nh,nw=source.shape[:2];h,w=den.shape[:2]
+    scale=min(nw/float(w),nh/float(h));offset=np.array([(nw-w*scale)/2,(nh-h*scale)/2])
+    yy,xx=component[:,0],component[:,1]
+    x0=max(0,int(math.floor(xx.min()*scale+offset[0]))-4)
+    y0=max(0,int(math.floor(yy.min()*scale+offset[1]))-4)
+    x1=min(nw,int(math.ceil((xx.max()+1)*scale+offset[0]))+4)
+    y1=min(nh,int(math.ceil((yy.max()+1)*scale+offset[1]))+4)
+    patch=source[y0:y1,x0:x1]
+    if patch.shape[0]*patch.shape[1]>262144 or np.any(patch[:,:,3]!=255):
+        return None
+    colors=np.unique(patch[:,:,:3].reshape(-1,3),axis=0)
+    if len(colors)>8:
+        return None  # no unsupported alpha/paint unmixing on continuous tones
+    distance=np.max(np.abs(colors.astype(float)-stroke.color),axis=1)
+    if not np.any(distance<=3) or np.any((distance>3)&(distance<24)):
+        return None
+    pigment=colors[int(distance.argmin())]
+    owned=np.max(np.abs(patch[:,:,:3].astype(float)-pigment),axis=2)<=3
+    from source_scene_guard import _components
+    _,count=_components(owned)
+    if count!=1:
+        return None
+    solid=owned.copy()
+    for _ in range(2):
+        p=np.pad(solid,1);hh,ww=solid.shape
+        solid=np.logical_and.reduce([p[dy:dy+hh,dx:dx+ww] for dy in range(3) for dx in range(3)])
+    if int(solid.sum())<16:
+        return None
+    measurement=np.full_like(source,255)
+    measurement[y0:y1,x0:x1,:3][owned]=pigment
+    model=replace(stroke,color=tuple(map(int,pigment)),source_fit={})
+    fitted=_refine_native_component_strokes([model],den,component,measurement)
+    if fitted is None:
+        return None
+    result=fitted[0]
+    result.color=tuple(map(int,pigment))
+    result.source_fit.update(policy='native_discrete_palette_line_occupancy',
+        source_paint_core_pixels=int(solid.sum()),native_paint_colors=len(colors),
+        underlying_fill_requires_composed_scene_validation=True)
+    return result
+
+
+def infer_occluded_flat_paint(strokes, source_rgba, den, visible, vis_fill, palette):
+    """Infer flat support beneath proven opaque strokes, never source pixels.
+
+    Equal native opaque paint on both normal rays is required for every added
+    working pixel. The caller uses this only in its tracing surrogate; original
+    references and visibility/alpha evidence remain untouched.
+    """
+    h,w=den.shape[:2];nh,nw=source_rgba.shape[:2]
+    scale=min(nw/float(w),nh/float(h));offset=np.array([(nw-w*scale)/2,(nh-h*scale)/2])
+    restored=np.zeros((h,w),bool);paint=np.zeros((h,w,3),np.uint8)
+    yy,xx=np.nonzero(visible & ~vis_fill)
+    if not len(xx):return restored,paint
+    coords=np.column_stack((xx+.5,yy+.5))
+    for stroke in strokes[:24]:
+        if (stroke.opacity!=1 or stroke.source_fit.get('policy')!='native_discrete_palette_line_occupancy'):
+            continue
+        values=[float(v) for v in re.findall(r'[-+]?(?:\d*\.\d+|\d+)',stroke.d)]
+        if len(values)!=4:continue
+        first,last=np.array(values).reshape(2,2)
+        direction=last-first;length=float(np.linalg.norm(direction));direction/=length
+        normal=np.array([-direction[1],direction[0]])
+        along=(coords-first)@direction;across=np.abs((coords-first)@normal)
+        candidates=(across<=stroke.width*.5+1)&(along>=-stroke.width)&(along<=length+stroke.width)
+        indices=np.flatnonzero(candidates)
+        if len(indices)>65536:continue
+        points=coords[indices]*scale+offset
+        xi=np.clip(points[:,0].astype(int),0,nw-1);yi=np.clip(points[:,1].astype(int),0,nh-1)
+        core=source_rgba[yi,xi]
+        legitimate=(core[:,3]==255)&(np.max(np.abs(core[:,:3].astype(float)-stroke.color),axis=1)<=3)
+        side_colors=[];side_valid=[]
+        for sign in (-1,1):
+            found=np.zeros(len(indices),bool);colors=np.zeros((len(indices),3),np.uint8)
+            for distance in np.arange(1.,min(68.,stroke.width*scale*2+4),1.):
+                sample=points+normal*distance*sign
+                sx=sample[:,0].astype(int);sy=sample[:,1].astype(int)
+                inside=(sx>=0)&(sx<nw)&(sy>=0)&(sy<nh)
+                rgba=source_rgba[np.clip(sy,0,nh-1),np.clip(sx,0,nw-1)]
+                hit=inside&~found&(rgba[:,3]==255)&(np.max(np.abs(rgba[:,:3].astype(float)-stroke.color),axis=1)>24)
+                colors[hit]=rgba[hit,:3];found|=hit
+            side_colors.append(colors);side_valid.append(found)
+        good=legitimate&side_valid[0]&side_valid[1]
+        good&=np.max(np.abs(side_colors[0].astype(float)-side_colors[1]),axis=1)<=3
+        # Only a surviving fill paint can be bridged, never inferred paper.
+        distances=np.max(np.abs(side_colors[0][:,None,:].astype(float)-palette[None,:,:]),axis=2)
+        good&=distances.min(axis=1)<=3
+        target=indices[good]
+        restored[yy[target],xx[target]]=True
+        paint[yy[target],xx[target]]=palette[distances.argmin(axis=1)[good]]
+    return restored,paint
+
+
+def _validate_native_open_curve(stroke, den, component, source_rgba):
+    """Prove an isolated uniformly painted curve before consuming its fill."""
+    if stroke.closed or stroke.primitive or stroke.opacity!=1 or stroke.n_nodes>20 or len(stroke.sample_points)>4096:
+        return None
+    if source_rgba is None:
+        source_rgba=np.dstack((np.asarray(den,dtype=np.uint8),np.full(den.shape[:2],255,np.uint8)))
+    source=np.asarray(source_rgba);nh,nw=source.shape[:2];h,w=den.shape[:2]
+    scale=min(nw/float(w),nh/float(h));offset=np.array([(nw-w*scale)/2,(nh-h*scale)/2])
+    yy,xx=component[:,0],component[:,1]
+    x0=max(0,int(math.floor(xx.min()*scale+offset[0]))-4)
+    y0=max(0,int(math.floor(yy.min()*scale+offset[1]))-4)
+    x1=min(nw,int(math.ceil((xx.max()+1)*scale+offset[0]))+4)
+    y1=min(nh,int(math.ceil((yy.max()+1)*scale+offset[1]))+4)
+    patch=source[y0:y1,x0:x1]
+    if patch.shape[0]*patch.shape[1]>262144 or np.any(patch[:,:,3]!=255):return None
+    rgb=patch[:,:,:3].astype(float)
+    border=np.concatenate((rgb[0],rgb[-1],rgb[:,0],rgb[:,-1]))
+    bg=np.median(border,axis=0)
+    if np.max(np.abs(border-bg))>3:return None
+    pigment=np.asarray(stroke.color,dtype=float)-bg
+    magnitude=float(pigment@pigment)
+    if magnitude<24**2:return None
+    coverage=np.sum((rgb-bg)*pigment,axis=2)/magnitude
+    residual=np.max(np.abs(rgb-bg-coverage[:,:,None]*pigment),axis=2)
+    ink=coverage>.05
+    if not ink.any() or residual[ink].max()>6 or coverage.max()>1.025:return None
+    coverage=np.clip(coverage,0,1)
+    def morph(mask,erode=False):
+        p=np.pad(mask,1);hh,ww=mask.shape
+        parts=[p[dy:dy+hh,dx:dx+ww] for dy in range(3) for dx in range(3)]
+        return np.logical_and.reduce(parts) if erode else np.logical_or.reduce(parts)
+    core=morph(coverage>=.5,True)&(coverage>=.9)
+    if not core.any():return None
+    hard_binary=(len(np.unique(patch[:,:,:3].reshape(-1,3),axis=0))==2
+                 and np.all((coverage<1e-9)|(coverage>1-1e-9)))
+    contrast=float(np.max(np.abs(pigment)))
+    source_occupancy=coverage>=.5
+    source_boundary=morph(source_occupancy)&~morph(source_occupancy,True)
+    pixel_y,pixel_x=np.indices(coverage.shape)
+    endpoint_regions=[]
+    for point in (stroke.sample_points[0],stroke.sample_points[-1]):
+        native=np.asarray(point)*scale+offset-[x0,y0]
+        endpoint_regions.append((pixel_x+.5-native[0])**2+(pixel_y+.5-native[1])**2
+                                <=(stroke.width*scale*1.5)**2)
+    if set(re.findall('[A-Za-z]',stroke.d))-set('MLC'):return None
+    best=None;evaluations=0
+    from curve_refit import fit_curve
+    proposals=[(stroke.d,stroke.n_nodes)]
+    proposal_widths={}
+    # A thinned L can end half a width before each native tip and move its
+    # corner into the turn. Whole-path shifts cannot fix those three points.
+    # Recover a single axis-aligned elbow from the observed two straight ink
+    # bands; this remains a proposal, subject to every native render guard.
+    # No corner is rounded into a cubic and no source pixels are consumed yet.
+    if re.findall('[A-Za-z]',stroke.d)==['M','L','L']:
+        values=re.findall(r'[-+]?(?:\d*\.\d+|\d+)',stroke.d)
+        if len(values)==6:
+            p=np.asarray([float(v) for v in values]).reshape(3,2)*scale+offset-[x0,y0]
+            directions=np.diff(p,axis=0)
+            axes=np.argmax(np.abs(directions),axis=1)
+            lengths=np.linalg.norm(directions,axis=1)
+            native_width=stroke.width*scale
+            axis_supported=(axes[0]!=axes[1] and np.all(lengths>native_width*4)
+                and all(abs(directions[k,1-axes[k]])<=lengths[k]*.05 for k in range(2)))
+            if axis_supported:
+                grid=np.stack([pixel_x+.5,pixel_y+.5],axis=2)
+                centres=[];widths=[];tips=[]
+                for k in range(2):
+                    major=int(axes[k]);minor=1-major
+                    low,high=sorted((p[k,major],p[k+1,major]))
+                    middle=(grid[:,:,major]>=low+native_width*1.5)&(grid[:,:,major]<=high-native_width*1.5)
+                    middle&=np.abs(grid[:,:,minor]-(p[k,minor]+p[k+1,minor])/2)<=native_width
+                    weights=coverage*middle
+                    mass=float(weights.sum())
+                    slices=int(np.count_nonzero(np.any(middle,axis=0 if major==0 else 1)))
+                    if mass<=0 or slices<4:break
+                    centre=float((weights*grid[:,:,minor]).sum()/mass)
+                    band_width=mass/slices
+                    # Endpoint is measured on its own straight arm, away from
+                    # the other arm. Pixel boundary proposals suit binary
+                    # sources; AA sources must still pass their stricter RGB.
+                    end=p[0 if k==0 else 2,major]
+                    joint=p[1,major]
+                    arm=(np.abs(grid[:,:,minor]-centre)<band_width*.6)&(coverage>=.5)
+                    arm&=(grid[:,:,major]<(joint-native_width) if end<joint else grid[:,:,major]>(joint+native_width))
+                    positions=grid[:,:,major][arm]
+                    if not len(positions):break
+                    tip=float(positions.min()-.5 if end<joint else positions.max()+.5)
+                    centres.append(centre);widths.append(band_width);tips.append(tip)
+                if len(centres)==2 and abs(widths[0]-widths[1])<=max(.25,native_width*.03):
+                    joint=np.zeros(2)
+                    for k in range(2):joint[1-axes[k]]=centres[k]
+                    ends=[joint.copy(),joint.copy()]
+                    for k in range(2):ends[k][axes[k]]=tips[k]
+                    points=(np.vstack((ends[0],joint,ends[1]))+[x0,y0]-offset)/scale
+                    path='M'+' L'.join(' '.join(f'{v:.4f}' for v in point) for point in points)
+                    proposals.append((path,3))
+                    proposal_widths[path]=float(np.mean(widths))/scale
+    try:
+        points=np.asarray(stroke.sample_points,dtype=float)
+        if len(points)>8:
+            padded=np.pad(points,((2,2),(0,0)),mode='edge')
+            smoothed=sum(padded[k:k+len(points)]*weight for k,weight in enumerate((1,2,3,2,1)))/9
+            smoothed[:2]=points[:2];smoothed[-2:]=points[-2:]
+        else:smoothed=points
+        gy,gx=np.nonzero(coverage>=.5)
+        cloud=(np.column_stack((gx+.5+x0,gy+.5+y0))-offset)/scale
+        # Thinning stops inside a rounded endpoint. Recover the cap centre
+        # from its observed native tip rather than shortening the true line.
+        for end in (0,-1):
+            inner=smoothed[min(len(smoothed)-1,8) if end==0 else max(0,len(smoothed)-9)]
+            axis=smoothed[end]-inner;axis/=np.linalg.norm(axis)
+            normal=np.array([-axis[1],axis[0]])
+            cloud_along=(cloud-smoothed[end])@axis
+            nearby=(cloud_along>-stroke.width)&(np.abs((cloud-smoothed[end])@normal)<stroke.width)
+            if nearby.any():
+                extension=float(cloud_along[nearby].max())+.5*(abs(axis[0])+abs(axis[1]))/scale-stroke.width*.475
+                if abs(extension)<stroke.width*.3:smoothed[end]+=axis*extension
+        fit=fit_curve(smoothed,closed=False,tolerance=.4*max(1,min(nw,nh)/128)/scale,line_tolerance=.15/scale,
+            corner_angle=80,corner_window=3/scale,allow_primitives=False,max_segments=8)
+        if fit['anchor_count']<=10:proposals.append((fit['path'],fit['anchor_count']))
+    except (ValueError,RuntimeError,ArithmeticError):pass
+    # Circular monoline arcs have a stronger low-anchor proposal than a
+    # staircase-derived Catmull path. Native angular support supplies butt
+    # endpoints; both cap models still face the same pixel/core/topology gates.
+    try:
+        points=np.asarray(stroke.sample_points,dtype=float)
+        system=np.column_stack((2*points[:,0],2*points[:,1],np.ones(len(points))))
+        solved=np.linalg.lstsq(system,np.sum(points*points,axis=1),rcond=None)[0]
+        centre=solved[:2];radial=np.linalg.norm(points-centre,axis=1)
+        if np.quantile(np.abs(radial-np.median(radial)),.95)<.75/scale:
+            gy,gx=np.nonzero(coverage>=.5)
+            cloud=(np.column_stack((gx+.5+x0,gy+.5+y0))-offset)/scale
+            radius=float(np.median(np.linalg.norm(cloud-centre,axis=1)))
+            angles=np.unwrap(np.arctan2(points[:,1]-centre[1],points[:,0]-centre[0]))
+            middle=float((angles[0]+angles[-1])/2)
+            ca=np.arctan2(cloud[:,1]-centre[1],cloud[:,0]-centre[0])
+            ca+=2*math.pi*np.round((middle-ca)/(2*math.pi))
+            low,high=float(ca.min()),float(ca.max())
+            start,end=(low,high) if angles[-1]>angles[0] else (high,low)
+            count=int(math.ceil(abs(end-start)/(math.pi/2)))
+            if 1<=count<=4:
+              for candidate_radius in sorted({radius,round(radius*scale*2)/(scale*2)}):
+                parts=[]
+                for a,b in zip(np.linspace(start,end,count+1)[:-1],np.linspace(start,end,count+1)[1:]):
+                    p0=centre+candidate_radius*np.array([math.cos(a),math.sin(a)])
+                    p3=centre+candidate_radius*np.array([math.cos(b),math.sin(b)])
+                    k=4/3*math.tan((b-a)/4)
+                    p1=p0+candidate_radius*k*np.array([-math.sin(a),math.cos(a)])
+                    p2=p3-candidate_radius*k*np.array([-math.sin(b),math.cos(b)])
+                    if not parts:parts.append(f'M{p0[0]:.4f} {p0[1]:.4f}')
+                    parts.append('C'+' '.join(f'{v:.4f}' for v in (*p1,*p2,*p3)))
+                proposals.append((' '.join(parts),count+1))
+    except (ValueError,ArithmeticError,np.linalg.LinAlgError):pass
+    shifts=((0,0),(-.25,0),(.25,0),(0,-.25),(0,.25),(-.25,-.25),(.25,.25),
+            (-.25,.25),(.25,-.25),(-.5,0),(.5,0),(0,-.5),(0,.5))
+    factors=sorted({.90,.925,.95,.975,1.,1.025,round(stroke.width*scale)/(stroke.width*scale)})
+    for path,nodes in proposals:
+        path_factors=factors
+        if path in proposal_widths:
+            # The long straight bands directly measure their common width.
+            # Do not shrink the whole line merely to fit a few quantized
+            # corner pixels when the native band width already passes.
+            path_factors=[proposal_widths[path]/stroke.width]
+        for shift_x,shift_y in shifts:
+            coordinates=iter([shift_x/scale,shift_y/scale]*64)
+            shifted=re.sub(r'[-+]?(?:\d*\.\d+|\d+)',
+                lambda m:f'{float(m.group())+next(coordinates):.4f}',path)
+            for cap in ('round','butt'):
+                for factor in path_factors:
+                    trial=replace(stroke,d=shifted,n_nodes=nodes,linecap=cap,
+                                  width=round(stroke.width*factor,4),source_fit={})
+                    rendered=_render_native_strokes([trial],[x0,y0,x1,y1],den.shape[:2],source.shape[:2])
+                    evaluations+=1
+                    a=rendered[:,:,3].astype(float)/255
+                    predicted=rendered[:,:,:3]*a[:,:,None]+bg*(1-a[:,:,None])
+                    if (np.any((a>=.125)&~morph(coverage>=.125))
+                            or np.any((coverage>=.125)&~morph(a>=.125))):
+                        continue
+                    protected=core|morph(a>=.5,True)
+                    error=np.abs(predicted-rgb).max(2)
+                    if error[protected].max()>6:
+                        continue
+                    union=ink|(a>.05)
+                    score=float(error[union].mean())
+                    endpoint_checks=[]
+                    if hard_binary:
+                        occupied=a>=.5
+                        iou=float((source_occupancy&occupied).sum()/max(1,(source_occupancy|occupied).sum()))
+                        if iou<.97 or np.any((error>1)&~source_boundary) or score>contrast*.06:
+                            continue
+                        for region in endpoint_regions:
+                            local=region&union
+                            endpoint_error=float(error[local].mean()) if local.any() else math.inf
+                            endpoint_iou=float((region&source_occupancy&occupied).sum()/max(1,(region&(source_occupancy|occupied)).sum()))
+                            endpoint_checks.append({'mean_max_rgb_error':endpoint_error,'occupancy_iou':endpoint_iou})
+                        # Caps have a local occupancy proof; a whole-arc score
+                        # cannot hide a shortened or rounded endpoint. The
+                        # one-pixel boundary and solid-core gates also apply.
+                        if any(v['occupancy_iou']<.95 for v in endpoint_checks):
+                            continue
+                    elif score>12:
+                        continue
+                    if best is None or score<best[0]:
+                        best=(score,trial,rendered,float(error[protected].max()),endpoint_checks,
+                              path in proposal_widths)
+    if best is None:return None
+    score,result,rendered,core_error,endpoint_checks,native_elbow=best
+    from source_scene_guard import _components,_holes
+    original_alpha=np.rint(coverage*255).astype(np.uint8)
+    for threshold in (32,128,224):
+        _,a=_components(original_alpha>=threshold);_,b=_components(rendered[:,:,3]>=threshold)
+        _,ha=_holes(original_alpha,threshold);_,hb=_holes(rendered[:,:,3],threshold)
+        if a!=b or int(ha.sum())!=int(hb.sum()):return None
+    result.source_fit={'policy':'native_uniform_curve_core_boundary_and_topology',
+        'serialized_geometry_validated':True,'source_color_jointly_validated':True,
+        'native_roi':[x0,y0,x1,y1],'source_dimensions':[nw,nh],
+        'original_solid_core_max_rgb_error':core_error,'ink_mean_max_channel_error':score,
+        'maximum_boundary_tolerance_native_pixels':1,'render_evaluations':evaluations,
+        'observation_model':'two_opaque_paints_pixel_occupancy' if hard_binary else 'antialiased_native_rgb',
+        'hard_binary_endpoint_checks':endpoint_checks,
+        'hard_binary_max_normalized_rgb_error':.06 if hard_binary else None,
+        'hard_binary_minimum_global_occupancy_iou':.97 if hard_binary else None,
+        'hard_binary_minimum_endpoint_occupancy_iou':.95 if hard_binary else None,
+        'hard_binary_outside_boundary_quantization_allowance_rgb':1 if hard_binary else None,
+        'original_opaque_paint_count':2 if hard_binary else None,'linecap':result.linecap,
+        'native_axis_aligned_elbow_proposal_used':native_elbow,
+        'scope':'native_raster_equivalence_not_original_authoring_intent'}
+    return result
+
+
+def _refine_straight_aa_stroke(stroke, den, palette, bg, component, labels,
+                               component_id, alpha, source_rgba=None):
+    """Jointly fit straight-line colour, width and butt/round caps to source.
+
+    Return None when the bounded native-source comparison cannot validate
+    the representation. The caller must defer the *whole* component, including Tier B. The
+    old rounded fallback could consume rectangular bars and their gaps.
+    """
+    if (stroke.closed or stroke.primitive or stroke.opacity != 1.0
+            or stroke.n_nodes != 2 or len(stroke.sample_points) < 2):
+        return None
+    try:
+        import resvg_py
+        from PIL import Image
+    except ImportError:
+        return None
+    H, W = den.shape[:2]
+    if source_rgba is None:
+        native_rgb = den
+        native_alpha = alpha
+    else:
+        original = np.asarray(source_rgba)
+        if original.ndim != 3 or original.shape[2] != 4:
+            return None
+        native_rgb, native_alpha = original[:, :, :3], original[:, :, 3]
+    nh, nw = native_rgb.shape[:2]
+    # Serialized SVG uses the default xMidYMid meet viewBox mapping. Work in
+    # that exact native coordinate system; never validate a resized proxy.
+    scale = min(nw / float(W), nh / float(H))
+    offset = np.array([(nw - W * scale) / 2, (nh - H * scale) / 2])
+    if not .4 <= stroke.width * scale <= 16.1:
+        return None
+    yy, xx = component[:, 0], component[:, 1]
+    margin = max(1, int(math.ceil(4 / scale)))
+    ly0, ly1 = max(0, int(yy.min()) - margin), min(H, int(yy.max()) + margin + 1)
+    lx0, lx1 = max(0, int(xx.min()) - margin), min(W, int(xx.max()) + margin + 1)
+    nearby = labels[ly0:ly1, lx0:lx1]
+    if np.any((nearby != 0) & (nearby != component_id)):
+        return None
+    y0 = max(0, int(math.floor(yy.min() * scale + offset[1])) - 4)
+    y1 = min(nh, int(math.ceil((yy.max() + 1) * scale + offset[1])) + 4)
+    x0 = max(0, int(math.floor(xx.min() * scale + offset[0])) - 4)
+    x1 = min(nw, int(math.ceil((xx.max() + 1) * scale + offset[0])) + 4)
+    h, w = y1 - y0, x1 - x0
+    if 32768 < w*h <= 262144:
+        # A 3000px one-pixel rule may occupy two downsampled mask rows. Locate
+        # the native ink inside that bounded window before allocating renders;
+        # keep the original 32768-pixel render budget and all observed ink.
+        window=np.asarray(native_rgb[y0:y1,x0:x1],dtype=float)
+        border=np.concatenate((window[0],window[-1],window[:,0],window[:,-1]))
+        paper=np.median(border,axis=0)
+        if np.max(np.abs(border-paper))<=3:
+            iy,ix=np.nonzero(np.linalg.norm(window-paper,axis=2)>10)
+            if len(ix):
+                ax=max(0,int(ix.min())-4);ay=max(0,int(iy.min())-4)
+                bx=min(w,int(ix.max())+5);by=min(h,int(iy.max())+5)
+                x1=x0+bx;y1=y0+by;x0+=ax;y0+=ay
+                h,w=y1-y0,x1-x0
+    if w * h > 32768 or min(h, w) < 3:
+        return None
+    raw = np.asarray(native_rgb[y0:y1, x0:x1], dtype=np.float64)
+    border = np.concatenate((raw[0], raw[-1], raw[:, 0], raw[:, -1]))
+    if source_rgba is not None:
+        bg = np.median(border, axis=0)
+    bg = np.asarray(bg, dtype=np.float64)
+    if np.max(np.abs(border - bg)) > 3:
+        return None
+    delta = bg - raw
+    strength = np.linalg.norm(delta, axis=2)
+    signal = strength > 10
+    if not np.any(signal):
+        return None
+    # This model is opaque ink on uniform paper, not alpha-colour unmixing.
+    if native_alpha is not None and np.any(np.asarray(native_alpha)[y0:y1, x0:x1][signal] != 255):
+        return None
+    py, px = np.indices((h, w), dtype=np.float64)
+    coords = np.column_stack((px.ravel() + .5, py.ravel() + .5))
+    weights = strength.ravel()
+    centre = (coords * weights[:, None]).sum(axis=0) / weights.sum()
+    centered = coords - centre
+    covariance = (centered * weights[:, None]).T @ centered / weights.sum()
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    direction = eigenvectors[:, -1]
+    if eigenvalues[-1] < 100 * max(.01, eigenvalues[0]):
+        return None
+    projected = centered @ direction
+    variance = float(np.sum(projected ** 2 * weights) / weights.sum())
+    colors = {tuple(stroke.color)}
+    ranked = sorted((tuple(map(int, color)) for color in palette),
+                    key=lambda color: -float(np.linalg.norm(np.asarray(color) - bg)))
+    colors.update(ranked[:8])
+    if source_rgba is not None:
+        core = raw[strength >= np.quantile(strength[signal], .85)]
+        core_color = tuple(map(int, np.rint(np.median(core, axis=0))))
+        # Do not promote one-level antialiasing variants into new pigments;
+        # original-resolution evidence still adds a genuinely missing colour.
+        if min(np.max(np.abs(np.asarray(color) - core_color)) for color in colors) > 3:
+            colors.add(core_color)
+    candidates = {"butt": [], "round": []}
+    for color in sorted(colors):
+        pigment = bg - color
+        magnitude = float(pigment @ pigment)
+        if magnitude < 24 ** 2:
+            continue
+        coverage = np.sum(delta * pigment, axis=2) / magnitude
+        residual = np.abs(delta - coverage[:, :, None] * pigment).max(axis=2)
+        if (float(coverage.max()) > 1.025 or np.percentile(residual[signal], 95) > 2
+                or residual[signal].max() > 6):
+            continue
+        mass = float(np.clip(coverage, 0, 1).sum())
+        for cap in candidates:
+            if cap == "butt":
+                length = math.sqrt(12 * variance)
+                width = mass / length
+            else:
+                # Continuous capsule area/axial moment gives a starting point;
+                # all proposals are then compared to native rendered pixels.
+                low, high = .45, min(16., math.sqrt(4 * mass / math.pi) * .95)
+                for _ in range(35):
+                    width = (low + high) / 2
+                    radius = width / 2
+                    length = max(.01, (mass - math.pi * radius ** 2) / width)
+                    moment = (radius * length ** 3 / 6 + math.pi * radius ** 2 * length ** 2 / 4
+                              + 4 * length * radius ** 3 / 3 + math.pi * radius ** 4 / 4)
+                    if moment / mass > variance:
+                        low = width
+                    else:
+                        high = width
+                width = (low + high) / 2
+                length = (mass - math.pi * width ** 2 / 4) / width
+            if length > MIN_STROKE_LEN and .45 <= width <= 16:
+                candidates[cap].append((color, np.array([*centre, length, width]), mass))
+    if not any(candidates.values()):
+        return None
+
+    render_cache = {}
+    def render(parameters, cap, axis=direction):
+        cx, cy, length, width = parameters
+        first, last = np.array([cx, cy]) - axis * length / 2, np.array([cx, cy]) + axis * length / 2
+        key = (cap, *(round(float(v), 7) for v in (*first, *last, width)))
+        if key not in render_cache:
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
+                   f'<path d="M{first[0]:.7f} {first[1]:.7f} L{last[0]:.7f} {last[1]:.7f}" '
+                   f'fill="none" stroke="black" stroke-width="{width:.7f}" stroke-linecap="{cap}"/></svg>')
+            png = resvg_py.svg_to_bytes(svg_string=svg, width=w, height=h,
+                skip_system_fonts=True, log_information=False, shape_rendering="geometric_precision")
+            with Image.open(io.BytesIO(png)) as image:
+                render_cache[key] = np.asarray(image.convert('RGBA'), dtype=np.float64)[:, :, 3] / 255
+        return render_cache[key]
+
+    def evaluate(parameters, color, cap, axis=direction, source_mass=None):
+        if parameters[2] <= 0 or not .40 <= parameters[3] <= 16.1:
+            return math.inf, None
+        geometric_mass = parameters[2] * parameters[3]
+        if cap == "round":
+            geometric_mass += math.pi * parameters[3] ** 2 / 4
+        if source_mass is not None and abs(geometric_mass - source_mass) > max(.05, source_mass * .01):
+            return math.inf, None
+        coverage = render(parameters, cap, axis)
+        predicted = bg + coverage[:, :, None] * (np.asarray(color) - bg)
+        return float(np.abs(predicted - raw).mean()), predicted
+
+    old_first, old_last = [np.asarray(p) * scale + offset for p in
+                           (stroke.sample_points[0], stroke.sample_points[-1])]
+    old_length = float(np.linalg.norm(old_last - old_first))
+    if old_length <= 0:
+        return None
+    old_axis = (old_last - old_first) / old_length
+    old_center = (old_first + old_last) / 2 - [x0, y0]
+    baseline, _ = evaluate([*old_center, old_length, stroke.width * scale], stroke.color, "round", old_axis)
+    best_by_cap = {}
+    # Maximum 2 cap styles x 4 compatible colours x 25 small-ROI renders.
+    for cap, hypotheses in candidates.items():
+        for color, initial, source_mass in hypotheses[:4]:
+            parameters = initial.copy()
+            score, predicted = evaluate(parameters, color, cap, source_mass=source_mass)
+            for step in (.2, .05, .01):
+                for index in (0, 1, 2, 3):
+                    for sign in (-1, 1):
+                        trial = parameters.copy(); trial[index] += sign * step
+                        value, picture = evaluate(trial, color, cap, source_mass=source_mass)
+                        if value < score:
+                            parameters, score, predicted = trial, value, picture
+            if predicted is not None and (cap not in best_by_cap or score < best_by_cap[cap][0]):
+                best_by_cap[cap] = (score, parameters, color, predicted, source_mass)
+    if len(best_by_cap) != 2:
+        return None  # absence of the competing model is not cap evidence
+    cap = min(best_by_cap, key=lambda key: best_by_cap[key][0])
+    # A one-pixel line can have two genuinely identical native rasters with
+    # different cap/length parameterizations. Keep it editable using a stable
+    # round tie-break, but explicitly retain the unresolved cap identity.
+    cap_ambiguity = bool(np.max(np.abs(best_by_cap['butt'][3]
+                                      - best_by_cap['round'][3])) <= 1.0)
+    if cap_ambiguity:
+        cap = 'round'
+    score, parameters, color, predicted, source_mass = best_by_cap[cap]
+    other = best_by_cap["butt" if cap == "round" else "round"]
+    # Test the endpoint region separately: a long line's interior must not
+    # hide rounded-off rectangle corners or a wrong extension of the ends.
+    axial = (coords - parameters[:2]) @ direction
+    cross = np.abs((coords - parameters[:2]) @ np.array([-direction[1], direction[0]]))
+    endpoint = ((np.abs(axial) >= parameters[2] / 2 - max(2., parameters[3]))
+                & (cross <= parameters[3] + 2)).reshape(h, w)
+    endpoint_error = float(np.abs(predicted - raw).max(axis=2)[endpoint].mean())
+    competing_endpoint_error = float(np.abs(other[3] - raw).max(axis=2)[endpoint].mean())
+    if not cap_ambiguity and (other[0] - score <= max(.001, score * .10)
+            or competing_endpoint_error - endpoint_error <= .05):
+        return None
+    union = signal | (np.linalg.norm(bg - predicted, axis=2) > 10)
+    ink_error = float(np.abs(predicted - raw).max(axis=2)[union].mean())
+    source_ink = np.linalg.norm(bg - raw, axis=2) > 20
+    candidate_ink = np.linalg.norm(bg - predicted, axis=2) > 20
+    iou = float((source_ink & candidate_ink).sum() / max(1, (source_ink | candidate_ink).sum()))
+    if score > baseline + .001 or ink_error > 3.0 or endpoint_error > 3.0 or iou < .97:
+        return None
+    if cap_ambiguity:
+        other_union = signal | (np.linalg.norm(bg - other[3], axis=2) > 10)
+        other_error = float(np.abs(other[3] - raw).max(axis=2)[other_union].mean())
+        other_ink = np.linalg.norm(bg - other[3], axis=2) > 20
+        other_iou = float((source_ink & other_ink).sum() / max(1, (source_ink | other_ink).sum()))
+        if (other[0] > baseline + .001 or other_error > 3.0
+                or competing_endpoint_error > 3.0 or other_iou < .97):
+            return None
+    cx, cy, length, width = parameters
+    first, last = np.array([cx + x0, cy + y0]) - direction * length / 2, np.array([cx + x0, cy + y0]) + direction * length / 2
+    first, last = [(point - offset) / scale for point in (first, last)]
+    # Validate the exact rounded numbers that will be serialized, not just
+    # the higher-precision optimizer state.
+    first, last = np.round(first, 4), np.round(last, 4)
+    output_width = round(float(width / scale), 4)
+    nf, nl = first * scale + offset, last * scale + offset
+    final_length = float(np.linalg.norm(nl - nf))
+    final_axis = (nl - nf) / final_length
+    final_params = [*((nf + nl) / 2 - [x0, y0]), final_length, output_width * scale]
+    final_score, final_picture = evaluate(final_params, color, cap, final_axis, source_mass)
+    # Select the neighbouring serialized width on the same strict objective.
+    # Rounding a subpixel working width down can turn every native black pixel
+    # into alpha254; do not discard the exact one-pixel solution for that.
+    for delta_width in (-.0001,.0001):
+        serialized_width=round(output_width+delta_width,4)
+        params=[*final_params[:3],serialized_width*scale]
+        value,picture=evaluate(params,color,cap,final_axis,source_mass)
+        if picture is not None and value<final_score:
+            final_score,final_picture=value,picture
+            output_width=serialized_width
+    if final_picture is None or final_score > score + .01:
+        return None
+    final_union = signal | (np.linalg.norm(bg - final_picture, axis=2) > 10)
+    ink_error = float(np.abs(final_picture - raw).max(axis=2)[final_union].mean())
+    endpoint_error = float(np.abs(final_picture - raw).max(axis=2)[endpoint].mean())
+    final_ink = np.linalg.norm(bg - final_picture, axis=2) > 20
+    iou = float((source_ink & final_ink).sum() / max(1, (source_ink | final_ink).sum()))
+    if ink_error > 3.0 or endpoint_error > 3.0 or iou < .97:
+        return None
+    stroke.width = output_width
+    stroke.color = color
+    stroke.linecap = cap
+    stroke.d = f'M{first[0]:.4f} {first[1]:.4f} L{last[0]:.4f} {last[1]:.4f}'
+    stroke.length = final_length / scale
+    stroke.n_nodes = 2
+    stroke.sample_points = [tuple(first + t * (last - first)) for t in
+        np.linspace(0, 1, min(256, max(16, len(stroke.sample_points))))]
+    stroke.source_fit = {'policy': 'straight_caps_native_render_source_coverage',
+        'linecap': cap, 'cap_models_compared': ['butt', 'round'],
+        'cap_ambiguity': cap_ambiguity,
+        'equivalent_at_source_resolution': cap_ambiguity,
+        'baseline_rgb_mae': baseline, 'candidate_rgb_mae': final_score,
+        'source_ink_mean_max_channel_error': ink_error, 'source_ink_iou': iou,
+        'endpoint_max_channel_mae': endpoint_error,
+        'competing_endpoint_max_channel_mae': competing_endpoint_error,
+        'coverage_not_binary_area': True, 'source_color_jointly_validated': True,
+        'source_dimensions': [nw, nh], 'native_roi': [x0, y0, x1, y1],
+        'serialized_geometry_validated': True, 'render_evaluations': len(render_cache)}
+    return stroke
+
+
 def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
-                    alpha=None):
+                    alpha=None, source_rgba=None, audit=None):
     """Find monoline ink components and rebuild them as strokes.
 
     ink_mask: bool mask of "ink" pixels (visible foreground, background
@@ -637,9 +1541,26 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
     ring or glyph from being resurrected as disconnected colour fragments.
     """
     H, W = ink_mask.shape
+    def record_defer(reason, component):
+        if audit is None:
+            return
+        counts = audit.setdefault('deferred_component_reasons', {})
+        counts[reason] = counts.get(reason, 0) + 1
+        examples = audit.setdefault('deferred_component_examples', [])
+        if len(examples) < 32:
+            examples.append({'reason': reason, 'pixels': int(len(component)),
+                'bbox': [int(component[:, 1].min()), int(component[:, 0].min()),
+                         int(component[:, 1].max()) + 1, int(component[:, 0].max()) + 1]})
+    # A 24 px uniform stroke at 384 px is the same design as an 8 px
+    # stroke at 128 px. A fixed 13 px half-width cap changed its editability
+    # with input resolution. Scale only the search bound; all width variation,
+    # length/width, junction and multicolour guards remain in force.
+    max_half_width = min(MAX_SCALED_HALF_WIDTH,
+                         max(MAX_HALF_WIDTH, int(math.ceil(min(H, W) / 16.0))))
     stroke_mask = np.zeros((H, W), dtype=bool)
     deferred_mask = np.zeros((H, W), dtype=bool)
     strokes = []
+    aa_fit_attempts = int(audit.get('native_cap_search_attempts',0)) if audit is not None else 0
     if not ink_mask.any():
         return strokes, stroke_mask, deferred_mask
     bg = np.asarray(bg_color, dtype=np.float32)
@@ -671,9 +1592,9 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
         comp = np.zeros((bh + 4, bw + 4), dtype=bool)
         comp[comp_idx[:, 0] - y0 + 2, comp_idx[:, 1] - x0 + 2] = True
 
-        dt = dist_transform_capped(comp)
+        dt = dist_transform_capped(comp, cap=max_half_width + 2)
         max_half = float(dt.max())
-        if max_half > MAX_HALF_WIDTH:
+        if max_half > max_half_width:
             continue                       # too fat: a shape, not a line
 
         # Try thinning the raw ribbon first; if the skeleton topology is not
@@ -753,7 +1674,7 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
         # width: area over center-line length is robust for thin ribbons
         # (the capped erosion transform quantizes hard at 1-2 px widths)
         width = area / length if length else 0.0
-        if width <= 0.5 or width > 2.2 * MAX_HALF_WIDTH:
+        if width <= 0.5 or width > 2.2 * max_half_width:
             continue
         if length < 2.5 * width:
             continue
@@ -811,6 +1732,7 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
         pieces = []
         all_gpts = []
         defer_component = False
+        defer_reason = "unsupported_closed_stroke_geometry"
         for pts, closed in raw_polys:
             gpts = [(x + x0 - 2 + 0.5, y + y0 - 2 + 0.5)
                     for x, y in pts]
@@ -854,32 +1776,30 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
                               > MULTICOLOR_SPLIT_DISTANCE ** 2
                               for a in distinct for b in distinct if a != b)
                     if far:
-                        # Splitting a curved/closed colour ramp makes dashed
-                        # arcs because transition runs become gaps.  Defer the
-                        # complete component instead.  Straight two-colour
-                        # rules remain editable, with shared boundary points
-                        # so no pixels disappear between runs.
-                        if (closed
-                                or _polyline_straightness(gpts) <
-                                MULTICOLOR_CURVE_STRAIGHTNESS_MIN
-                                or len(runs) > MAX_MULTICOLOR_STRAIGHT_RUNS):
+                        if (closed or junction_edges or _polyline_straightness(gpts)<.99
+                                or len(runs)!=len(big_runs)
+                                or len(runs)>MAX_MULTICOLOR_STRAIGHT_RUNS):
                             defer_component = True
+                            defer_reason = "multicolour_caps_and_seam_not_source_validated"
                             break
-                        local_pieces = []
-                        for ri, rr in enumerate(runs):
-                            start_i = max(0, rr[0] - (1 if ri else 0))
-                            end_i = min(len(gpts), rr[1] + 1)
-                            segment = gpts[start_i:end_i]
-                            if len(segment) >= 2:
-                                local_pieces.append((segment, False))
+                        local_pieces=[]
+                        for start,end in runs:
+                            segment=list(gpts[start:end])
+                            if start:
+                                segment.insert(0,tuple((np.asarray(gpts[start-1])+gpts[start])/2))
+                            if end<len(gpts):
+                                segment.append(tuple((np.asarray(gpts[end-1])+gpts[end])/2))
+                            local_pieces.append((segment,False))
             pieces.extend(local_pieces)
 
         if defer_component:
+            record_defer(defer_reason, comp_idx)
             dm = np.zeros((H, W), dtype=bool)
             dm[comp_idx[:, 0], comp_idx[:, 1]] = True
             deferred_mask |= _dilate_one(dm)
             continue
 
+        component_strokes = []
         for seg_pts, seg_closed in pieces:
             if len(seg_pts) < 2:
                 continue
@@ -893,13 +1813,78 @@ def extract_strokes(ink_mask, den, palette, bg_color=(255, 255, 255),
             kw = dict(primitive or {})
             primitive_name = kw.pop("primitive", "")
             kw.pop("nodes", None)
-            strokes.append(Stroke(color=_seg_color(seg_pts),
+            stroke = Stroke(color=_seg_color(seg_pts),
                                   width=round(max(0.45, width), 2),
                                   d=d, closed=seg_closed,
                                   length=seg_length, n_nodes=nodes, pixels=area,
                                   opacity=_seg_opacity(seg_pts),
                                   primitive=primitive_name,
-                                  sample_points=list(seg_pts), **kw))
+                                  sample_points=list(seg_pts), **kw)
+            if (not junction_edges and len(pieces)==1 and not stroke.closed and not stroke.primitive
+                    and (stroke.n_nodes == 2 or _polyline_straightness(seg_pts) >= .97)):
+                fitted = None
+                fit_search_allowed = len(pieces) == 1 and aa_fit_attempts < 24
+                if fit_search_allowed:
+                    aa_fit_attempts += 1
+                    if audit is not None:
+                        audit['native_cap_search_attempts']=aa_fit_attempts
+                    try:
+                        fitted = _refine_straight_aa_stroke(stroke, den, palette, bg,
+                            comp_idx, labels, li, alpha, source_rgba=source_rgba)
+                        if fitted is None:
+                            fitted = _refine_transparent_straight(stroke, den, palette, bg,
+                                comp_idx, labels, li, alpha, source_rgba)
+                        if fitted is None:
+                            native_group = _refine_native_component_strokes([stroke],den,comp_idx,source_rgba)
+                            fitted = native_group[0] if native_group else None
+                        if fitted is None:
+                            fitted = _refine_opaque_palette_straight(stroke,den,comp_idx,source_rgba)
+                    except (ValueError, ArithmeticError, RuntimeError):
+                        pass
+                if fitted is None:
+                    defer_component = True
+                    defer_reason = ('native_straight_caps_not_source_validated' if fit_search_allowed
+                                    else 'native_straight_cap_search_budget_exhausted')
+                    break
+                stroke = fitted
+            component_strokes.append(stroke)
+
+        if defer_component:
+            record_defer(defer_reason, comp_idx)
+            dm = np.zeros((H, W), dtype=bool)
+            dm[comp_idx[:, 0], comp_idx[:, 1]] = True
+            deferred_mask |= _dilate_one(dm)
+            continue
+        if junction_edges or len(pieces)>1:
+            native_group=None
+            if aa_fit_attempts<24:
+                aa_fit_attempts+=1
+                if audit is not None:
+                    audit['native_cap_search_attempts']=aa_fit_attempts
+                native_group = _refine_native_component_strokes(component_strokes,den,comp_idx,source_rgba)
+            if native_group is not None:
+                component_strokes = native_group
+            elif len(pieces)>1 and not junction_edges:
+                record_defer('multicolour_caps_and_seam_not_source_validated',comp_idx)
+                dm=np.zeros((H,W),dtype=bool)
+                dm[comp_idx[:,0],comp_idx[:,1]]=True
+                deferred_mask|=_dilate_one(dm)
+                continue
+        unproven=[s for s in component_strokes if not s.closed and not s.primitive
+                  and not s.source_fit.get('serialized_geometry_validated')]
+        if unproven:
+            proven=None
+            if len(component_strokes)==1 and aa_fit_attempts<24:
+                aa_fit_attempts+=1
+                if audit is not None:audit['native_cap_search_attempts']=aa_fit_attempts
+                proven=_validate_native_open_curve(component_strokes[0],den,comp_idx,source_rgba)
+            if proven is None:
+                record_defer('native_open_component_not_source_validated',comp_idx)
+                dm=np.zeros((H,W),dtype=bool);dm[comp_idx[:,0],comp_idx[:,1]]=True
+                deferred_mask|=_dilate_one(dm)
+                continue
+            component_strokes=[proven]
+        strokes.extend(component_strokes)
 
         gm = np.zeros((H, W), dtype=bool)
         gm[comp_idx[:, 0], comp_idx[:, 1]] = True

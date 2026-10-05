@@ -913,6 +913,8 @@ def process_compound_paths(
             "exact rational monotone-collinear cubic identity"
         ),
         "id_policy": "source-order and geometry digest; deterministic",
+        "protected_gradient_path_count": 0,
+        "protected_gradient_paths": [],
     }
     try:
         if not isinstance(svg_text, str):
@@ -959,6 +961,19 @@ def process_compound_paths(
             compound_path_count += 1
             if _in_non_render_container(element, parent_map):
                 all_subpath_count += explicit_moves
+                continue
+            if any(node.get("data-avc-paint-only-reconstruction") is not None
+                   or node.get("data-avc-gradient-object") is not None
+                   for node in _ancestor_chain(element, parent_map)):
+                # A source certificate binds exact path data, IDs and owner
+                # order. Pixel equality alone cannot authorize splitting or
+                # even rewriting an exactly collinear cubic in that unit.
+                all_subpath_count += explicit_moves
+                base_report["protected_gradient_path_count"] += 1
+                if len(base_report["protected_gradient_paths"]) < 64:
+                    base_report["protected_gradient_paths"].append({
+                        "id": element.get("id"),
+                        "reason": "source_gradient_geometry_requires_evidence_revalidation"})
                 continue
             fill = _effective_property(element, parent_map, "fill", "black").strip()
             display = _effective_property(

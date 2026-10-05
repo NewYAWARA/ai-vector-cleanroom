@@ -29,7 +29,7 @@ PYTHON = ROOT / "python" / "python.exe"
 if not PYTHON.exists():
     PYTHON = Path(sys.executable)
 
-HARNESS_VERSION = "v3-codex-regression.4"
+HARNESS_VERSION = "v3-designer-regression.2"
 MANIFEST = RUN / "reuse_manifest.json"
 FIXTURE_NAMES = (
     "line_over_fill_darkgray",
@@ -46,13 +46,8 @@ FIXTURE_NAMES = (
     "x_junction",
     "y_junction",
 )
-HASHED_TEST_FILES = (
-    ROOT / "vector_cleanroom.py",
-    ROOT / "clean_base.py",
-    ROOT / "trace_engine.py",
-    ROOT / "stroke_engine.py",
-    ROOT / "quality_diagnostics.py",
-    ROOT / "editability_audit.py",
+HASHED_TEST_FILES = tuple(sorted(ROOT.glob("*.py"))) + (
+    ROOT / "requirements-preview.txt",
     TESTS / "generate_fixtures.py",
     TESTS / "test_regression.py",
 )
@@ -570,7 +565,7 @@ class VectorRegression(unittest.TestCase):
         self.assertIsInstance(report["paint_roles"], dict)
         self.assertIsInstance(report["designer_operations"], dict)
         self.assertTrue(report["preview_is_svg_render"])
-        self.assertEqual(report["tool_version"], "v3-codex-beta.5")
+        self.assertEqual(report["tool_version"], "v3-designer-preview.4")
         self.assertEqual(
             report["editability_schema"],
             "ai-vector-cleanroom.editability/v2")
@@ -707,7 +702,8 @@ class VectorRegression(unittest.TestCase):
                          report["solid_paints"] + report["gradient_paints"])
         self.assertEqual(report["solid_paints"], len(report["palette"]))
         self.assertEqual(report["gradient_paints"], report["gradients"])
-        self.assertTrue(all(item.get("type") in {"solid", "linearGradient"}
+        self.assertTrue(all(item.get("type") in {
+                                "solid", "linearGradient", "radialGradient"}
                             for item in report["paint_resources"]))
 
         final = report["final_structure"]
@@ -746,7 +742,7 @@ class VectorRegression(unittest.TestCase):
         }
         self.assertEqual(set(), policy_required - set(policy))
         self.assertEqual(policy["policy"],
-                         "visual_gate_tier_then_safe_dominance_then_preserve_features")
+                         "visual_gate_then_safe_dominance_then_measured_editing_economy")
         self.assertEqual(policy["evaluated_candidates"],
                          len(report["candidates"]))
         self.assertLessEqual(policy["selected_requested_features_retained"],
@@ -786,7 +782,7 @@ class VectorRegression(unittest.TestCase):
         readme = (self.result_dir("one_px_black") / "OUTPUT_README.txt").read_text(
             encoding="utf-8")
         self.assertTrue(readme.startswith("AI 向量清稿工具｜本次輸出摘要\n"))
-        self.assertIn("工具版本：v3-codex-beta.5", readme)
+        self.assertIn("工具版本：v3-designer-preview.4", readme)
         self.assertIn("驗收狀態：accepted", readme)
         self.assertIn("前景符合度：", readme)
         self.assertIn("外觀閘門：accepted", readme)
@@ -797,12 +793,12 @@ class VectorRegression(unittest.TestCase):
         self.assertIn("實際設定：", readme)
         self.assertIn("自動回退：", readme)
         self.assertIn(
-            "Beta.5 fidelity, topology and editability enhancements", readme)
+            "Fidelity, topology and editability enhancements", readme)
         self.assertIn("色彩調整.html", readme)
 
         review = (self.result_dir("one_px_black") / "review.html").read_text(
             encoding="utf-8")
-        self.assertIn("AI Vector Cleanroom v3-codex-beta.5", review)
+        self.assertIn("AI Vector Cleanroom v3-designer-preview.4", review)
         self.assertIn("accepted：外觀與可編輯性均通過自動品質閘門", review)
         self.assertIn("局部細節 p10", review)
         self.assertIn("可編輯性", review)
@@ -815,7 +811,7 @@ class VectorRegression(unittest.TestCase):
             and element.attrib.get("id") == "ai-vector-cleanroom-metadata"
         )
         embedded = json.loads(metadata.text)
-        self.assertEqual(embedded["tool_version"], "v3-codex-beta.5")
+        self.assertEqual(embedded["tool_version"], "v3-designer-preview.4")
         self.assertEqual(embedded["options_requested"], report["options_requested"])
         self.assertEqual(embedded["options_effective"], report["options_effective"])
         self.assertEqual(embedded["visual_acceptance_status"],

@@ -28,7 +28,7 @@ def _scores(fg, color, p10, mean, topology=100.0,
 
 
 class VisualGateTests(unittest.TestCase):
-    def test_high_quality_dark_wordmark_is_accepted(self):
+    def test_high_quality_scores_are_accepted(self):
         gate = _evaluate_visual_gate(
             _scores(96.900, 91.030, 93.387, 97.012, 99.9))
         self.assertEqual(gate["status"], "accepted")

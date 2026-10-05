@@ -67,6 +67,39 @@ class SvgPostprocessTests(unittest.TestCase):
         self.assertEqual(report["native_polylines"], 1)
         self.assertEqual(report["native_polygons"], 1)
         self.assertEqual(report["native_polygonal_shapes"], 2)
+        self.assertEqual(report["nodes_total"], 14)
+        self.assertEqual(report["designer_anchors_total"], 20)
+        self.assertEqual(
+            report["designer_anchor_count_source"], "canonical_svg_geometry")
+
+    def test_designer_anchor_count_deduplicates_closed_return_points(self):
+        with tempfile.TemporaryDirectory() as temp:
+            svg = Path(temp) / "designer-anchors.svg"
+            svg.write_text(f'''<svg xmlns="{SVG_NS}" viewBox="0 0 100 100">
+              <path d="M10 10 L40 10 L40 40 L10 40 L10 10 Z"/>
+              <path d="M50 10 L80 10 L65 40 Z"/>
+              <path d="M10 70 L90 70" fill="none" stroke="#111"/>
+            </svg>''', encoding="utf-8")
+            report = measure_svg_structure(svg)
+
+        self.assertEqual(report["nodes_total"], 10)
+        self.assertEqual(report["designer_anchors_total"], 9)
+
+    def test_rounded_rectangle_handles_use_geometry_not_metadata(self):
+        from designer_handoff import build_handoff_manifest
+        cases = [('', 4), ('rx="5"', 8), ('ry="5"', 8),
+                 ('rx="5" ry="0"', 4), ('rx="0" ry="5"', 4),
+                 ('rx="0"', 4), ('rx="auto" ry="5"', 8),
+                 ('rx="5%" ry="2px"', 8), ('rx="NaN"', 4)]
+        with tempfile.TemporaryDirectory() as folder:
+            svg = Path(folder) / 'rect.svg'
+            for attributes, expected in cases:
+                with self.subTest(attributes=attributes):
+                    svg.write_text(f'<svg xmlns="{SVG_NS}" viewBox="0 0 100 100">'
+                        f'<rect id="shape" width="80" height="50" {attributes} '
+                        'data-avc-designer-anchors="1"/></svg>', encoding='utf-8')
+                    self.assertEqual(measure_svg_structure(svg)['designer_anchors_total'], expected)
+                    self.assertEqual(build_handoff_manifest(svg)['objects'][0]['anchor_count'], expected)
 
     def test_pipeline_applies_all_structural_stages(self):
         calls = []
@@ -93,6 +126,46 @@ class SvgPostprocessTests(unittest.TestCase):
         self.assertTrue(any(item.get("data-detector") for item in circles))
         self.assertGreaterEqual(final["semantic_groups"], 1)
         self.assertGreater(final["object_id_coverage"], 0.5)
+
+    def test_proposal_scratch_paths_do_not_inherit_work_directory_depth(self):
+        seen = {}
+
+        def validator(before, after, stage):
+            seen.setdefault(stage, []).append((Path(before), Path(after)))
+            return {"accepted": True, "score_percent": 100.0}
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # The project-local TEMP root is already deep.  This suffix keeps
+            # the delivered SVG creatable while the old nested proposal names
+            # would cross the legacy 260-character boundary.
+            deep = root / ("work-" + "x" * 30)
+            deep.mkdir(parents=True)
+            svg = deep / "logo.svg"
+            manifest = deep / "roles.json"
+            svg.write_text(_source(), encoding="utf-8")
+            report = enhance_svg_structure(
+                svg, validator=validator,
+                enable_annulus=False, enable_native_shapes=False,
+                enable_scene_graph=False)
+            _manifest, paint_report = attach_paint_roles(
+                svg, manifest, validator=validator)
+
+            self.assertEqual(report["stages"]["compound_paths"]["status"],
+                             "applied")
+            self.assertEqual(paint_report["status"], "applied")
+            self.assertIn("compound_exact", seen)
+            for before, after in seen["compound_exact"]:
+                self.assertFalse(before.is_relative_to(deep))
+                self.assertFalse(after.is_relative_to(deep))
+            self.assertFalse(seen["compound_exact"][-1][1].exists())
+
+            self.assertIn("paint_roles_exact", seen)
+            for before, after in seen["paint_roles_exact"]:
+                self.assertEqual(before, svg)
+                self.assertTrue(before.is_relative_to(deep))
+                self.assertFalse(after.is_relative_to(deep))
+            self.assertFalse(seen["paint_roles_exact"][-1][1].exists())
 
     def test_exact_linear_stage_commits_native_lines_only_with_pixel_proof(self):
         def exact_validator(_before, _after, _stage):
@@ -356,7 +429,7 @@ class SvgPostprocessTests(unittest.TestCase):
 
             def fake_render(svg_path, png_path, **_kwargs):
                 image = Image.new("RGBA", (8, 8), (255, 255, 255, 255))
-                if Path(svg_path) == after:
+                if Path(svg_path).name == "after.svg":
                     image.putpixel((4, 4), (254, 255, 255, 255))
                 image.save(png_path)
                 return True
@@ -406,6 +479,37 @@ class SvgPostprocessTests(unittest.TestCase):
         self.assertEqual(
             second["render_cache_hits"], {"before": True, "after": False})
         self.assertEqual(second["validation_render_width_px"], 321)
+
+    def test_stage_render_guard_uses_bounded_temporary_png_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            before = root / (("before-" + "x" * 90) + ".svg")
+            after = root / (("after-" + "y" * 90) + ".svg")
+            before.write_text("<svg data-stage='before'/>", encoding="utf-8")
+            after.write_text("<svg data-stage='after'/>", encoding="utf-8")
+            render_inputs = []
+            render_paths = []
+
+            def fake_render(svg_path, png_path, **_kwargs):
+                render_inputs.append(Path(svg_path))
+                render_paths.append(Path(png_path))
+                Image.new("RGBA", (8, 8), (255, 255, 255, 255)).save(png_path)
+                return True
+
+            with mock.patch("vector_cleanroom.render_svg_png",
+                            side_effect=fake_render):
+                result = validate_svg_stage_renders(
+                    before, after, "curve_refit_identity_normalization")
+
+        self.assertEqual(result["external_render_check"], "completed")
+        self.assertEqual([path.name for path in render_inputs],
+                         ["before.svg", "after.svg"])
+        self.assertEqual([path.name for path in render_paths],
+                         ["before.png", "after.png"])
+        self.assertTrue(all(path.parent != root for path in render_inputs))
+        self.assertTrue(all(path.parent != root for path in render_paths))
+        self.assertTrue(all(not path.exists() for path in render_inputs))
+        self.assertTrue(all(not path.exists() for path in render_paths))
 
     def test_stage_render_cache_key_includes_gradient_metadata_and_size(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -495,7 +599,8 @@ class SvgPostprocessTests(unittest.TestCase):
             after.write_text("<svg data-stage='after'/>", encoding="utf-8")
 
             def fake_render(svg_path, png_path, **_kwargs):
-                size = (8, 16) if Path(svg_path) == before else (16, 8)
+                size = ((8, 16) if Path(svg_path).name == "before.svg"
+                        else (16, 8))
                 Image.new("RGBA", size, (255, 255, 255, 255)).save(png_path)
                 return True
 

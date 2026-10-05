@@ -26,6 +26,29 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def rect_designer_anchors(element: ET.Element) -> int:
+    """A rounded rectangle has eight outline handles; a square corner has four.
+
+    One omitted radius uses the other. An explicit zero in either direction
+    disables rounding. Count actual attributes rather than trusted metadata.
+    """
+    radii = [element.get("rx"), element.get("ry")]
+    for index, raw in enumerate(radii):
+        if raw is not None and raw.strip().lower() == "auto":
+            radii[index] = None
+    rx, ry = radii
+    if rx is None:
+        rx = ry
+    if ry is None:
+        ry = rx
+    pattern = r"\s*([-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?)(?:px|pt|pc|mm|cm|in|em|ex|%)?\s*"
+    for raw in (rx, ry):
+        match = re.fullmatch(pattern, str(raw or ""))
+        if not match or not 0 < float(match[1]) < float("inf"):
+            return 4
+    return 8
+
+
 def atomic_replace_bytes(target: str | Path, data: bytes) -> None:
     """Durably replace one file without exposing a half-written target."""
 
@@ -110,6 +133,23 @@ def _path_anchors(data: str) -> int:
     return int(_path_metrics(data)[2])
 
 
+def _designer_path_anchors(data: str) -> int:
+    """Count unique editable anchors, not SVG command parameter sets.
+
+    ``nodes_total`` is a long-standing compatibility metric and deliberately
+    remains unchanged.  The designer metric de-duplicates a closed contour's
+    explicit return to its starting point and follows the same canonical path
+    interpretation as the designer-quality gate.
+    """
+    from designer_quality import _path_loops, _path_segments
+
+    segments, valid = _path_segments(data)
+    if not valid:
+        return _path_anchors(data)
+    return sum(int(loop.get("node_count", 0))
+               for loop in _path_loops(segments))
+
+
 def _points_count(value: str) -> int:
     numbers = re.findall(
         r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", value or "")
@@ -144,16 +184,23 @@ def measure_svg_structure(svg_path: str | Path) -> dict[str, object]:
     breakdown = {tag: sum(_local(item.tag) == tag for item in native)
                  for tag in sorted(_NATIVES)}
     nodes = sum(_path_anchors(item.get("d", "")) for item in paths)
+    designer_anchors = sum(
+        _designer_path_anchors(item.get("d", "")) for item in paths)
     for item in native:
         tag = _local(item.tag)
         if tag == "rect":
             nodes += 4
+            designer_anchors += rect_designer_anchors(item)
         elif tag == "line":
             nodes += 2
+            designer_anchors += 2
         elif tag in {"polygon", "polyline"}:
-            nodes += max(1, _points_count(item.get("points", "")))
-        else:  # circle / ellipse are one native editor object
+            point_count = max(1, _points_count(item.get("points", "")))
+            nodes += point_count
+            designer_anchors += point_count
+        else:  # circle / ellipse: one DOM object, four designer anchors
             nodes += 1
+            designer_anchors += 4
     ids = [item.get("id") for item in drawables if item.get("id")]
     rebuilt_strokes = sum(bool(_STROKE_ID.match(item.get("id", "")))
                           for item in drawables)
@@ -174,6 +221,8 @@ def measure_svg_structure(svg_path: str | Path) -> dict[str, object]:
         "gradients": gradients,
         "nodes": nodes,
         "nodes_total": nodes,
+        "designer_anchors_total": designer_anchors,
+        "designer_anchor_count_source": "canonical_svg_geometry",
         "drawables": len(drawables),
         "groups": len(groups),
         "semantic_groups": len(semantic_groups),
@@ -197,9 +246,16 @@ def enhance_svg_structure(svg_path: str | Path, *,
     target = Path(svg_path)
     before_structure = measure_svg_structure(target)
     stages: dict[str, object] = {}
-    base_dir = Path(work_dir) if work_dir else target.parent
-    base_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="svg-postprocess-", dir=base_dir) as temp:
+    base_dir = Path(work_dir) if work_dir else None
+    if base_dir is not None:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    # Scratch SVGs are renderer inputs, not atomic-commit files.  Keeping them
+    # under a deeply nested portable-app output directory can cross Windows'
+    # legacy MAX_PATH boundary.  Atomic commits still create their temporary
+    # file beside the target; only disposable proposals live in system temp.
+    temp_options = ({"dir": base_dir} if base_dir is not None else {})
+    with tempfile.TemporaryDirectory(
+            prefix="svg-postprocess-", **temp_options) as temp:
         scratch = Path(temp)
 
         # 1. Large co-circular stroke fragments -> one native dashed circle.
@@ -415,8 +471,12 @@ def attach_paint_roles(svg_path: str | Path, manifest_path: str | Path, *,
     target = Path(svg_path)
     manifest_file = Path(manifest_path)
     manifest = write_paint_role_manifest(target, manifest_file)
-    base_dir = Path(work_dir) if work_dir else target.parent
-    with tempfile.TemporaryDirectory(prefix="paint-roles-", dir=base_dir) as temp:
+    base_dir = Path(work_dir) if work_dir else None
+    if base_dir is not None:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    temp_options = ({"dir": base_dir} if base_dir is not None else {})
+    with tempfile.TemporaryDirectory(
+            prefix="paint-roles-", **temp_options) as temp:
         proposal = Path(temp) / "annotated.svg"
         annotation = annotate_svg_with_paint_roles(
             target, manifest, proposal)

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from vector_cleanroom import (_rolled_back_stage_report,
-                              _select_viable_candidate)
+                              _select_viable_candidate, _candidate_structure_concerns)
 
 
 REQUESTED = {
@@ -23,6 +24,22 @@ def _item(name, quality, rank, scores=None, **overrides):
 
 
 class CandidatePolicyRegression(unittest.TestCase):
+    def test_one_difficult_path_is_not_hidden_by_hundreds_of_simple_objects(self):
+        stats = SimpleNamespace(n_paths=501, n_nodes=610, n_strokes=0,
+            n_native=0, n_gradients=0, stroke_info=[], palette_audit={})
+        path = 'M0 0 ' + ' '.join(f'L{i} {i % 2}' for i in range(110))
+        svg = '<svg>' + '<path d="M0 0 H1 V1 Z"/>' * 500 + f'<path d="{path}"/></svg>'
+        concerns = _candidate_structure_concerns(stats, svg)
+        self.assertNotIn('high_average_anchor_burden', concerns)
+        self.assertIn('high_anchor_individual_path', concerns)
+
+    def test_source_unverified_stroke_triggers_alternative_candidate_search(self):
+        stats = SimpleNamespace(n_paths=0, n_nodes=2, n_strokes=1,
+            n_native=0, n_gradients=0, stroke_info=[], palette_audit={
+                'stroke_reconstruction': {'complex_strokes_without_native_cap_proof': 1}})
+        self.assertIn('unverified_native_stroke', _candidate_structure_concerns(
+            stats, '<svg><path d="M0 0 L20 20"/></svg>'))
+
     @staticmethod
     def _gate_scores(foreground, color, detail_p10, detail_mean,
                      topology_p10):
@@ -74,7 +91,7 @@ class CandidatePolicyRegression(unittest.TestCase):
         self.assertEqual(selected[5]["name"], "higher")
 
     def test_local_detail_can_safely_override_requested_strokes(self):
-        # Real tea-logo failure signature: the centre-line reconstruction buys
+        # Real Ali-tea failure signature: the centre-line reconstruction buys
         # 0.2 foreground points but visibly damages glyphs and the outer arc.
         requested = _item(
             "strokes-on", 90.640, 87.0,
@@ -99,7 +116,7 @@ class CandidatePolicyRegression(unittest.TestCase):
         self.assertEqual(policy["selected_metric_vector"]["detail_p10"],
                          71.907)
 
-    def test_high_quality_dark_wordmark_tie_still_keeps_requested_strokes(self):
+    def test_high_quality_score_tie_still_keeps_requested_strokes(self):
         requested = _item(
             "requested", 96.871, 92.006,
             scores={
@@ -182,7 +199,7 @@ class CandidatePolicyRegression(unittest.TestCase):
         self.assertEqual(policy["survivor_count"], 2)
 
     def test_manual_review_candidate_outranks_rejected_requested_build(self):
-        # Real tea-logo opaque/cutout failure: feature retention previously let the
+        # Real Ali opaque/cutout failure: feature retention previously let the
         # rejected base beat the safer strokes-off candidate.
         rejected = _item(
             "requested-rejected", 95.983, 90.0,
@@ -204,7 +221,7 @@ class CandidatePolicyRegression(unittest.TestCase):
         self.assertEqual(policy["visual_status_counts"]["rejected"], 1)
         self.assertEqual(policy["visual_status_survivor_count"], 1)
 
-    def test_accepted_candidate_outranks_higher_foreground_manual_review(self):
+    def test_acceptance_label_cannot_buy_excess_foreground_loss(self):
         manual = _item(
             "requested-manual", 99.0, 99.0,
             scores=self._gate_scores(99.0, 84.9, 92.0, 94.0, 96.0),
@@ -217,13 +234,63 @@ class CandidatePolicyRegression(unittest.TestCase):
         selected, policy = _select_viable_candidate(
             [manual, accepted], REQUESTED)
 
-        self.assertEqual(selected[5]["name"], "strokes-off-accepted")
+        self.assertEqual(selected[5]["name"], "requested-manual")
         self.assertEqual(policy["best_visual_status"], "accepted")
-        self.assertEqual(policy["selected_visual_status"], "accepted")
+        self.assertEqual(policy["selected_visual_status"], "manual_review")
+        self.assertTrue(policy["incomparable_gate_tradeoffs_retained"])
         self.assertEqual(
             policy["policy"],
-            "visual_gate_tier_then_safe_dominance_then_preserve_features",
+            "visual_gate_then_safe_dominance_then_measured_editing_economy",
         )
+
+    def test_accepted_candidate_wins_when_other_axes_remain_within_budget(self):
+        manual = _item("manual", 96.2, 99,
+                       scores=self._gate_scores(96.2, 84.9, 91, 94, 96))
+        accepted = _item("accepted", 96, 90, strokes="off",
+                         scores=self._gate_scores(96, 90, 90, 94, 96))
+        selected, policy = _select_viable_candidate([manual, accepted], REQUESTED)
+        self.assertEqual(selected[5]["name"], "accepted")
+        self.assertEqual(policy["selected_visual_status"], "accepted")
+
+    def test_real_thin_line_gate_tradeoff_retains_editable_strokes_for_review(self):
+        native = _item("native", 96.362, 88.659,
+                       scores=self._gate_scores(96.362, 79.563, 95.221, 97.503, 100))
+        filled = _item("filled", 92.227, 95.592, strokes="off",
+                       scores=self._gate_scores(92.227, 88.603, 89.729, 94.481, 100))
+        selected, policy = _select_viable_candidate([native, filled], REQUESTED)
+        self.assertEqual(selected[5]["name"], "native")
+        self.assertEqual(policy["selected_visual_status"], "manual_review")
+        self.assertTrue(policy["incomparable_gate_tradeoffs_retained"])
+
+    def test_equivalent_output_prefers_measured_economy_over_enabled_switches(self):
+        scores = self._gate_scores(97, 95, 92, 95, 99)
+        busy = _item("busy", 97, 99, scores=scores)
+        simple = _item("simple", 97, 90, scores=scores, geometry="off")
+        structure = {"paths": 15, "nodes": 200, "native_primitives": 1,
+                     "strokes": 2, "gradients": 1}
+        busy[5]["structure"] = structure
+        simple[5]["structure"] = {**structure, "nodes": 80, "paths": 10}
+        selected, policy = _select_viable_candidate([busy, simple], REQUESTED)
+        self.assertEqual(selected[5]["name"], "simple")
+        self.assertEqual(policy["editing_economy"]["candidate_count_after"], 1)
+        self.assertFalse(policy["editing_economy"]["human_time_saving_validated"])
+
+    def test_simplicity_cannot_trade_away_real_strokes_or_local_fidelity(self):
+        scores = self._gate_scores(97, 95, 92, 95, 99)
+        original = _item("original", 97, 99, scores=scores)
+        structure = {"paths": 15, "nodes": 200, "native_primitives": 1,
+                     "strokes": 2, "gradients": 1}
+        original[5]["structure"] = structure
+        for change in ({"strokes": 0}, {"gradients": 0}):
+            simple = _item("loss", 97, 90, scores=scores, geometry="off")
+            simple[5]["structure"] = {**structure, "nodes": 20, **change}
+            selected, _ = _select_viable_candidate([original, simple], REQUESTED)
+            self.assertEqual(selected[5]["name"], "original")
+        simple = _item("local-loss", 97, 90,
+                       scores=self._gate_scores(97, 95, 91.5, 95, 99), geometry="off")
+        simple[5]["structure"] = {**structure, "nodes": 20}
+        selected, _ = _select_viable_candidate([original, simple], REQUESTED)
+        self.assertEqual(selected[5]["name"], "original")
 
     def test_global_rollback_reports_only_committed_structure(self):
         compound = _rolled_back_stage_report("compound_paths", {

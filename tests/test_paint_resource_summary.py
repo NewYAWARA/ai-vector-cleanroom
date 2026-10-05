@@ -28,6 +28,8 @@ class PaintResourceSummaryTests(unittest.TestCase):
                 },
                 {
                     "id": "grad2",
+                    "type": "radial",
+                    "model": {"type": "radial"},
                     "stops": [
                         {"offset": 0.0, "color": "#667788"},
                         {"offset": 0.5, "color": "#8899aa"},
@@ -59,13 +61,20 @@ class PaintResourceSummaryTests(unittest.TestCase):
             {item["hex"] for item in summary["palette"]},
             {"#112233", "#abcdef"},
         )
-        gradient_layers = [
-            item for item in summary["layers"]
-            if item["type"] == "linearGradient"
-        ]
+        gradient_layers = [item for item in summary["layers"]
+                           if item["type"].endswith("Gradient")]
         self.assertEqual(
             [item["gradient_id"] for item in gradient_layers],
             ["grad1", "grad2", "grad1"],
+        )
+        self.assertEqual(
+            [item["type"] for item in gradient_layers],
+            ["linearGradient", "radialGradient", "linearGradient"],
+        )
+        self.assertEqual(
+            [item["type"] for item in summary["paint_resources"]
+             if item["type"].endswith("Gradient")],
+            ["linearGradient", "radialGradient"],
         )
         self.assertNotIn(
             "#334455",

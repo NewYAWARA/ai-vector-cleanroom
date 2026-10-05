@@ -67,6 +67,22 @@ def _scores(failed=(), *, foreground=90.0, color=90.0,
     }
 
 
+def _grid_component_case(count):
+    positions = [
+        (6, 6), (26, 6), (46, 6),
+        (6, 26), (26, 26), (46, 26),
+        (6, 46), (26, 46), (46, 46),
+    ]
+    rectangles = tuple(
+        (x, y, x + 6, y + 4, (0, 0, 0))
+        for x, y in positions[:count])
+    source = _image(rectangles)
+    blank = _image()
+    topology = compute_quality_diagnostics(
+        blank, source)["detail_grid"]["component_topology"]
+    return source, blank, topology["failed_examples"]
+
+
 class MissingComponentRepairTests(unittest.TestCase):
     def _propose(self, source, render, flat, examples, **kwargs):
         return propose_missing_component_repairs(
@@ -105,20 +121,105 @@ class MissingComponentRepairTests(unittest.TestCase):
             result["audit"]["records"][0]["reason"],
             "render_moat_not_clear")
 
-    def test_nearby_source_component_fails_source_moat(self):
+    def test_source_supported_render_neighbour_is_not_a_shifted_duplicate(self):
         source = _image((
             (20, 20, 30, 24, (0, 0, 0)),
             # A blank column keeps this a distinct topology label while the
-            # conservative three-pixel source moat still reaches it.
+            # conservative three-pixel audit moat still reaches it.
             (31, 20, 35, 24, (0, 0, 0)),
         ))
+        render = _image(((31, 20, 35, 24, (0, 0, 0)),))
 
-        result = self._propose(source, _image(), source, [_example()])
+        result = self._propose(source, render, source, [_example()])
+
+        self.assertEqual(result["status"], "proposed")
+        record = result["audit"]["records"][0]
+        self.assertEqual(record["source_gap_pixels"], 0)
+        self.assertGreater(record["source_moat_pixels"], 0)
+        self.assertGreater(record["render_moat_pixels"], 0)
+        self.assertEqual(record["render_moat_unexpected_pixels"], 0)
+        self.assertEqual(record["render_moat_supported_pixels"],
+                         record["render_moat_pixels"])
+        self.assertEqual(record["render_inner_gap_pixels"], 0)
+        self.assertEqual(
+            record["touching_render_component_unsupported_pixels"], 0)
+        self.assertEqual(record["source_support_components"], [2])
+
+    def test_source_supported_neighbour_cannot_bridge_inner_gap(self):
+        source = _image((
+            (20, 20, 30, 24, (0, 0, 0)),
+            (31, 20, 35, 24, (0, 0, 0)),
+        ))
+        # x=30 is the target's required blank inner ring.  It is also within
+        # the neighbour's alignment halo, so support ownership alone must not
+        # be allowed to erase the gap.
+        render = _image(((30, 20, 35, 24, (0, 0, 0)),))
+
+        result = self._propose(source, render, source, [_example()])
 
         self.assertEqual(result["status"], "skipped")
+        record = result["audit"]["records"][0]
+        self.assertEqual(record["reason"], "separation_carve_limit")
+        self.assertGreater(record["render_inner_gap_pixels"], 0)
+
+    def test_complete_touching_render_component_must_be_source_supported(self):
+        source = _image((
+            (20, 20, 30, 24, (0, 0, 0)),
+            (31, 20, 35, 24, (0, 0, 0)),
+        ))
+        # The leading pixels inside the three-pixel moat are source-supported,
+        # but the connected tail extends well beyond the support halo.
+        render = _image(((31, 20, 41, 24, (0, 0, 0)),))
+
+        result = self._propose(source, render, source, [_example()])
+
+        self.assertEqual(result["status"], "skipped")
+        record = result["audit"]["records"][0]
         self.assertEqual(
-            result["audit"]["records"][0]["reason"],
-            "source_moat_not_clear")
+            record["reason"], "shifted_duplicate_detected")
+        self.assertEqual(record["render_moat_unexpected_pixels"], 0)
+        self.assertEqual(
+            record["shifted_duplicate_scan"]["status"], "detected")
+        self.assertLess(
+            record["shifted_duplicate_scan"]["detected_match"]
+            ["source_support"], 0.9)
+
+    def test_below_topology_area_source_noise_cannot_own_render(self):
+        source = _image((
+            (20, 20, 30, 24, (0, 0, 0)),
+            (31, 20, 33, 22, (0, 0, 0)),
+        ))
+        render = _image(((31, 20, 33, 22, (0, 0, 0)),))
+
+        result = self._propose(source, render, source, [_example()])
+
+        self.assertEqual(result["status"], "skipped")
+        record = result["audit"]["records"][0]
+        self.assertEqual(
+            record["reason"], "render_moat_not_clear")
+        self.assertEqual(record["source_support_components"], [])
+
+    def test_small_source_owned_gap_intrusion_is_carved_fail_closed(self):
+        source = _image((
+            (20, 20, 30, 30, (0, 0, 0)),
+            (31, 23, 35, 27, (0, 0, 0)),
+        ))
+        render_array = np.asarray(_image((
+            (31, 23, 35, 27, (0, 0, 0)),
+        ))).copy()
+        render_array[25, 30, :3] = (0, 0, 0)
+        render = Image.fromarray(render_array, "RGBA")
+        example = _example(width=10, height=10)
+
+        result = self._propose(source, render, source, [example])
+
+        self.assertEqual(result["status"], "proposed")
+        record = result["audit"]["records"][0]
+        self.assertEqual(record["render_inner_gap_pixels"], 1)
+        self.assertEqual(record["render_inner_gap_unexpected_pixels"], 0)
+        self.assertEqual(record["separation_carve_pixels"], 3)
+        self.assertEqual(record["trace_area_px"], 97)
+        self.assertEqual(result["repairs"][0]["trace_area_px"], 97)
 
     def test_multicolour_or_translucent_flat_component_is_skipped(self):
         source = _image(((20, 20, 30, 24, (0, 0, 0)),))
@@ -195,6 +296,34 @@ class MissingComponentRepairTests(unittest.TestCase):
             self.assertEqual(result["status"], "skipped")
             self.assertEqual(
                 result["audit"]["skipped_reason"], "total_area_limit")
+
+    def test_default_batch_proposes_five_safe_components_deterministically(self):
+        source, blank, examples = _grid_component_case(5)
+
+        first = self._propose(source, blank, source, examples)
+        second = self._propose(source, blank, source, examples)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "proposed")
+        self.assertEqual(first["repair_count"], 5)
+        self.assertEqual(first["audit"]["limits"]["max_components"], 8)
+        self.assertEqual(
+            [item["source_component"] for item in first["repairs"]],
+            [1, 2, 3, 4, 5])
+
+    def test_default_batch_still_fails_closed_above_eight_components(self):
+        source, blank, examples = _grid_component_case(9)
+
+        result = self._propose(source, blank, source, examples)
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["svg_fragment"], "")
+        self.assertEqual(
+            result["audit"]["skipped_reason"], "component_count_limit")
+        self.assertEqual(len(result["audit"]["records"]), 9)
+        self.assertTrue(all(
+            record.get("reason") == "component_count_limit"
+            for record in result["audit"]["records"]))
 
     def test_non_one_to_one_viewbox_is_skipped_with_reason(self):
         source = _image(((20, 20, 30, 24, (0, 0, 0)),))
@@ -305,12 +434,47 @@ class MissingComponentRepairTests(unittest.TestCase):
         audit = validate_repair_transaction(
             proposal, before_scores, after_scores,
             {"status": "rejected"}, {"status": "accepted"},
-            before, source)
+            before, source, source_reference=source)
 
         self.assertEqual(audit["status"], "accepted")
         self.assertEqual(audit["reasons"], [])
         self.assertEqual(audit["outside_allowed_pixels"], 0)
         self.assertEqual(audit["unresolved_target_components"], [])
+
+    def test_transaction_accepts_bounded_carve_that_preserves_separation(self):
+        source = _image((
+            (20, 20, 30, 30, (0, 0, 0)),
+            (31, 23, 35, 27, (0, 0, 0)),
+        ))
+        before_array = np.asarray(_image((
+            (31, 23, 35, 27, (0, 0, 0)),
+        ))).copy()
+        before_array[25, 30, :3] = (0, 0, 0)
+        before = Image.fromarray(before_array, "RGBA")
+        example = _example(width=10, height=10)
+        proposal = self._propose(source, before, source, [example])
+        after_array = before_array.copy()
+        after_array[20:30, 20:30, :3] = (0, 0, 0)
+        # This is the authenticated three-pixel carve around the one existing
+        # source-owned inner-gap pixel at (30, 25).
+        after_array[24:27, 29, :3] = (255, 255, 255)
+        after = Image.fromarray(after_array, "RGBA")
+
+        audit = validate_repair_transaction(
+            proposal, _scores((example,)),
+            _scores((), foreground=91.0, color=91.0,
+                    detail_p10=92.0, detail_mean=96.0,
+                    topology_p10=100.0, topology_worst=100.0),
+            {"status": "rejected"}, {"status": "accepted"},
+            before, after, source_reference=source)
+
+        self.assertEqual(audit["status"], "accepted")
+        record = audit["post_render_gap_guard"]["records"][0]
+        self.assertEqual(record["before_render_inner_gap_core_pixels"], 1)
+        self.assertEqual(record["after_render_inner_gap_core_pixels"], 1)
+        self.assertEqual(record["new_render_inner_gap_core_pixels"], 0)
+        self.assertEqual(
+            record["new_render_to_preexisting_connection_pixels"], 0)
 
     def test_transaction_rejects_outside_changes_and_unresolved_targets(self):
         source = _image(((20, 20, 30, 24, (0, 0, 0)),))
@@ -326,7 +490,7 @@ class MissingComponentRepairTests(unittest.TestCase):
                 proposal, _scores((_example(),)),
                 _scores((), topology_p10=100.0, topology_worst=100.0),
                 {"status": "rejected"}, {"status": "accepted"},
-                before, outside)
+                before, outside, source_reference=source)
             self.assertEqual(audit["status"], "rejected")
             self.assertIn(
                 "render_changed_outside_repair_bbox", audit["reasons"])
@@ -334,7 +498,7 @@ class MissingComponentRepairTests(unittest.TestCase):
             audit = validate_repair_transaction(
                 proposal, _scores((_example(),)), _scores((_example(),)),
                 {"status": "rejected"}, {"status": "rejected"},
-                before, source)
+                before, source, source_reference=source)
             self.assertEqual(audit["status"], "rejected")
             self.assertIn("target_component_not_repaired", audit["reasons"])
 
@@ -350,11 +514,35 @@ class MissingComponentRepairTests(unittest.TestCase):
         audit = validate_repair_transaction(
             proposal, _scores((_example(),)), degraded,
             {"status": "accepted"}, {"status": "rejected"},
-            before, source)
+            before, source, source_reference=source)
 
         self.assertEqual(audit["status"], "rejected")
         self.assertIn("visual_gate_regressed", audit["reasons"])
         self.assertIn("foreground_regressed", audit["reasons"])
+
+    def test_transaction_rejects_post_render_inner_gap_bridge(self):
+        source = _image((
+            (20, 20, 30, 24, (0, 0, 0)),
+            (31, 20, 35, 24, (0, 0, 0)),
+        ))
+        before = _image(((31, 20, 35, 24, (0, 0, 0)),))
+        proposal = self._propose(source, before, source, [_example()])
+        bridged = _image((
+            (20, 20, 30, 24, (0, 0, 0)),
+            (30, 20, 35, 24, (0, 0, 0)),
+        ))
+
+        audit = validate_repair_transaction(
+            proposal, _scores((_example(),)),
+            _scores((), topology_p10=100.0, topology_worst=100.0),
+            {"status": "rejected"}, {"status": "accepted"},
+            before, bridged, source_reference=source)
+
+        self.assertEqual(audit["status"], "rejected")
+        self.assertIn("post_render_added_inner_gap_core", audit["reasons"])
+        self.assertGreater(
+            audit["post_render_gap_guard"]["records"][0]
+            ["new_render_inner_gap_core_pixels"], 0)
 
 
 class ComponentRepairPipelineTests(unittest.TestCase):
@@ -429,6 +617,55 @@ class ComponentRepairPipelineTests(unittest.TestCase):
         self.assertTrue(result["audit"]["live_svg_unchanged"])
         self.assertEqual(result["stats"].n_paths, 0)
         self.assertEqual(result["temp_artifacts"], [])
+
+    def test_pipeline_commits_five_only_after_all_targets_resolve(self):
+        source, blank, failed = _grid_component_case(5)
+        before_scores = _scores(failed)
+        after_scores = _scores(
+            (), foreground=91.0, color=91.0, detail_p10=92.0,
+            detail_mean=96.0, topology_p10=100.0,
+            topology_worst=100.0)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            svg = td / "candidate.svg"
+            flat = td / "flat.png"
+            source_path = td / "source.png"
+            before_render = td / "before.png"
+            svg.write_bytes(
+                b'<svg xmlns="http://www.w3.org/2000/svg" '
+                b'width="64" height="64" viewBox="0 0 64 64"></svg>\n')
+            source.save(source_path)
+            source.save(flat)
+            blank.save(before_render)
+            stats = SimpleNamespace(
+                viewbox=[64, 64], gradient_info=[], n_paths=0, n_nodes=0,
+                geometry_notes=[])
+
+            def fake_self_check(_svg, _flat, _source, **kwargs):
+                source.save(kwargs["keep_render"])
+                return after_scores
+
+            with mock.patch(
+                    "vector_cleanroom.self_check",
+                    side_effect=fake_self_check), mock.patch(
+                    "vector_cleanroom._evaluate_visual_gate",
+                    side_effect=[{"status": "rejected"},
+                                 {"status": "accepted"}]):
+                scores, audit = _attempt_isolated_component_repair(
+                    svg, flat, source_path, stats, before_scores,
+                    before_render)
+
+            self.assertEqual(scores, after_scores)
+            self.assertEqual(audit["status"], "committed")
+            self.assertEqual(audit["repair_count"], 5)
+            self.assertEqual(stats.n_paths, 5)
+            self.assertEqual(
+                audit["transaction"]["target_components"], [1, 2, 3, 4, 5])
+            self.assertEqual(
+                audit["transaction"]["unresolved_target_components"], [])
+            self.assertFalse(any(
+                path.name.startswith("_component_repair")
+                for path in td.iterdir()))
 
     def test_pipeline_prefilter_skips_partial_failures_without_io(self):
         partial = _example(score=50.0, coverage=50.0, fragments=1)

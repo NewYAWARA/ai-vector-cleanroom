@@ -1,0 +1,32 @@
+AI Vector Cleanroom — Designer Preview 4
+Version: v3-designer-preview.4
+Build date: 2026-10-05
+Distribution: source-only (MIT; external CPython 3.12 x64 environment)
+Default venv: %LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4
+Default data root: %LOCALAPPDATA%\AIVC\designer4
+
+定位：把可用向量交給 Illustrator 接手；難修區域保留參考與人工處理清單。
+
+本版重點：
+- Preview 4：依實際可見像素定位原圖顏色／覆蓋與明暗差異，移除重複通用提醒與外框式責任歸屬。
+- 原圖比對失敗、超出上限或缺少原圖時明示未完成，沒有提示不冒充人工驗收。
+- 初次轉檔依原生原圖重建可靠輪廓，驗證不再把描圖器的中間結果當唯一答案。
+- 原圖白縫、筆畫連接與多餘淺色分別檢查；短曲線反覆轉彎列人工檢查提醒。
+- 線條原生端點、交叉與疊色驗證；辨識縮圖假漸層並補充真正淡漸層候選。
+- 整張自動整理：逐物件驗證，包含真漸層與原圖對照；另存版本。
+- 原圖證據充足的單一橢圓可重建成四錨點原生幾何，明示為重建提案。
+- working.svg 保留完整候選，免逐一標記即可在 Illustrator 繼續編輯。
+- 修正主體被小圓孔取代、漸層身份斷鏈，以及描圖器漏小點／小白孔。
+- 透明底檢查新增裂縫，封閉曲線關係檢查保護小孔，筆畫搜尋適應解析度。
+- 圖片／SVG 比對、分組選取與多選，採用／待確認／交人工三態判斷。
+- 全部物件初始為待確認；系統建議不等於人工採用或完稿驗收。
+- 保存判斷與版本衝突保護；重跑與局部簡化另建版本。
+- 接手 ZIP 含 working.svg、accepted.svg、draft.svg、物件／決策 JSON 及 Illustrator 說明。
+- accepted.svg 僅保留採用部分；draft.svg 含點陣參考、隱藏候選與提示框，非純向量完稿。
+- 局部減點限受支援的封閉單色填色路徑；未通過檢查不發布新版本。
+- 新轉檔保存未去背原圖參考；舊結果若只有清理後參考圖會明示。
+
+驗證狀態：本機程式、結構與渲染檢查，不代表 Illustrator 匯入／完稿驗收。
+尚未取得設計師實際對照計時，沒有免修改率或省工比例承諾。
+本預覽版承接 Beta.6 核心，使用獨立環境與資料目錄，不自動搬移舊版資料。
+詳細用法與邊界請讀 README.md、使用說明.txt；歷史技術變更保留於 CHANGELOG.md。

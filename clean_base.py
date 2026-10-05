@@ -14,9 +14,14 @@ The output SVG contains vector paths only and does not embed bitmap images.
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import io
+import json
 import math
 import re
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +32,468 @@ from PIL import Image, ImageFilter
 
 import vtracer
 
+from execution_control import ConversionInterrupted
 from trace_engine import _prepare_image
+
+
+GRADIENT_STAGE_CACHE_SCHEMA = "ai-vector-cleanroom.gradient-stage-cache/v1"
+PRE_GRADIENT_STATE_CACHE_SCHEMA = (
+    "ai-vector-cleanroom.pre-gradient-state-cache/v1")
+POST_FIT_SCENE_CACHE_SCHEMA = "ai-vector-cleanroom.post-fit-scene-cache/v1"
+POST_FIT_SCENE_CACHE_MAX_ENTRIES = 16
+POST_FIT_SCENE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+
+
+def new_pre_gradient_state_cache():
+    """Return one exact cache shared only by a single ``process_one`` run."""
+    return {
+        "schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+        "entries": {},
+        "audit": {
+            "requests": 0,
+            "hits": 0,
+            "misses": 0,
+            "errors": 0,
+        },
+    }
+
+
+def _normalise_pre_gradient_state_cache(cache):
+    if cache is None:
+        return None
+    if not isinstance(cache, dict):
+        raise TypeError("pre_gradient_state_cache must be a dict or None")
+    if not cache:
+        cache.update(new_pre_gradient_state_cache())
+    if cache.get("schema") != PRE_GRADIENT_STATE_CACHE_SCHEMA:
+        raise ValueError("unsupported pre-gradient-state cache schema")
+    entries = cache.get("entries")
+    audit = cache.get("audit")
+    if not isinstance(entries, dict) or not isinstance(audit, dict):
+        raise ValueError("malformed pre-gradient-state cache")
+    for name in ("requests", "hits", "misses", "errors"):
+        audit[name] = int(audit.get(name, 0) or 0)
+    return cache
+
+
+def pre_gradient_state_cache_audit(cache):
+    """Return a JSON-safe audit without retaining cached image state."""
+    state = _normalise_pre_gradient_state_cache(cache)
+    if state is None:
+        return {
+            "schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+            "scope": "disabled",
+            "requests": 0,
+            "hits": 0,
+            "misses": 0,
+            "errors": 0,
+            "entry_count": 0,
+            "keys_sha256": [],
+        }
+    return {
+        "schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+        "scope": "single_process_one",
+        **{name: int(state["audit"].get(name, 0) or 0)
+           for name in ("requests", "hits", "misses", "errors")},
+        "entry_count": len(state["entries"]),
+        "keys_sha256": sorted(str(key) for key in state["entries"]),
+    }
+
+
+def _pre_gradient_state_cache_key(src, parameters, stage_callable,
+                                  stage_schema):
+    """Hash exact source bytes and every option affecting the cached prefix."""
+    source_bytes = Path(src).read_bytes()
+    callable_identity = {
+        "module": str(getattr(stage_callable, "__module__",
+                              type(stage_callable).__module__)),
+        "qualname": str(getattr(stage_callable, "__qualname__",
+                                getattr(stage_callable, "__name__",
+                                        type(stage_callable).__qualname__))),
+        "process_identity": id(stage_callable),
+    }
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest().upper()
+    contract = {
+        "cache_schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+        "stage_schema": str(stage_schema),
+        "stage_callable": callable_identity,
+        "parameters": parameters,
+        "source_size_bytes": len(source_bytes),
+        "source_sha256": source_sha256,
+    }
+    header = json.dumps(
+        contract, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        allow_nan=False).encode("utf-8")
+    return hashlib.sha256(header).hexdigest().upper()
+
+
+def _pre_gradient_state_cache_get_or_compute(cache, key, producer):
+    """Return isolated state; interrupted or failed producers are not stored."""
+    state = _normalise_pre_gradient_state_cache(cache)
+    if state is None:
+        return producer(), {
+            "schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+            "status": "disabled",
+            "key_sha256": key,
+        }
+    audit = state["audit"]
+    entries = state["entries"]
+    audit["requests"] += 1
+    if key in entries:
+        audit["hits"] += 1
+        return copy.deepcopy(entries[key]), {
+            "schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+            "status": "hit",
+            "key_sha256": key,
+        }
+    audit["misses"] += 1
+    try:
+        result = producer()
+    except BaseException:
+        audit["errors"] += 1
+        raise
+    entries[key] = copy.deepcopy(result)
+    return result, {
+        "schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+        "status": "miss",
+        "key_sha256": key,
+    }
+
+
+def new_gradient_stage_cache():
+    """Return one process-local cache shared by a single ``process_one`` run.
+
+    The cache deliberately has no disk persistence and is not global.  Its
+    entries are raw JSON-safe gradient-stage results, before clean-base turns
+    proposal masks into mutable assembly records.
+    """
+    return {
+        "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+        "entries": {},
+        "geometry_fit_cache": {},
+        "audit": {
+            "requests": 0,
+            "hits": 0,
+            "misses": 0,
+            "bypasses": 0,
+            "errors": 0,
+        },
+    }
+
+
+def _normalise_gradient_stage_cache(cache):
+    if cache is None:
+        return None
+    if not isinstance(cache, dict):
+        raise TypeError("gradient_stage_cache must be a dict or None")
+    if not cache:
+        cache.update(new_gradient_stage_cache())
+    if cache.get("schema") != GRADIENT_STAGE_CACHE_SCHEMA:
+        raise ValueError("unsupported gradient-stage cache schema")
+    entries = cache.get("entries")
+    geometry_fit_cache = cache.setdefault("geometry_fit_cache", {})
+    audit = cache.get("audit")
+    if (not isinstance(entries, dict)
+            or not isinstance(geometry_fit_cache, dict)
+            or not isinstance(audit, dict)):
+        raise ValueError("malformed gradient-stage cache")
+    for name in ("requests", "hits", "misses", "bypasses", "errors"):
+        audit[name] = int(audit.get(name, 0) or 0)
+    return cache
+
+
+def gradient_stage_cache_audit(cache):
+    """Return a JSON-safe, entry-free audit for the final conversion report."""
+    state = _normalise_gradient_stage_cache(cache)
+    if state is None:
+        return {
+            "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+            "scope": "disabled",
+            "requests": 0,
+            "hits": 0,
+            "misses": 0,
+            "bypasses": 0,
+            "errors": 0,
+            "entry_count": 0,
+            "keys_sha256": [],
+        }
+    result = {
+        "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+        "scope": "single_process_one",
+        **{name: int(state["audit"].get(name, 0) or 0)
+           for name in ("requests", "hits", "misses", "bypasses", "errors")},
+        "entry_count": len(state["entries"]),
+        "keys_sha256": sorted(str(key) for key in state["entries"]),
+    }
+    geometry_state = state.get("geometry_fit_cache") or {}
+    geometry_entries = geometry_state.get("entries") or {}
+    geometry_audit = geometry_state.get("audit") or {}
+    result["geometry_fit_cache"] = {
+        "schema": geometry_state.get("schema"),
+        **{name: int(geometry_audit.get(name, 0) or 0)
+           for name in ("requests", "hits", "misses", "stores", "errors")},
+        "entry_count": len(geometry_entries),
+        "keys_sha256": sorted(str(key) for key in geometry_entries),
+    }
+    result["post_fit_scene_cache"] = _post_fit_scene_cache_audit(state)
+    return result
+
+
+def _gradient_stage_cache_bypass(cache, reason):
+    state = _normalise_gradient_stage_cache(cache)
+    if state is not None:
+        state["audit"]["bypasses"] += 1
+    return {
+        "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+        "status": "bypassed",
+        "reason": str(reason),
+    }
+
+
+def _gradient_stage_cache_key(arrays, parameters, stage_callable,
+                              stage_schema):
+    """Hash every value that can affect the source-space stage result.
+
+    Array layout is normalised to C order, while name, dtype and shape remain
+    part of the contract.  Callable identity is intentionally process-local:
+    this cache must never be reused after a code reload or persisted to disk.
+    """
+    digest = hashlib.sha256()
+    callable_identity = {
+        "module": str(getattr(stage_callable, "__module__",
+                              type(stage_callable).__module__)),
+        "qualname": str(getattr(stage_callable, "__qualname__",
+                                getattr(stage_callable, "__name__",
+                                        type(stage_callable).__qualname__))),
+        "process_identity": id(stage_callable),
+    }
+    contract = {
+        "cache_schema": GRADIENT_STAGE_CACHE_SCHEMA,
+        "stage_schema": str(stage_schema),
+        "stage_callable": callable_identity,
+        "parameters": parameters,
+    }
+    header = json.dumps(
+        contract, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        allow_nan=False).encode("utf-8")
+    digest.update(len(header).to_bytes(8, "big"))
+    digest.update(header)
+    for name, value in arrays:
+        array = np.ascontiguousarray(np.asarray(value))
+        metadata = json.dumps({
+            "name": str(name),
+            "dtype": array.dtype.str,
+            "shape": list(array.shape),
+        }, ensure_ascii=True, sort_keys=True,
+            separators=(",", ":")).encode("ascii")
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+        payload = memoryview(array).cast("B")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest().upper()
+
+
+def _gradient_stage_cache_get_or_compute(cache, key, producer):
+    """Return an isolated stage result; failed producers are never cached."""
+    state = _normalise_gradient_stage_cache(cache)
+    if state is None:
+        return producer(), {
+            "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+            "status": "disabled",
+            "key_sha256": key,
+        }
+    audit = state["audit"]
+    entries = state["entries"]
+    audit["requests"] += 1
+    if key in entries:
+        audit["hits"] += 1
+        return copy.deepcopy(entries[key]), {
+            "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+            "status": "hit",
+            "key_sha256": key,
+        }
+    audit["misses"] += 1
+    try:
+        result = producer()
+    except BaseException:
+        audit["errors"] += 1
+        raise
+    # Store a detached copy.  The caller may subsequently decode masks or add
+    # assembly-only fields without mutating the value seen by a later candidate.
+    entries[key] = copy.deepcopy(result)
+    return result, {
+        "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+        "status": "miss",
+        "key_sha256": key,
+    }
+
+
+def _post_fit_scene_state(cache):
+    parent = _normalise_gradient_stage_cache(cache)
+    if parent is None:
+        return None
+    state = parent.setdefault("post_fit_scene_cache", {
+        "schema": POST_FIT_SCENE_CACHE_SCHEMA, "entries": {}, "bytes": 0,
+        "audit": {name: 0 for name in
+                  ("requests", "hits", "misses", "stores", "evictions", "errors", "bypasses")},
+    })
+    if (state.get("schema") != POST_FIT_SCENE_CACHE_SCHEMA
+            or not isinstance(state.get("entries"), dict)
+            or not isinstance(state.get("audit"), dict)):
+        raise ValueError("malformed post-fit-scene cache")
+    return state
+
+
+def _post_fit_scene_cache_audit(cache):
+    state = _post_fit_scene_state(cache)
+    return {
+        "schema": POST_FIT_SCENE_CACHE_SCHEMA,
+        "scope": "single_process_one" if state is not None else "disabled",
+        **({**state["audit"]} if state is not None else {}),
+        "entry_count": len(state["entries"]) if state is not None else 0,
+        "estimated_payload_bytes": state["bytes"] if state is not None else 0,
+        "maximum_entries": POST_FIT_SCENE_CACHE_MAX_ENTRIES,
+        "maximum_estimated_payload_bytes": POST_FIT_SCENE_CACHE_MAX_BYTES,
+        "keys_sha256": sorted(state["entries"]) if state is not None else [],
+        "identity_scope": "exact_svg_source_bytes_decoded_rgba_references_fields_parameters_callable",
+    }
+
+
+def _post_fit_cache_value(value):
+    """Typed exact fingerprints, including nested proposal masks and proofs."""
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            raise TypeError("object arrays are not cacheable")
+        array = np.ascontiguousarray(value)
+        return ["array", array.dtype.str, list(array.shape),
+                hashlib.sha256(array.tobytes()).hexdigest()]
+    if isinstance(value, np.generic):
+        return ["numpy_scalar", value.dtype.str, _post_fit_cache_value(value.item())]
+    if isinstance(value, dict):
+        rows = [[_post_fit_cache_value(k), _post_fit_cache_value(v)] for k, v in value.items()]
+        rows.sort(key=lambda row: json.dumps(row[0], sort_keys=True, ensure_ascii=True))
+        return ["dict", rows]
+    if isinstance(value, (list, tuple)):
+        return [type(value).__name__, [_post_fit_cache_value(v) for v in value]]
+    if isinstance(value, bytes):
+        return ["bytes", len(value), hashlib.sha256(value).hexdigest()]
+    if value is None or isinstance(value, (str, bool, int)):
+        return [type(value).__name__, value]
+    if isinstance(value, float) and math.isfinite(value):
+        return ["float", value.hex()]
+    raise TypeError("unsupported post-fit cache input type")
+
+
+def _post_fit_scene_key(operation, svg_text, source_path, processed_rgba,
+                        fields, parameters, stage_callable, native_reference_rgba=None):
+    raw = Path(source_path).read_bytes()
+    with Image.open(io.BytesIO(raw)) as image:
+        original = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    contract = _post_fit_cache_value({
+        "schema": POST_FIT_SCENE_CACHE_SCHEMA, "operation": operation,
+        "svg_utf8": svg_text.encode("utf-8"),
+        "source_path": str(Path(source_path).resolve()),
+        "source_file_bytes": raw, "source_decoded_rgba": original,
+        "processed_rgba": processed_rgba, "native_reference_rgba": native_reference_rgba,
+        "fields": fields, "parameters": parameters,
+        "callable": (str(getattr(stage_callable, "__module__", "")),
+                     str(getattr(stage_callable, "__qualname__", type(stage_callable).__qualname__)),
+                     id(stage_callable)),
+    })
+    return hashlib.sha256(json.dumps(contract, ensure_ascii=True,
+        separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
+
+
+def _post_fit_result_size(value):
+    """Conservative payload accounting, including nested arrays and reports."""
+    if isinstance(value, np.ndarray):
+        return 256 + value.nbytes
+    if isinstance(value, dict):
+        return 256 + sum(128 + _post_fit_result_size(k) + _post_fit_result_size(v)
+                         for k, v in value.items())
+    if isinstance(value, (tuple, list)):
+        return 256 + sum(64 + _post_fit_result_size(v) for v in value)
+    if isinstance(value, str):
+        return 128 + 4 * len(value)
+    if isinstance(value, bytes):
+        return 128 + len(value)
+    if value is None or isinstance(value, (bool, int, float, np.generic)):
+        return 128
+    raise TypeError("unsupported post-fit cache result type")
+
+
+def _cached_post_fit_scene(cache, *, operation, svg_text, source_path, processed_rgba,
+                           fields, parameters, stage_callable, producer,
+                           native_reference_rgba=None):
+    """Reuse only this job's identical full-scene transaction, never its neighbours.
+
+    Both successful and normal rejected results may be reused. Exceptions and
+    inputs changing during a transaction are not cached. Existing certificates
+    remain untouched; the separate cache record distinguishes reused evidence
+    from native validation executed during this invocation.
+    """
+    started = time.perf_counter()
+    state = _post_fit_scene_state(cache)
+    evidence = {"schema": POST_FIT_SCENE_CACHE_SCHEMA, "operation": operation,
+                "status": "disabled", "producer_executed": True,
+                "validation_reused_for_exact_inputs": False}
+    def finish(result):
+        evidence["invocation_elapsed_seconds"] = time.perf_counter() - started
+        return result, evidence
+    if state is None:
+        return finish(producer())
+    audit, entries = state["audit"], state["entries"]
+    audit["requests"] += 1
+    def key_now():
+        return _post_fit_scene_key(operation, svg_text, source_path, processed_rgba,
+            fields, parameters, stage_callable, native_reference_rgba)
+    try:
+        key = key_now()
+    except (OSError, TypeError, ValueError):
+        audit["bypasses"] += 1
+        evidence.update(status="bypassed", reason="exact_input_snapshot_unavailable")
+        return finish(producer())
+    evidence["key_sha256"] = key
+    if key in entries:
+        audit["hits"] += 1
+        entry = entries[key]
+        evidence.update(status="hit", producer_executed=False,
+            validation_reused_for_exact_inputs=True,
+            original_producer_elapsed_seconds=entry["producer_elapsed_seconds"])
+        return finish(copy.deepcopy(entry["value"]))
+    audit["misses"] += 1
+    evidence["status"] = "miss"
+    validation_started = time.perf_counter()
+    try:
+        result = producer()
+    except BaseException:
+        audit["errors"] += 1
+        raise
+    elapsed = time.perf_counter() - validation_started
+    evidence["original_producer_elapsed_seconds"] = elapsed
+    try:
+        if key_now() != key:
+            raise ValueError("inputs_changed_during_transaction")
+        size = _post_fit_result_size(result)
+        if size > POST_FIT_SCENE_CACHE_MAX_BYTES:
+            raise ValueError("result_exceeds_bounded_cache")
+        detached = copy.deepcopy(result)
+    except (OSError, TypeError, ValueError) as exc:
+        audit["bypasses"] += 1
+        evidence.update(stored=False, storage_reason=str(exc)[:160])
+        return finish(result)
+    while entries and (len(entries) >= POST_FIT_SCENE_CACHE_MAX_ENTRIES
+                       or state["bytes"] + size > POST_FIT_SCENE_CACHE_MAX_BYTES):
+        oldest = entries.pop(next(iter(entries)))
+        state["bytes"] -= oldest["size_bytes"]
+        audit["evictions"] += 1
+    entries[key] = {"value": detached, "size_bytes": size,
+                    "producer_elapsed_seconds": elapsed}
+    state["bytes"] += size
+    audit["stores"] += 1
+    evidence["stored"] = True
+    return finish(result)
 
 
 @dataclass
@@ -252,6 +718,13 @@ def _palette_fit_stats(uniq, w, cent):
 
 def _nearest_palette_labels(img, palette, chunk=131072):
     """Assign palette labels in bounded memory (20 colours can be sizeable)."""
+    if int(chunk) == 131072:
+        # The operation-level backend uses an integer WebGPU shader only for
+        # exactly representable RGB inputs and otherwise executes this same
+        # float32 NumPy contract.  Keeping the import local avoids any GPU
+        # package/driver startup on code paths that never label a palette.
+        from compute_backend import nearest_palette_labels
+        return nearest_palette_labels(img, palette)
     pixels = np.asarray(img, dtype=np.float32).reshape(-1, 3)
     palette = np.asarray(palette, dtype=np.float32).reshape(-1, 3)
     out = np.empty(len(pixels), dtype=np.int16)
@@ -623,7 +1096,19 @@ def _gradient_palette_hex(gradient):
         # A detected gradient is required to have real stops.  Failing here
         # is safer than leaking its routing sentinel into user-facing data.
         raise ValueError("gradient region has no real color stops")
-    _, rgb = min(stops, key=lambda stop: abs(float(stop[0]) - 0.5))
+    central = min(
+        stops,
+        key=lambda stop: abs(float(
+            stop.get("offset", 0.0) if isinstance(stop, dict) else stop[0])
+            - 0.5),
+    )
+    if isinstance(central, dict):
+        colour = central.get("color")
+        if isinstance(colour, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
+            return colour.lower()
+        rgb = central.get("rgb")
+    else:
+        _, rgb = central
     rgb = tuple(int(np.clip(round(float(v)), 0, 255)) for v in rgb)
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
@@ -1503,6 +1988,245 @@ def _detect_gradients(den, lab_all, vis_fill, palette, max_regions=8,
     return regions[:max_regions]
 
 
+def _gradient_region_from_proposal(proposal):
+    """Adapt a held-out paint + geometry proposal to the SVG assembler.
+
+    The source-space mask owns the paint object; its colour model and its
+    error-budgeted contour remain separate evidence.  Only compact evidence is
+    retained here so reports do not embed every optimiser candidate/sample.
+    """
+    from gradient_reconstruction_stage import decode_mask_rle
+
+    mask = decode_mask_rle(proposal["mask"])
+    model = dict(proposal.get("model") or {})
+    stops = [dict(stop) for stop in proposal.get("stops") or []]
+    geometry = dict(proposal.get("geometry") or {})
+    if model.get("type") not in {"linear", "radial"}:
+        raise ValueError("gradient proposal has no supported native model")
+    if not 2 <= len(stops) <= 5:
+        raise ValueError("gradient proposal must contain 2 to 5 stops")
+    path = geometry.get("path") or proposal.get("path") or ""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("gradient proposal has no vector geometry")
+    error_budget = dict(geometry.get("error_budget") or {})
+    budget = error_budget.get("requested_max_percent")
+    p95_error = error_budget.get("actual_p95_error_percent")
+    max_error = error_budget.get("actual_max_error_percent")
+    evidence_values = (budget, p95_error, max_error)
+    if (error_budget.get("passed") is not True
+            or any(isinstance(value, bool) or not isinstance(
+                value, (int, float)) or not math.isfinite(float(value))
+                   for value in evidence_values)
+            or float(budget) <= 0.0
+            or float(p95_error) < 0.0
+            or float(max_error) < 0.0
+            or float(p95_error) > float(budget) + 1e-7
+            or float(max_error) > 3.0 * float(budget) + 1e-7):
+        raise ValueError(
+            "gradient proposal has incomplete or invalid geometry error evidence")
+    from native_geometry_contract import whole_object_native_primitive
+
+    native = list(geometry.get("native_primitives") or [])
+    whole_native = whole_object_native_primitive(geometry, path)
+    compact_geometry = {
+        "solver": geometry.get("solver"),
+        "primitive_first": bool(geometry.get("primitive_first")),
+        "native_primitives": native,
+        "native_whole_object_path": path if whole_native else None,
+        "primitive_complexity": geometry.get("primitive_complexity") or {},
+        "topology": geometry.get("topology") or {},
+        "selection_evidence": geometry.get("selection_evidence") or {},
+        "anchor_count": int(geometry.get("anchor_count") or 0),
+        "designer_anchor_count": int(
+            geometry.get("designer_anchor_count")
+            or geometry.get("anchor_count") or 0),
+        "segment_count": int(geometry.get("segment_count") or 0),
+        "anchors_before": int(geometry.get("anchors_before") or 0),
+        "error_budget": error_budget,
+        "lexicographic_objective": geometry.get(
+            "lexicographic_objective") or [],
+    }
+    region = {
+        "mask": mask,
+        "area": int(proposal.get("area") or mask.sum()),
+        "model": model,
+        "stops": stops,
+        "path_override": path,
+        "fill_rule": geometry.get("fill_rule") or proposal.get(
+            "fill_rule") or "evenodd",
+        "native_primitives": native,
+        "proposal_id": proposal.get("proposal_id"),
+        "candidate_id": proposal.get("candidate_id"),
+        "candidate_family": proposal.get("candidate_family"),
+        "confidence": float(proposal.get("confidence") or 0.0),
+        "enclosed_source_component_candidate": copy.deepcopy(
+            proposal.get("enclosed_source_component_candidate")),
+        "validation": {
+            "engine": "source_space_heldout_gradient_object",
+            "paint": proposal.get("heldout_evidence") or {},
+            "geometry": compact_geometry,
+            "selection": proposal.get("selection") or {},
+        },
+    }
+    # Top-level legacy coordinates remain available to older preview/report
+    # readers while the authoritative model stays intact.
+    if model["type"] == "linear":
+        for name in ("x1", "y1", "x2", "y2"):
+            region[name] = float(model[name])
+    return region
+
+
+def _recover_unowned_gradient_residuals(entries, labels, visible, gradient_regions,
+                                        palette_count, *, proven_preexisting=None):
+    """Explicitly trace palette ink omitted outside all gradient ownership.
+
+    A gradient can absorb virtually the entire image, leaving a handful of
+    one-pixel antialias colours that VTracer's speckle filter drops.  Keep the
+    ink-loss gate: reconstruct the missing ink instead of waiving that gate or
+    pretending that a placeholder routing colour represents it.
+    """
+    if not gradient_regions:
+        return [], 0
+    from trace_engine import binary_mask_to_compound_path
+
+    residual = np.asarray(visible, dtype=bool).copy()
+    owned = np.zeros_like(residual)
+    for region in gradient_regions:
+        owned |= np.asarray(region["mask"], dtype=bool)
+    residual &= ~owned
+    if proven_preexisting is not None:
+        preexisting = np.asarray(proven_preexisting, dtype=bool)
+        if preexisting.shape != residual.shape:
+            raise ValueError("gradient residual provenance shape mismatch")
+        residual &= ~preexisting
+    emitted = {entry["color"] for entry in entries}
+    recovered, pixels, unrelated_fragments = [], 0, 0
+    for raw_index in np.unique(labels[residual]):
+        index = int(raw_index)
+        if index in emitted or index < 0 or index >= palette_count:
+            continue
+        mask = residual & (labels == index)
+        ys, xs = np.nonzero(mask)
+        if not len(xs):
+            continue
+        # Pad the crop explicitly even on a source-canvas edge, so a one-pixel
+        # residual retains a closed boundary instead of becoming a trace edge.
+        x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+        local = np.pad(mask[y0:y1, x0:x1], 1)
+        traced = binary_mask_to_compound_path(
+            local, simplify=0.0, min_area=0.0, smooth=0.0, curve=0.0)
+        if traced.get("path"):
+            consumed = int(np.count_nonzero(owned & (labels == index)))
+            fragments = len(_parse_subpaths(traced["path"]))
+            if not consumed:
+                # An unrelated palette colour already omitted by tracing is
+                # not a consequence of gradient ownership. Only a bounded
+                # handful of scraps may be recovered opportunistically; never
+                # turn pre-existing antialias noise into hundreds of paths or
+                # withdraw unrelated gradient objects because of that noise.
+                if unrelated_fragments + fragments > 8:
+                    continue
+                unrelated_fragments += fragments
+            recovered.append({"color": index,
+                              "raw": _bake_translate(traced["path"], x0 - 1, y0 - 1)})
+            pixels += int(len(xs))
+    return recovered, pixels
+
+
+def _proven_light_compartment_exclusions(shape, main_recovery):
+    excluded = np.ones(shape, dtype=bool)
+    height, width = shape
+    for record in main_recovery.get("records", []):
+        if record.get("kind") != "enclosed_background_compartment":
+            continue
+        x0, y0, x1, y1 = record["bbox_xyxy"]
+        if 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height:
+            excluded[y0:y1, x0:x1] = False
+    return excluded
+
+
+def _gradient_residual_fragmentation(entries, labels, visible, regions,
+                                     maximum_fragments=8):
+    """Withdraw replacements that would require many new disconnected scraps.
+
+    This is a bounded editing-complexity policy, not a claim about human time.
+    A source colour which the ordinary tracer omitted must not be recovered as
+    hundreds of selectable pixels merely to keep a gradient proposal alive.
+    Withdraw only proposals consuming those fragmented source colours, then
+    rerun the ordinary tracer with their original palette pixels restored.
+    """
+    counts = {}
+    for entry in entries:
+        counts[int(entry["color"])] = len(_parse_subpaths(entry["raw"]))
+    excessive = {index: count for index, count in counts.items()
+                 if count > maximum_fragments}
+    if sum(counts.values()) > maximum_fragments and not excessive:
+        excessive = counts
+    if not excessive:
+        return None
+    residual = np.asarray(visible, dtype=bool).copy()
+    for region in regions:
+        residual &= ~np.asarray(region["mask"], dtype=bool)
+    residual &= np.isin(labels, list(excessive))
+    # Attribute the scraps locally. The same palette colour may also appear
+    # in unrelated gradients; withdrawing every consumer would unnecessarily
+    # discard safe objects elsewhere on the canvas.
+    neighbourhood = np.asarray(Image.fromarray(
+        residual.astype(np.uint8) * 255, "L").filter(ImageFilter.MaxFilter(3))) > 0
+    owners = []
+    for region in regions:
+        candidate_id = region.get("candidate_id")
+        mask = np.asarray(region["mask"], dtype=bool)
+        consumed = sum(int(np.count_nonzero(mask & (labels == index)))
+                       for index in excessive)
+        if candidate_id and consumed:
+            owners.append({"candidate_id": str(candidate_id),
+                           "adjacent_residual_pixels": int(np.count_nonzero(mask & neighbourhood)),
+                           "consumed_palette_pixels": consumed})
+    if not owners:
+        return None
+    owners.sort(key=lambda row: (-row["adjacent_residual_pixels"],
+                                -row["consumed_palette_pixels"], row["candidate_id"]))
+    return {
+        "reason": "gradient_replacement_requires_fragmented_palette_residuals",
+        "candidate_ids": [owners[0]["candidate_id"]] if owners else [],
+        "attribution_candidates": owners,
+        "residual_fragments": sum(counts.values()),
+        "maximum_recovered_fragments": int(maximum_fragments),
+        "palette_fragment_counts": {str(k): v for k, v in sorted(counts.items())},
+        "action": "withdraw_gradient_and_retrace_original_palette",
+        "human_time_saving_claimed": False,
+    }
+
+
+def _withdraw_gradient_proposals(stage, withdrawals):
+    """Keep the final certificate aligned with the actually emitted set."""
+    if not withdrawals:
+        return stage
+    result = copy.deepcopy(stage)
+    blocked = {item for record in withdrawals for item in record["candidate_ids"]}
+    proposals = [p for p in result.get("proposals", [])
+                 if str(p.get("candidate_id")) not in blocked]
+    result["proposals"] = proposals
+    result["status"] = "proposed" if proposals else "skipped"
+    for decision in result.get("decisions", []):
+        if (decision.get("status") == "selected"
+                and str(decision.get("candidate_id")) in blocked):
+            decision["status"] = "withdrawn"
+            decision["reasons"] = list(decision.get("reasons") or []) + [
+                "gradient_replacement_requires_fragmented_palette_residuals"]
+    summary = result.setdefault("summary", {})
+    summary.update({
+        "objects_selected": len(proposals),
+        "covered_pixels": sum(int(p.get("area") or 0) for p in proposals),
+        "pair_objects_selected": sum(p.get("candidate_family") == "pair" for p in proposals),
+        "total_anchors": sum(int((p.get("economy") or {}).get("anchors_after") or 0) for p in proposals),
+        "total_segments": sum(int((p.get("economy") or {}).get("segment_count") or 0) for p in proposals),
+        "fragmentation_withdrawn_objects": len(blocked),
+    })
+    return result
+
+
 # ---------- Main pipeline ----------
 
 def _iter_svg_paths(raw):
@@ -1638,26 +2362,14 @@ def _broad_enclosed_background_mask(visible, bg_like, enclosure):
     return selected
 
 
-def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
-                     regularize=True, flat_out=None,
-                     background="auto", max_size=0, geometry=None,
-                     strokes="on", gradients="on"):
-    """Convert a bitmap into a grouped, optionally regularized SVG.
+def _produce_pre_gradient_state(src, *, forced_colors, white_threshold,
+                                background, max_size, strokes, checkpoint):
+    """Build the exact stroke-aware state immediately before gradients.
 
-    background: "auto" (heuristic removal of light border-connected
-                background), "keep" (never remove), "transparent" (force
-                removal of light border-connected regions).
-    max_size:   downscale the longest image side before tracing (0 = off).
-                The SVG width/height still reflect the original size.
-    geometry:   "off" | "conservative" | "normal". If None, falls back to
-                the legacy boolean `regularize` (True -> "normal").
+    The returned value is deliberately self-contained: callers may deep-copy
+    it between serial candidate builds without sharing any mutable array,
+    stroke object, note list or audit dictionary.
     """
-    src, dst = Path(src), Path(dst)
-    if geometry is None:
-        geometry = "normal" if regularize else "off"
-    if geometry not in ("off", "conservative", "normal"):
-        raise ValueError(f"invalid geometry level: {geometry!r}")
-
     im, (orig_w, orig_h), removed = _prepare_image(
         src, max_size=max_size, background=background,
         white_threshold=white_threshold, alpha_threshold=12,
@@ -1741,6 +2453,7 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         return out
 
     palette_opacity = _palette_opacities(visible, palette, lab_all)
+    checkpoint("stroke_analysis", "正在辨識可編輯筆畫與保留細節色彩")
 
     # Monoline stroke reconstruction: uniform-width line work becomes real
     # strokes (center line + stroke-width) instead of filled outline pairs.
@@ -1750,10 +2463,22 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     stroke_list = []
     stroke_mask = np.zeros((H, W), dtype=bool)
     stroke_deferred_mask = np.zeros((H, W), dtype=bool)
+    stroke_safety_audit = {
+        "policy": "native_straight_caps_and_whole_ink_palette_components",
+        "source_ink_coverage_minimum": .98,
+        "palette_fragment_candidate_pixels_deferred": 0,
+        "native_cap_validated_strokes": 0,
+        "complex_strokes_without_native_cap_proof": 0,
+        "closed_strokes_without_native_geometry_fit": 0,
+    }
     bg_col = (255.0, 255.0, 255.0)
     if strokes != "off":
         try:
-            from stroke_engine import extract_strokes
+            from stroke_engine import extract_strokes, connected_components, _dilate_one
+            # Source cap/width evidence must use native pixels, including when
+            # the trace mask was resized or its background made transparent.
+            with Image.open(src) as original_image:
+                stroke_source_rgba = np.asarray(original_image.convert("RGBA"))
 
             def _stroke_result(value):
                 # Three values are the Beta.4 contract.  Accept the former
@@ -1774,22 +2499,61 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                                          den[:, 0], den[:, -1]])
                 bg_col = tuple(np.median(border, axis=0))
             ink = visible & (((den - np.asarray(bg_col, dtype=np.float32)) ** 2)
-                             .sum(axis=2) > 60 ** 2)
+                             .sum(axis=2) > 24 ** 2)
             s_a, m_a, d_a = _stroke_result(
                 extract_strokes(ink, den, palette, bg_col,
-                                alpha=source_alpha))
+                                alpha=source_alpha, source_rgba=stroke_source_rgba,
+                                audit=stroke_safety_audit))
             stroke_list += s_a
             stroke_mask |= m_a
             stroke_deferred_mask |= d_a
             if _allow_palette_tier_b_strokes(palette_audit):
+                whole_ink_labels, _ = connected_components(ink)
+                whole_ink_areas = np.bincount(whole_ink_labels.ravel())
                 for ci in range(len(palette)):
                     cm = (visible & ~stroke_mask & ~stroke_deferred_mask
                           & (lab_all == ci))
                     if not cm.any() or cm.sum() > 0.35 * H * W:
                         continue
+                    # A colour-cluster ribbon may be just the AA outline of a
+                    # filled object. It cannot claim stroke ownership unless
+                    # it represents practically the entire original ink
+                    # component. Otherwise preserve the fill, including its
+                    # gaps/corners, instead of rounding one colour fragment.
+                    covered = np.bincount(whole_ink_labels[cm], minlength=len(whole_ink_areas))
+                    eligible = covered >= np.maximum(1, whole_ink_areas) * .98
+                    eligible[0] = False
+                    allowed = _dilate_one(eligible[whole_ink_labels])
+                    # A real solid line may sit on another filled shape. It
+                    # gets a separate bounded attempt only when this palette
+                    # component has a two-pixel-eroded solid core; thin AA
+                    # outlines cannot qualify. Every recovered stroke must
+                    # subsequently carry the native palette-occupancy proof.
+                    exceptional=cm & ~allowed
+                    if exceptional.any():
+                        core=exceptional.copy()
+                        for _ in range(2):
+                            p=np.pad(core,1)
+                            core=np.logical_and.reduce([p[dy:dy+H,dx:dx+W]
+                                for dy in range(3) for dx in range(3)])
+                        if int(core.sum())>=16:
+                            found,owned,deferred=_stroke_result(extract_strokes(
+                                exceptional,den,palette,bg_col,alpha=source_alpha,
+                                source_rgba=stroke_source_rgba,audit=stroke_safety_audit))
+                            if found and all(getattr(s,'source_fit',{}).get('policy')==
+                                    'native_discrete_palette_line_occupancy' for s in found):
+                                stroke_list+=found
+                                stroke_mask|=owned
+                                cm &= ~owned
+                    rejected = int((cm & ~allowed).sum())
+                    stroke_safety_audit["palette_fragment_candidate_pixels_deferred"] += rejected
+                    cm &= allowed
+                    if not cm.any():
+                        continue
                     s_b, m_b, d_b = _stroke_result(
                         extract_strokes(cm, den, palette, bg_col,
-                                        alpha=source_alpha))
+                                        alpha=source_alpha, source_rgba=stroke_source_rgba,
+                                        audit=stroke_safety_audit))
                     stroke_list += s_b
                     stroke_mask |= m_b
                     stroke_deferred_mask |= d_b
@@ -1803,6 +2567,24 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
             stroke_deferred_mask[:] = False
             pre_notes.append(f"stroke engine disabled by error: {e!r}"[:160])
 
+    stroke_safety_audit["native_cap_validated_strokes"] = sum(
+        bool(getattr(s, "source_fit", {}).get("serialized_geometry_validated")) for s in stroke_list)
+    stroke_safety_audit["complex_strokes_without_native_cap_proof"] = sum(
+        not getattr(s, "closed", False) and not getattr(s, "primitive", "")
+        and not getattr(s, "source_fit", {}).get("serialized_geometry_validated") for s in stroke_list)
+    # Closed outlines have no endpoints. Their geometry still needs the
+    # ordinary scene checks, but an absent cap proof is not a failure there.
+    stroke_safety_audit["closed_strokes_without_native_geometry_fit"] = sum(
+        (getattr(s, "closed", False) or bool(getattr(s, "primitive", "")))
+        and not getattr(s, "source_fit", {}).get("serialized_geometry_validated") for s in stroke_list)
+    if stroke_safety_audit["palette_fragment_candidate_pixels_deferred"]:
+        pre_notes.append("palette fragments not covering their whole source ink component "
+                         "retained as fills; antialias outlines are not editable strokes")
+    if stroke_safety_audit["complex_strokes_without_native_cap_proof"]:
+        pre_notes.append("complex strokes lack native-source endpoint proof; manual review required")
+
+    checkpoint("stroke_analysis_complete", "筆畫分析完成")
+
     # Recover the true core color (and sub-pixel trace width) from the
     # original-resolution source when max_size downsampling turned a 1 px
     # black line into a gray trace-scale pixel.
@@ -1815,6 +2597,8 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
             sx, sy = orig_w / float(W), orig_h / float(H)
             trace_scale = (W / float(orig_w) + H / float(orig_h)) / 2.0
             for s in stroke_list:
+                if getattr(s, "source_fit", {}).get("serialized_geometry_validated"):
+                    continue  # native width/colour/caps were already jointly proven
                 pts = s.sample_points
                 if not pts:
                     continue
@@ -1952,26 +2736,311 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     if isinstance(palette_audit, dict):
         palette_audit["initial_accent_retention"] = accent_retention_audit
         palette_audit["linear_detail_stabilization"] = linear_detail_audit
+        palette_audit["stroke_reconstruction"] = stroke_safety_audit
+    # This alternative estimates colours independently of accepted strokes.
+    # It never changes flat tracing, fill ownership, opacity or stroke output.
+    # The gradient stage may inspect its paired labels under the same total
+    # candidate budget; source paint and geometry gates still decide delivery.
+    sampling_hypothesis = None
+    from palette_sampling import independent_sampling_mask
+    sampling_mask, sampling_audit = independent_sampling_mask(
+        den, visible, background_counter_mask)
+    if forced_colors:
+        sampling_audit.update(status="baseline", reason="explicit_color_count")
+    elif sampling_audit["status"] == "proposed":
+        sampling_palette, _, sampling_estimator_audit = detect_palette(
+            den_palette, sampling_mask, forced=0,
+            return_audit=True, return_labels=False)
+        sampling_labels = _assign(den, sampling_palette)
+        sampling_palette, sampling_labels, sampling_accent_audit = (
+            _retain_initial_accent_colors(
+                den, sampling_mask, initial_palette,
+                sampling_palette, sampling_labels))
+        if (np.array_equal(sampling_palette, palette)
+                and np.array_equal(sampling_labels, lab_all)):
+            sampling_audit.update(status="baseline", reason="identical_palette_and_labels")
+        else:
+            sampling_hypothesis = {"palette": sampling_palette,
+                                   "lab_all": sampling_labels}
+        sampling_audit["estimator"] = sampling_estimator_audit
+        sampling_audit["accent_retention"] = sampling_accent_audit
+    palette_audit["independent_gradient_sampling"] = sampling_audit
     palette_opacity = _palette_opacities(vis_fill, palette, lab_all)
+    checkpoint("flat_reference", "正在建立扁平化品質參考")
 
-    # flat reference for self-check keeps EVERYTHING (fills + strokes)
+    # The exact encoded bytes are retained so every cache hit can restore the
+    # same candidate-validation artifact without invoking Pillow again.
     flat = palette[lab_all]
-    if flat_out:
-        flat_alpha = np.where(visible, source_alpha, 0).astype(np.uint8)
-        flat_rgba_full = np.dstack([flat, flat_alpha])
-        Image.fromarray(flat_rgba_full, "RGBA").save(flat_out)
+    flat_alpha = np.where(visible, source_alpha, 0).astype(np.uint8)
+    flat_rgba_full = np.dstack([flat, flat_alpha])
+    flat_png = io.BytesIO()
+    Image.fromarray(flat_rgba_full, "RGBA").save(flat_png, format="PNG")
 
-    # Gradient banding reconstruction: adjacent flat bands that were one
-    # smooth ramp in the source are merged, painted with a unique placeholder
-    # color so vtracer traces the union in the correct stack position, and
-    # emitted as ONE path filled with a real <linearGradient>.
+    return {
+        "orig_w": orig_w,
+        "orig_h": orig_h,
+        "removed": removed,
+        "source_alpha": source_alpha,
+        "visible": visible,
+        "H": H,
+        "W": W,
+        "pre_notes": pre_notes,
+        "den": den,
+        "palette": palette,
+        "lab_all": lab_all,
+        "palette_opacity": palette_opacity,
+        "stroke_list": stroke_list,
+        "bg_col": bg_col,
+        "hole_mask": hole_mask,
+        "vis_fill": vis_fill,
+        "palette_audit": palette_audit,
+        "flat": flat,
+        "flat_png_bytes": flat_png.getvalue(),
+        "sampling_hypothesis": sampling_hypothesis,
+    }
+
+
+def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
+                     regularize=True, flat_out=None,
+                     background="auto", max_size=0, geometry=None,
+                     strokes="on", gradients="on",
+                     curve_error_percent=0.25,
+                     gradient_stage_cache=None,
+                     progress=None, control=None,
+                     pre_gradient_state_cache=None,
+                     _gradient_withdrawals=(), _gradient_retry_state=None,
+                     _residual_scene_probe=True):
+    """Convert a bitmap into a grouped, optionally regularized SVG.
+
+    background: "auto" (heuristic removal of light border-connected
+                background), "keep" (never remove), "transparent" (force
+                removal of light border-connected regions).
+    max_size:   downscale the longest image side before tracing (0 = off).
+                The SVG width/height still reflect the original size.
+    geometry:   "off" | "conservative" | "normal". If None, falls back to
+                the legacy boolean `regularize` (True -> "normal").
+    curve_error_percent: object-bbox-normalised p95 geometry budget used by
+                 curve and native gradient-object reconstruction.
+    gradient_stage_cache: optional process-local cache created once by
+                 ``vector_cleanroom.process_one`` and shared only among that
+                 image's candidate builds.
+    pre_gradient_state_cache: optional process-local exact cache for the
+                 stroke-aware state immediately before gradient reconstruction.
+    """
+    src, dst = Path(src), Path(dst)
+
+    def _checkpoint(substage, detail=""):
+        if control is not None:
+            control.checkpoint(f"candidate_build:{substage}")
+        if progress is not None:
+            event = {
+                "stage": "candidate_build",
+                "substage": str(substage),
+                "detail": str(detail),
+            }
+            if control is not None and hasattr(control, "snapshot"):
+                event.update(control.snapshot())
+                event["stage"] = "candidate_build"
+                event["substage"] = str(substage)
+            progress(event)
+
+    _checkpoint("prepare_source", "正在清理背景與建立來源遮罩")
+    if geometry is None:
+        geometry = "normal" if regularize else "off"
+    if geometry not in ("off", "conservative", "normal"):
+        raise ValueError(f"invalid geometry level: {geometry!r}")
+    curve_error_percent = float(curve_error_percent)
+    if (not math.isfinite(curve_error_percent)
+            or not 0.05 <= curve_error_percent <= 2.0):
+        raise ValueError("curve_error_percent must be between 0.05 and 2.0")
+
+    pre_gradient_parameters = {
+        "forced_colors": int(forced_colors),
+        "white_threshold": int(white_threshold),
+        "background": str(background),
+        "max_size": int(max_size),
+        "strokes": str(strokes),
+    }
+    pre_gradient_key = None
+    if pre_gradient_state_cache is not None:
+        pre_gradient_key = _pre_gradient_state_cache_key(
+            src, pre_gradient_parameters, _produce_pre_gradient_state,
+            PRE_GRADIENT_STATE_CACHE_SCHEMA)
+
+    def _produce_prefix():
+        return _produce_pre_gradient_state(
+            src, forced_colors=forced_colors,
+            white_threshold=white_threshold, background=background,
+            max_size=max_size, strokes=strokes, checkpoint=_checkpoint)
+
+    if _gradient_retry_state is None:
+        pre_gradient_state, pre_gradient_cache_evidence = (
+            _pre_gradient_state_cache_get_or_compute(
+                pre_gradient_state_cache, pre_gradient_key, _produce_prefix))
+    else:
+        pre_gradient_state = copy.deepcopy(_gradient_retry_state["prefix"])
+        pre_gradient_cache_evidence = {
+            "schema": PRE_GRADIENT_STATE_CACHE_SCHEMA,
+            "status": "fragmentation_retry_exact_reuse"}
+    retry_prefix = copy.deepcopy(pre_gradient_state) if gradients != "off" else None
+    original_gradient_stage = None
+    orig_w = pre_gradient_state["orig_w"]
+    orig_h = pre_gradient_state["orig_h"]
+    removed = pre_gradient_state["removed"]
+    source_alpha = pre_gradient_state["source_alpha"]
+    visible = pre_gradient_state["visible"]
+    H = pre_gradient_state["H"]
+    W = pre_gradient_state["W"]
+    pre_notes = pre_gradient_state["pre_notes"]
+    den = pre_gradient_state["den"]
+    palette = pre_gradient_state["palette"]
+    lab_all = pre_gradient_state["lab_all"]
+    palette_opacity = pre_gradient_state["palette_opacity"]
+    stroke_list = pre_gradient_state["stroke_list"]
+    bg_col = pre_gradient_state["bg_col"]
+    hole_mask = pre_gradient_state["hole_mask"]
+    vis_fill = pre_gradient_state["vis_fill"]
+    palette_audit = pre_gradient_state["palette_audit"]
+    flat = pre_gradient_state["flat"]
+    sampling_hypothesis = pre_gradient_state.get("sampling_hypothesis")
+    if isinstance(palette_audit, dict):
+        palette_audit["pre_gradient_state_cache"] = (
+            pre_gradient_cache_evidence)
+    if flat_out:
+        Path(flat_out).write_bytes(pre_gradient_state["flat_png_bytes"])
+
+    _checkpoint("gradient_reconstruction", "正在驗證原生漸層候選")
+
+    # Gradient-object reconstruction is intentionally source-space first:
+    # held-out colour evidence selects one bounded native paint model, while a
+    # separate normalised geometry contract minimises anchors.  Palette bands
+    # are never treated as the desired object boundaries.
     grad_regions = []
+    gradient_reconstruction_audit = {
+        "status": "disabled" if gradients == "off" else "skipped",
+        "summary": {},
+        "cache": (_gradient_stage_cache_bypass(
+            gradient_stage_cache, "gradients_off")
+            if gradients == "off" else {
+                "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+                "status": "pending",
+            }),
+    }
     if gradients != "off" and vis_fill.any():
+        cache_evidence = {
+            "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+            "status": "error",
+        }
         try:
-            grad_regions = _detect_gradients(den, lab_all, vis_fill, palette)
+            from gradient_reconstruction_stage import (
+                SCHEMA as GRADIENT_RECONSTRUCTION_SCHEMA,
+                propose_gradient_reconstruction,
+            )
+            from palette_sampling import (
+                discover_with_sampling_hypothesis, SCHEMA as SAMPLING_SCHEMA)
+            stage_parameters = {
+                "geometry_error_percent": curve_error_percent,
+                "geometry_smooth": 0.55,
+                "max_candidates": 48,
+                "max_geometry_candidates": 16,
+                "max_objects": 8,
+                "max_segments_per_object": 4096,
+                "selection_beam_width": 256,
+                "candidate_options": None,
+                "model_options": None,
+            }
+            cache_state = _normalise_gradient_stage_cache(
+                gradient_stage_cache)
+            shared_geometry_fit_cache = (
+                cache_state["geometry_fit_cache"]
+                if cache_state is not None else None)
+            try:
+                with Image.open(src) as original_image:
+                    original_source_rgba = np.asarray(original_image.convert("RGBA"), dtype=np.uint8)
+            except OSError:
+                original_source_rgba = None
+            # Keep the key tied to the exact arrays presented to the stage,
+            # not merely the source path or high-level candidate options.
+            cache_key = _gradient_stage_cache_key((
+                ("den", den),
+                ("lab_all", lab_all),
+                ("vis_fill", vis_fill),
+                ("palette", palette),
+                ("source_alpha", source_alpha),
+                ("original_source_rgba", original_source_rgba),
+                ("sampling_palette", (sampling_hypothesis or {}).get(
+                    "palette", np.zeros(1, dtype=np.uint8))),
+                ("sampling_labels", (sampling_hypothesis or {}).get(
+                    "lab_all", np.zeros(1, dtype=np.int32))),
+            ), stage_parameters, propose_gradient_reconstruction,
+                GRADIENT_RECONSTRUCTION_SCHEMA + ":" + SAMPLING_SCHEMA)
+
+            def _produce_gradient_stage():
+                discovery_kwargs = {}
+                if sampling_hypothesis is not None:
+                    def sampling_provider(*args, **kwargs):
+                        return discover_with_sampling_hypothesis(
+                            *args, hypothesis=sampling_hypothesis, **kwargs)
+                    discovery_kwargs["candidate_provider"] = sampling_provider
+                return propose_gradient_reconstruction(
+                    den,
+                    lab_all,
+                    vis_fill,
+                    palette,
+                    alpha=source_alpha,
+                    original_source_rgba=original_source_rgba,
+                    geometry_fit_cache=shared_geometry_fit_cache,
+                    progress=progress,
+                    control=control,
+                    **discovery_kwargs,
+                    **stage_parameters,
+                )
+
+            if _gradient_retry_state is None:
+                original_gradient_stage, cache_evidence = (
+                    _gradient_stage_cache_get_or_compute(
+                        gradient_stage_cache, cache_key,
+                        _produce_gradient_stage))
+            else:
+                original_gradient_stage = _gradient_retry_state["stage"]
+                cache_evidence = {
+                    "schema": GRADIENT_STAGE_CACHE_SCHEMA,
+                    "status": "fragmentation_retry_exact_reuse"}
+            gradient_stage = _withdraw_gradient_proposals(
+                original_gradient_stage, _gradient_withdrawals)
+            grad_regions = [
+                _gradient_region_from_proposal(proposal)
+                for proposal in gradient_stage.get("proposals", [])
+            ]
+            gradient_reconstruction_audit = {
+                "schema": gradient_stage.get("schema"),
+                "status": gradient_stage.get("status"),
+                "summary": gradient_stage.get("summary") or {},
+                "objective": gradient_stage.get("objective") or {},
+                "parameters": gradient_stage.get("parameters") or {},
+                "decisions": gradient_stage.get("decisions") or [],
+                "fragmentation_withdrawals": list(_gradient_withdrawals),
+                "cache": cache_evidence,
+            }
+        except ConversionInterrupted:
+            raise
         except Exception as e:
             grad_regions = []
-            pre_notes.append(f"gradient detection disabled by error: {e!r}"[:160])
+            gradient_reconstruction_audit = {
+                "status": "error",
+                "summary": {},
+                "error": f"{type(e).__name__}: {e}"[:240],
+                "cache": cache_evidence,
+            }
+            pre_notes.append(
+                f"source-space gradient reconstruction failed closed: {e!r}"[:200])
+    elif gradients != "off":
+        gradient_reconstruction_audit["cache"] = (
+            _gradient_stage_cache_bypass(
+                gradient_stage_cache, "no_visible_fill"))
+    if isinstance(palette_audit, dict):
+        palette_audit["gradient_reconstruction"] = gradient_reconstruction_audit
+    _checkpoint("gradient_reconstruction_complete", "漸層候選驗證完成")
     grad_keys = []
     if grad_regions:
         try:
@@ -2002,8 +3071,24 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     # then remove only that temporary geometry after tracing.  The delivered
     # SVG remains transparent and the separate flat reference above retains
     # the source alpha exactly.
-    trace_opaque_background = bool((~vis_fill).any())
+    trace_vis_fill=vis_fill
     trace_rgb = flat.copy()
+    if any(getattr(s,'source_fit',{}).get('policy')=='native_discrete_palette_line_occupancy'
+           for s in stroke_list):
+        from stroke_engine import infer_occluded_flat_paint
+        with Image.open(src) as source_image:
+            native_rgba=np.asarray(source_image.convert('RGBA'))
+        support,support_paint=infer_occluded_flat_paint(
+            stroke_list,native_rgba,den,visible,vis_fill,palette)
+        if support.any():
+            trace_vis_fill=vis_fill|support
+            trace_rgb[support]=support_paint[support]
+            palette_audit['stroke_underpaint']={
+                'policy':'native_equal_flat_paint_on_both_normal_sides',
+                'inferred_occluded_working_pixels':int(support.sum()),
+                'original_reference_unchanged':True,
+                'scope':'trace_surrogate_only_requires_final_composed_scene_validation'}
+    trace_opaque_background = bool((~trace_vis_fill).any())
     trace_background_rgb = None
     trace_background_isolated = False
     if trace_opaque_background:
@@ -2026,10 +3111,10 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                 break
         if trace_background_rgb is None:
             trace_background_rgb = (255, 255, 255)
-        trace_rgb[~vis_fill] = trace_background_rgb
+        trace_rgb[~trace_vis_fill] = trace_background_rgb
         trace_alpha = np.full((H, W), 255, dtype=np.uint8)
     else:
-        trace_alpha = np.where(vis_fill, 255, 0).astype(np.uint8)
+        trace_alpha = np.where(trace_vis_fill, 255, 0).astype(np.uint8)
     flat_rgba = np.dstack([trace_rgb, trace_alpha])
 
     raw = ""
@@ -2043,6 +3128,7 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         # native-circle pass could simplify them.  Two pixels remains a small
         # noise guard while preserving design components for later validation.
         speckle = 2
+        _checkpoint("main_trace", "正在描摹主要向量輪廓")
         with tempfile.TemporaryDirectory() as td:
             flat_png = Path(td) / "flat.png"
             raw_svg = Path(td) / "raw.svg"
@@ -2055,6 +3141,33 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                 path_precision=6,
             )
             raw = raw_svg.read_text(encoding="utf-8")
+        try:
+            from trace_component_recovery import recover_missing_source_components
+
+            # vis_fill already excludes recovered strokes and removed
+            # background in the cached pre-gradient state.
+            recovery_excluded = ~np.asarray(vis_fill, dtype=bool)
+            for region in grad_regions:
+                recovery_excluded |= np.asarray(region["mask"], dtype=bool)
+            raw, component_recovery = recover_missing_source_components(
+                raw, flat_rgba, excluded_mask=recovery_excluded)
+            if component_recovery.get("recovered_count", 0):
+                pre_notes.append(
+                    f'{component_recovery["recovered_count"]} wholly omitted small '
+                    "source compartment(s) restored before normal render validation")
+        except ConversionInterrupted:
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            component_recovery = {
+                "schema": "ai-vector-cleanroom.trace-component-recovery/v1",
+                "status": "skipped_error", "recovered_count": 0,
+                "error": f"{type(exc).__name__}: {exc}"[:240],
+                "downstream_render_validation_required": True}
+            pre_notes.append("small source compartment recovery unavailable; "
+                             "original trace still requires normal source validation")
+        if isinstance(palette_audit, dict):
+            palette_audit["trace_component_recovery"] = component_recovery
+        _checkpoint("main_trace_complete", "主要向量輪廓完成")
 
     # Cutout tracing can encode white lettering as holes in a darker parent
     # instead of as white objects.  That looks correct on the normal white
@@ -2065,6 +3178,7 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     # so they can never leak into this recovery pass.
     light_overlay_entries = {}
     if trace_opaque_background and vis_fill.any():
+        _checkpoint("light_paint_trace", "正在保留透明背景上的淺色物件")
         gradient_owned = np.zeros_like(vis_fill)
         for region in grad_regions:
             gradient_owned |= np.asarray(region.get("mask"), dtype=bool)
@@ -2101,6 +3215,30 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                     splice_threshold=45, path_precision=6,
                 )
                 light_raw = mask_svg.read_text(encoding="utf-8")
+                try:
+                    from trace_component_recovery import recover_missing_source_components
+
+                    # Marker colours exaggerate antialias crumbs. Reopen only
+                    # source-white compartments already proven missing in the
+                    # real-colour main trace; never infer new marks here.
+                    light_excluded = _proven_light_compartment_exclusions(
+                        vis_fill.shape, component_recovery)
+                    light_raw, light_recovery = recover_missing_source_components(
+                        light_raw, binary_rgba, excluded_mask=light_excluded)
+                    if light_recovery.get("recovered_count", 0):
+                        pre_notes.append(
+                            f'{light_recovery["recovered_count"]} wholly omitted light '
+                            "source compartment(s) restored before normal render validation")
+                except ConversionInterrupted:
+                    raise
+                except (OSError, ValueError, RuntimeError) as exc:
+                    light_recovery = {
+                        "schema": "ai-vector-cleanroom.trace-component-recovery/v1",
+                        "status": "skipped_error", "recovered_count": 0,
+                        "error": f"{type(exc).__name__}: {exc}"[:240],
+                        "downstream_render_validation_required": True}
+                if isinstance(palette_audit, dict):
+                    palette_audit["light_trace_component_recovery"] = light_recovery
                 for d, fill, tx, ty in _iter_svg_paths(light_raw):
                     rgb = np.asarray(tuple(
                         int(fill[index:index + 2], 16)
@@ -2129,6 +3267,7 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                             "color": ci,
                             "raw": _bake_translate(d, tx, ty),
                         })
+        _checkpoint("light_paint_trace_complete", "淺色物件保留完成")
 
     pal_rgb = [tuple(int(v) for v in c) for c in palette]
     pal_opacity = list(palette_opacity)
@@ -2186,6 +3325,130 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         entries.extend(recovered)
         recovered_light_paths += len(recovered)
 
+    residual_entries, residual_pixels = _recover_unowned_gradient_residuals(
+        entries, lab_all, vis_fill, grad_regions, len(palette))
+    fragmentation = _gradient_residual_fragmentation(
+        residual_entries, lab_all, vis_fill, grad_regions)
+    if fragmentation:
+        # A consumed palette also occurs in unrelated antialias pixels. Before
+        # assigning its old trace scraps to any gradient, compare the actual
+        # no-gradient trace. Only exact unchanged remote 3x3 RGBA support can
+        # leave the recovery debt; changed/source-adjacent details remain.
+        from gradient_residual_provenance import prove_preexisting_residuals
+        owned = np.zeros_like(vis_fill, dtype=bool)
+        for region in grad_regions:
+            owned |= np.asarray(region["mask"], dtype=bool)
+        indices = [int(entry["color"]) for entry in residual_entries]
+        residual_mask = vis_fill & ~owned & np.isin(lab_all, indices)
+        baseline_rgb = pre_gradient_state["flat"].copy()
+        if trace_opaque_background:
+            baseline_rgb[~vis_fill] = trace_background_rgb
+        baseline_rgba = np.dstack((baseline_rgb, trace_alpha))
+        try:
+            preexisting, provenance = prove_preexisting_residuals(
+                raw, baseline_rgba, residual_mask, owned, visible=vis_fill, source_rgb=den)
+            palette_audit["gradient_residual_provenance"] = provenance
+            if preexisting.any():
+                residual_entries, residual_pixels = _recover_unowned_gradient_residuals(
+                    entries, lab_all, vis_fill, grad_regions, len(palette),
+                    proven_preexisting=preexisting)
+                fragmentation = _gradient_residual_fragmentation(
+                    residual_entries, lab_all, vis_fill, grad_regions)
+        except (OSError, ValueError, RuntimeError) as exc:
+            palette_audit["gradient_residual_provenance"] = {
+                "status": "unavailable_original_recovery_policy_retained",
+                "reason": str(exc)[:240]}
+    residual_scene_counterfactual = None
+    if fragmentation and fragmentation["candidate_ids"]:
+        already_withdrawn = {item for record in _gradient_withdrawals
+                             for item in record["candidate_ids"]}
+        if set(fragmentation["candidate_ids"]) - already_withdrawn:
+            _checkpoint("gradient_fragmentation_rollback",
+                        "正在比較漸層與原始色層，確認是否真的增加碎片")
+            if not _residual_scene_probe:
+                return build_clean_base(
+                    src, dst, forced_colors=forced_colors,
+                    white_threshold=white_threshold, regularize=regularize,
+                    flat_out=flat_out, background=background, max_size=max_size,
+                    geometry=geometry, strokes=strokes, gradients=gradients,
+                    curve_error_percent=curve_error_percent,
+                    gradient_stage_cache=gradient_stage_cache, progress=progress,
+                    control=control, pre_gradient_state_cache=pre_gradient_state_cache,
+                    _gradient_withdrawals=(*_gradient_withdrawals, fragmentation),
+                    _gradient_retry_state={"prefix": retry_prefix, "stage": original_gradient_stage},
+                    _residual_scene_probe=False)
+            with tempfile.TemporaryDirectory() as baseline_dir:
+                baseline_svg = Path(baseline_dir) / "baseline.svg"
+                baseline_stats = build_clean_base(
+                src, baseline_svg, forced_colors=forced_colors,
+                white_threshold=white_threshold, regularize=regularize,
+                flat_out=flat_out, background=background, max_size=max_size,
+                geometry=geometry, strokes=strokes, gradients=gradients,
+                curve_error_percent=curve_error_percent,
+                gradient_stage_cache=gradient_stage_cache, progress=progress,
+                control=control, pre_gradient_state_cache=pre_gradient_state_cache,
+                _gradient_withdrawals=(*_gradient_withdrawals, fragmentation),
+                _gradient_retry_state={"prefix": retry_prefix,
+                                       "stage": original_gradient_stage},
+                _residual_scene_probe=False)
+                residual_scene_counterfactual = {
+                    "svg": baseline_svg.read_text(encoding="utf8"), "stats": baseline_stats,
+                    "fragmentation": fragmentation, "residual_mask": residual_mask}
+            # The candidate is tentative. It may omit recovery scraps only
+            # if its complete final native rendering proves them unchanged;
+            # otherwise the counterfactual's exact SVG and stats win below.
+            residual_entries, residual_pixels = [], 0
+
+    def _span_scene_search_summary():
+        scenes = []
+        audits = [("assembled_candidate", palette_audit)]
+        if residual_scene_counterfactual is not None:
+            audits.insert(0, ("withdrawal_counterfactual", residual_scene_counterfactual["stats"].palette_audit))
+        for label, audit in audits:
+            transaction = audit.get("gradient_source_ownership_transaction") or {}
+            performance = transaction.get("performance") or {}
+            search = performance.get("bounded_span_search")
+            if isinstance(search, dict):
+                row = {"scene": label, **copy.deepcopy(search)}
+                cached = transaction.get("execution_cache") or {}
+                row["evidence_reused_for_exact_scene"] = cached.get("status") == "hit"
+                if row["evidence_reused_for_exact_scene"]:
+                    row["original_validation_search"] = copy.deepcopy(search)
+                    row.update(native_probe_count=0, helper_calls=0)
+                    # Retain timing under its original-validation scope only.
+                    row.update(elapsed_seconds=0.0, wall_seconds_since_first_request=0.0)
+                scenes.append(row)
+        return {
+            "scope": "this_clean_base_candidate_residual_transaction_not_all_cli_fallback_variants",
+            "assembled_scene_search_count": sum(not row["evidence_reused_for_exact_scene"] for row in scenes),
+            "assembled_scene_evidence_count": len(scenes),
+            "maximum_assembled_scenes": 2,
+            "native_probe_count": sum(int(row.get("native_probe_count", 0)) for row in scenes),
+            "helper_calls": sum(int(row.get("helper_calls", 0)) for row in scenes),
+            "exact_scene_cache_hits": sum(bool(row.get("evidence_reused_for_exact_scene")) for row in scenes),
+            "scenes": scenes,
+            "independent_scene_evidence": True,
+        }
+
+    def _return_residual_counterfactual(reason):
+        baseline_stats = residual_scene_counterfactual["stats"]
+        baseline_stats.palette_audit["gradient_residual_scene_transaction"] = {
+            "status": "rolled_back_to_verified_counterfactual", "reason": str(reason)[:240]}
+        baseline_stats.palette_audit["gradient_contour_span_scene_searches"] = _span_scene_search_summary()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(residual_scene_counterfactual["svg"], encoding="utf8")
+        return baseline_stats
+    if _gradient_withdrawals:
+        pre_notes.append(
+            f"{sum(len(record['candidate_ids']) for record in _gradient_withdrawals)} "
+            "gradient replacement(s) withdrawn because they required fragmented "
+            "palette residuals; original palette retraced without pixel scraps")
+    entries.extend(residual_entries)
+    if residual_entries:
+        pre_notes.append(
+            f"{residual_pixels} unowned source pixel(s) in {len(residual_entries)} "
+            "omitted palette colour(s) explicitly restored outside gradient ownership")
+
     if trace_background_paths_removed:
         pre_notes.append(
             f"{trace_background_paths_removed} tracer-only routing background "
@@ -2197,11 +3460,13 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
 
     geometry_notes = []
     if geometry != "off":
+        _checkpoint("geometry_regularization", "正在規則化圓形、線段與輪廓")
         try:
             geometry_notes = _regularize(entries, level=geometry)
         except Exception as e:
             geometry_notes = []
             pre_notes.append(f"geometry regularization disabled by error: {e!r}"[:160])
+        _checkpoint("geometry_regularization_complete", "幾何規則化完成")
 
     # 幾何規則化後再算外框（座標可能被調整過）
     for e in entries:
@@ -2265,8 +3530,9 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         f"  <title>{title}</title>",
         "  <desc>Editable vector approximation. Layers follow stack order; "
         "uniform-width line work is rebuilt as real strokes; near-circles "
-        "become native circle elements; banded color ramps are rebuilt as "
-        "linear gradients. No bitmap embedded.</desc>",
+        "become native circle elements; continuous source colour fields are "
+        "rebuilt as bounded native linear or radial gradients. No bitmap "
+        "embedded.</desc>",
     ]
     grad_ids = {}
     if grad_by_idx:
@@ -2275,14 +3541,42 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
             gid = f"grad{n}"
             grad_ids[idx] = gid
             g["id"] = gid
-            parts.append(
-                f'    <linearGradient id="{gid}" gradientUnits="userSpaceOnUse" '
-                f'x1="{_f(g["x1"])}" y1="{_f(g["y1"])}" '
-                f'x2="{_f(g["x2"])}" y2="{_f(g["y2"])}">')
-            for off, c in g["stops"]:
+            model = g.get("model") or {
+                "type": "linear", "x1": g["x1"], "y1": g["y1"],
+                "x2": g["x2"], "y2": g["y2"],
+            }
+            model_type = model.get("type", "linear")
+            if model_type == "radial":
+                cx, cy = model["center"]
+                rx = float(model["radius_x"])
+                ry = float(model["radius_y"])
+                angle = float(model.get("rotation_degrees", 0.0))
+                parts.append(
+                    f'    <radialGradient id="{gid}" '
+                    f'gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" '
+                    f'gradientTransform="translate({_f(cx)} {_f(cy)}) '
+                    f'rotate({_f(angle)}) scale({_f(rx)} {_f(ry)})">')
+                closing_tag = "radialGradient"
+            else:
+                parts.append(
+                    f'    <linearGradient id="{gid}" '
+                    f'gradientUnits="userSpaceOnUse" '
+                    f'x1="{_f(model["x1"])}" y1="{_f(model["y1"])}" '
+                    f'x2="{_f(model["x2"])}" y2="{_f(model["y2"])}">')
+                closing_tag = "linearGradient"
+            for stop in g["stops"]:
+                if isinstance(stop, dict):
+                    off = float(stop["offset"])
+                    colour = stop.get("color")
+                    if not isinstance(colour, str):
+                        colour = "#{:02x}{:02x}{:02x}".format(
+                            *(int(value) for value in stop["rgb"]))
+                else:
+                    off, colour_rgb = stop
+                    colour = "#{:02x}{:02x}{:02x}".format(*colour_rgb)
                 parts.append(f'      <stop offset="{_f(off)}" '
-                             f'stop-color="#{c[0]:02x}{c[1]:02x}{c[2]:02x}"/>')
-            parts.append("    </linearGradient>")
+                             f'stop-color="{colour}"/>')
+            parts.append(f"    </{closing_tag}>")
         parts.append("  </defs>")
     final_palette = []
     n_paths = 0
@@ -2306,9 +3600,12 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         cy = (a[1] + b[1]) / 2.0
         return cx, cy, (r_out + r_in) / 2.0, r_out - r_in
 
+    emitted_gradient_geometry = set()
     for run in runs:
         ci = run["color"]
         grad = grad_by_idx.get(ci)
+        if grad is not None and ci in emitted_gradient_geometry:
+            continue
         if grad is not None:
             base = "gradient"
             fill_attr = f'url(#{grad_ids[ci]})'
@@ -2325,6 +3622,69 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         parts.append(f'  <g id="{nm}" inkscape:label="{nm}" '
                      f'inkscape:groupmode="layer" fill="{group_fill}" '
                      f'fill-rule="evenodd"{opacity_attr}>')
+        if grad is not None and grad.get("path_override"):
+            # The placeholder trace establishes stack position only.  Actual
+            # geometry comes from the independent error-budgeted optimiser,
+            # so palette band edges cannot become designer anchors.
+            from native_geometry_contract import whole_object_native_primitive
+
+            primitive = whole_object_native_primitive(
+                (grad.get("validation") or {}).get("geometry") or {},
+                grad["path_override"])
+            # Keep the native coordinates at the same precision as the
+            # independently verified path.  Two-decimal formatting would
+            # introduce a new, unmeasured geometry change at emission.
+            native_number = lambda value: f'{float(value):.6f}'.rstrip('0').rstrip('.')
+            designer_anchors = int(
+                ((grad.get("validation") or {}).get("geometry") or {})
+                .get("designer_anchor_count") or 0)
+            if isinstance(primitive, dict) and primitive.get("element") in {"circle", "ellipse"}:
+                designer_anchors = 4
+            error_budget = (
+                ((grad.get("validation") or {}).get("geometry") or {})
+                .get("error_budget") or {})
+            budget_percent = float(error_budget["requested_max_percent"])
+            p95_percent = float(error_budget["actual_p95_error_percent"])
+            max_percent = float(error_budget["actual_max_error_percent"])
+            evidence = (
+                f' id="avc-gradient-drawable-{xml_escape(str(grad_ids[ci]))}"'
+                f' data-avc-gradient-object="{xml_escape(str(grad.get("proposal_id") or "source"))}"'
+                f' data-avc-designer-anchors="{designer_anchors}"'
+                f' data-avc-error-budget-percent="{_f(budget_percent)}"'
+                f' data-avc-p95-error-percent="{_f(p95_percent)}"'
+                f' data-avc-max-error-percent="{_f(max_percent)}"')
+            if isinstance(primitive, dict) and primitive.get("element") == "circle":
+                parts.append(
+                    f'    <circle cx="{native_number(primitive["cx"])}" '
+                    f'cy="{native_number(primitive["cy"])}" r="{native_number(primitive["r"])}"'
+                    f'{evidence}/>')
+                n_native += 1
+                n_fill_native_circles += 1
+                n_nodes += 1
+            elif isinstance(primitive, dict) and primitive.get("element") == "ellipse":
+                rotation = float(primitive.get("rotation_degrees", 0.0))
+                transform = (
+                    f' transform="rotate({native_number(rotation)} {native_number(primitive["cx"])} '
+                    f'{native_number(primitive["cy"])})"'
+                    if abs(rotation) > 1e-9 else "")
+                parts.append(
+                    f'    <ellipse cx="{native_number(primitive["cx"])}" '
+                    f'cy="{native_number(primitive["cy"])}" rx="{native_number(primitive["rx"])}" '
+                    f'ry="{native_number(primitive["ry"])}"{transform}{evidence}/>')
+                n_native += 1
+                n_nodes += 1
+            else:
+                parts.append(
+                    f'    <path d="{grad["path_override"]}"{evidence}/>')
+                n_paths += 1
+                n_nodes += int(
+                    ((grad.get("validation") or {}).get("geometry") or {})
+                    .get("anchor_count")
+                    or len(re.findall(r"[A-Za-z]", grad["path_override"])))
+            emitted_gradient_geometry.add(ci)
+            parts.append("  </g>")
+            final_palette.append((nm, _gradient_palette_hex(grad)))
+            continue
         for e in run["items"]:
             if "raw" in e:
                 parts.append(f'    <path d="{e["raw"]}"/>')
@@ -2335,7 +3695,8 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
             # a lone perfect circle becomes a native <circle>
             if len(subs) == 1 and subs[0].get("is_circle"):
                 cx, cy, r = subs[0]["is_circle"]
-                parts.append(f'    <circle cx="{_f(cx)}" cy="{_f(cy)}" '
+                parts.append(f'    <circle id="avc-fill-circle-{n_fill_native_circles + 1}" '
+                             f'cx="{_f(cx)}" cy="{_f(cy)}" '
                              f'r="{_f(r)}"/>')
                 n_native += 1
                 n_fill_native_circles += 1
@@ -2345,7 +3706,8 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
             ring = _concentric_ring(subs) if grad is None else None
             if ring:
                 cx, cy, r, wd = ring
-                parts.append(f'    <circle cx="{_f(cx)}" cy="{_f(cy)}" '
+                parts.append(f'    <circle id="avc-fill-ring-{n_fill_native_circles + 1}" '
+                             f'cx="{_f(cx)}" cy="{_f(cy)}" '
                              f'r="{_f(r)}" fill="none" '
                              f'stroke="{pal_hex[ci]}" stroke-width="{_f(wd)}"/>')
                 n_native += 1
@@ -2362,6 +3724,14 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
         final_palette.append((nm, _gradient_palette_hex(grad)
                               if grad is not None else pal_hex[ci]))
 
+    missing_gradient_geometry = set(grad_by_idx) - emitted_gradient_geometry
+    if missing_gradient_geometry:
+        if residual_scene_counterfactual is not None:
+            return _return_residual_counterfactual("candidate_gradient_placeholder_routing_failed")
+        raise ValueError(
+            "gradient placeholder routing lost an accepted source-space "
+            f"object: {sorted(missing_gradient_geometry)}")
+
     # rebuilt strokes sit on top (line work visually overlays fills)
     if stroke_list:
         parts.append('  <g id="strokes" inkscape:label="strokes" '
@@ -2369,7 +3739,7 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                      'stroke-linecap="round" stroke-linejoin="round">')
         for i, s in enumerate(stroke_list, 1):
             hx = "#{:02x}{:02x}{:02x}".format(*s.color)
-            op_attr = (f' stroke-opacity="{_f(s.opacity)}"'
+            op_attr = (f' stroke-opacity="{s.opacity:.4f}"'
                        if getattr(s, "opacity", 1.0) < 0.995 else "")
             if getattr(s, "primitive", "") == "circle":
                 parts.append(f'    <circle id="stroke-{i}" stroke="{hx}" '
@@ -2385,7 +3755,8 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                              f'height="{_f(s.height)}"{op_attr}/>')
             else:
                 parts.append(f'    <path id="stroke-{i}" stroke="{hx}" '
-                             f'stroke-width="{_f(s.width)}" d="{s.d}"'
+                             f'stroke-width="{s.width:.4f}" '
+                             f'stroke-linecap="{getattr(s, "linecap", "round")}" d="{s.d}"'
                              f'{op_attr}/>')
             n_nodes += s.n_nodes
         parts.append("  </g>")
@@ -2404,8 +3775,6 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
     # have produced at least one element; a silently dropped color region
     # (e.g. a thin detail eaten by the speckle filter) is a hard failure.
     vis_guard = vis_fill
-    geometry_notes = _finalize_circle_geometry_note(
-        geometry_notes, n_fill_native_circles)
     if grad_regions:
         vis_guard = vis_fill.copy()
         for g in grad_regions:
@@ -2452,16 +3821,212 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                 lost.append((pal_hex[i], share))
         if lost:
             detail = ", ".join(f"{hx} ({share:.1%})" for hx, share in lost)
+            if residual_scene_counterfactual is not None:
+                return _return_residual_counterfactual("candidate_source_ink_loss_guard_failed: " + detail)
             raise ValueError(
                 f"vectorizer silently dropped visible color regions: {detail}; "
                 "the details may be thinner than the speckle filter")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text("\n".join(parts), encoding="utf-8")
+    svg_text = "\n".join(parts)
+    if any(isinstance(region.get("enclosed_source_component_candidate"), dict)
+           for region in grad_regions):
+        from gradient_source_components import apply_source_component_candidates
+        processed_scene = np.dstack((den, source_alpha))
+        ownership_result, ownership_cache = _cached_post_fit_scene(
+            gradient_stage_cache, operation="source_ownership_and_bounded_spans",
+            svg_text=svg_text, source_path=src, processed_rgba=processed_scene,
+            fields=grad_regions, parameters={"budget_percent": curve_error_percent},
+            stage_callable=apply_source_component_candidates,
+            producer=lambda: apply_source_component_candidates(
+                svg_text, grad_regions, src, processed_scene, budget_percent=curve_error_percent))
+        refined_svg, updates, ownership_transaction = ownership_result
+        ownership_transaction["execution_cache"] = ownership_cache
+        ownership_transaction["performance_scope"] = (
+            "original_validation_execution_reused" if ownership_cache["status"] == "hit"
+            else "this_invocation")
+        for region in grad_regions:
+            update = updates.get(region.get("candidate_id"))
+            if update is None:
+                continue
+            previous_geometry = region["validation"]["geometry"]
+            n_nodes += int(update["geometry"]["anchor_count"]) - int(previous_geometry["anchor_count"])
+            region.update(mask=update["mask"], area=update["area"], path_override=update["path"])
+            region["validation"]["geometry"] = update["geometry"]
+            region["validation"]["selection"] = {
+                **region["validation"].get("selection", {}),
+                "ownership_source": "original_and_processed_source_supported_enclosed_components",
+                "ownership_colour_evidence_used": True}
+        svg_text = refined_svg
+        palette_audit["gradient_source_ownership_transaction"] = ownership_transaction
+    if len(grad_regions) == 1 and not stroke_list:
+        from source_gradient_primitive import propose_isolated_gradient_primitive
+        try:
+            refined_svg, source_geometry, source_certificate = (
+                propose_isolated_gradient_primitive(
+                    svg_text, src, budget_percent=curve_error_percent))
+            grad = grad_regions[0]
+            # The source certificate covers the complete candidate, including
+            # every separately verified AA residual it removed. One final
+            # native element is distinct from its four/eight designer handles.
+            n_paths, n_native, n_nodes = 0, 1, 1
+            n_fill_native_circles = int(source_certificate["primitive_kind"] == "circle")
+            grad["validation"]["geometry"] = source_geometry
+            grad["validation"]["selection"] = {
+                **grad["validation"].get("selection", {}),
+                "colour_used_for_geometry": True,
+                "geometry_source": "unmodified_input_coverage50_with_verified_gradient_paint"}
+            palette_audit["source_gradient_primitive"] = source_certificate
+            svg_text = refined_svg
+            pre_notes.append(
+                "1 isolated gradient " + source_certificate["primitive_kind"] +
+                " rebuilt from unmodified input coverage; "
+                "same paint and original-source contour/render checks passed; "
+                "not binary-mask-equivalent simplification")
+        except (OSError, ValueError) as exc:
+            palette_audit["source_gradient_primitive"] = {
+                "status": "not_applied", "reason": str(exc)[:240]}
+    def _gradient_public_info(g):
+        model = dict(g.get("model") or {
+            "type": "linear", "x1": g["x1"], "y1": g["y1"],
+            "x2": g["x2"], "y2": g["y2"],
+        })
+        stops = []
+        for stop in g["stops"]:
+            if isinstance(stop, dict):
+                stops.append({
+                    "offset": float(stop["offset"]),
+                    "color": str(stop.get("color") or
+                                 "#{:02x}{:02x}{:02x}".format(
+                                     *(int(v) for v in stop["rgb"]))),
+                })
+            else:
+                off, colour = stop
+                stops.append({
+                    "offset": float(off),
+                    "color": "#{:02x}{:02x}{:02x}".format(*colour),
+                })
+        info = {
+            "id": g.get("id", ""),
+            "key": "#{:02x}{:02x}{:02x}".format(*g["key"]),
+            "model": model,
+            "type": model.get("type", "linear"),
+            "opacity": g.get("opacity", 1.0),
+            "key_distance": g.get("key_distance", 48),
+            "validation": g.get("validation", {}),
+            "candidate_id": g.get("candidate_id"),
+            "candidate_family": g.get("candidate_family"),
+            "confidence": g.get("confidence"),
+            "stops": stops,
+            "viewbox": [W, H],
+        }
+        if model.get("type") == "linear":
+            info.update({name: float(model[name])
+                         for name in ("x1", "y1", "x2", "y2")})
+        return info
+
+    if residual_scene_counterfactual is not None:
+        from gradient_residual_provenance import prove_unchanged_scene_residuals
+        try:
+            scene_proof = prove_unchanged_scene_residuals(
+                residual_scene_counterfactual["svg"], svg_text,
+                residual_scene_counterfactual["residual_mask"], src, np.dstack((den, source_alpha)))
+            scene_proof["counterfactual_withdrawal"] = residual_scene_counterfactual["fragmentation"]
+            palette_audit["gradient_residual_scene_transaction"] = scene_proof
+            pre_notes.append("gradient retained after complete-scene comparison proved all residual halos unchanged")
+        except (OSError, ValueError, RuntimeError) as exc:
+            # The new ownership outline may fail source edge fidelity even
+            # when its independently verified paint is useful. Retain the
+            # counterfactual's exact geometry and try only that source paint.
+            try:
+                from gradient_paint_only import apply_paint_only_gradient
+                withdrawn = residual_scene_counterfactual["fragmentation"]["candidate_ids"]
+                candidates = [g for g in grad_regions if g.get("candidate_id") in withdrawn]
+                if len(withdrawn) != 1 or len(candidates) != 1:
+                    raise ValueError("paint_only_requires_one_unambiguous_source_field")
+                region = copy.deepcopy(candidates[0])
+                paint_svg, paint_geometry, paint_proof = apply_paint_only_gradient(
+                    residual_scene_counterfactual["svg"], svg_text, region,
+                    src, np.dstack((den, source_alpha)), budget_percent=curve_error_percent)
+                # Clone every report before mutation: a later failure must
+                # return the exact untouched counterfactual SVG and evidence.
+                result = copy.deepcopy(residual_scene_counterfactual["stats"])
+                region["id"] = paint_proof["gradient_id"]
+                region["validation"]["geometry"] = paint_geometry
+                region["validation"]["selection"] = {
+                    **region["validation"].get("selection", {}),
+                    "colour_used_for_geometry": False,
+                    "geometry_source": "unchanged_existing_svg_geometry"}
+                result.gradient_info.append(_gradient_public_info(region))
+                result.n_gradients += 1
+                audit = result.palette_audit["gradient_reconstruction"]
+                restored = [d for d in audit["decisions"] if d.get("candidate_id") == region["candidate_id"]]
+                if len(restored) != 1 or restored[0].get("status") != "withdrawn":
+                    raise ValueError("paint_only_withdrawal_evidence_identity_mismatch")
+                restored[0].update(status="selected", reconstruction_route="paint_only_existing_paths")
+                partial_count = sum(bool((g.get("validation") or {}).get("geometry", {}).get(
+                    "source_paint_only", {}).get("partial_selection")) for g in result.gradient_info)
+                audit["summary"]["objects_selected"] = len(result.gradient_info) - partial_count
+                audit["summary"]["partial_paint_fields"] = partial_count
+                audit["summary"]["paint_only_existing_geometry_objects"] = 1
+                audit["summary"]["geometry_replacements_withdrawn"] = len(withdrawn)
+                result.palette_audit["gradient_paint_only_transaction"] = paint_proof
+                result.palette_audit["gradient_residual_scene_transaction"] = {
+                    "status": "new_outline_rejected_existing_geometry_paint_restored",
+                    "outline_rejection": str(exc)[:240],
+                    "residual_handling": "counterfactual_geometry_and_paint_order_unchanged"}
+                result.palette_audit["gradient_contour_span_scene_searches"] = _span_scene_search_summary()
+                result.geometry_notes.append(
+                    "1 source gradient restored on existing paths; geometry, path count, "
+                    "paint order and complete alpha unchanged; no geometry economy claimed")
+                dst.write_text(paint_svg, encoding="utf8")
+                return result
+            except (OSError, ValueError, RuntimeError) as paint_exc:
+                return _return_residual_counterfactual(str(exc)+"; paint-only: "+str(paint_exc))
+    partial_paint_details = []
+    if original_gradient_stage is not None and original_gradient_stage.get("paint_ready_alternatives"):
+        from gradient_paint_only import apply_pending_paint_alternatives
+        _checkpoint("partial_source_paint", "核對既有路徑的局部漸層；保留原輪廓與堆疊")
+        native_paint_reference, _, _ = _prepare_image(
+            src, max_size=0, background=background,
+            white_threshold=white_threshold, alpha_threshold=12)
+        processed_scene = np.dstack((den, source_alpha))
+        native_paint_rgba = np.asarray(native_paint_reference.convert("RGBA"))
+        pending_paint = original_gradient_stage["paint_ready_alternatives"]
+        partial_result, partial_cache = _cached_post_fit_scene(
+            gradient_stage_cache, operation="pending_partial_paint",
+            svg_text=svg_text, source_path=src, processed_rgba=processed_scene,
+            native_reference_rgba=native_paint_rgba, fields=pending_paint,
+            parameters={"budget_percent": curve_error_percent, "maximum_fields": 1,
+                        "background": background, "white_threshold": white_threshold,
+                        "native_reference_alpha_threshold": 12},
+            stage_callable=apply_pending_paint_alternatives,
+            producer=lambda: apply_pending_paint_alternatives(
+                svg_text, pending_paint, src, processed_scene,
+                budget_percent=curve_error_percent, maximum_fields=1,
+                native_reference_rgba=native_paint_rgba))
+        svg_text, partial_paint_details, partial_decisions, partial_proofs = partial_result
+        palette_audit["gradient_partial_paint_execution_cache"] = partial_cache
+        audit = palette_audit["gradient_reconstruction"]
+        audit.setdefault("decisions", []).extend(partial_decisions)
+        audit.setdefault("summary", {})["partial_paint_fields"] = len(partial_paint_details)
+        audit["summary"]["objects_selected"] = len(grad_regions)
+        palette_audit["gradient_partial_paint_transactions"] = partial_proofs
+        if partial_paint_details:
+            pre_notes.append(
+                f"{len(partial_paint_details)} source field(s) partially restored on existing paths; "
+                "original geometry, alpha and paint order retained; manual review required; "
+                "no complete-object or geometry-economy claim")
+    palette_audit["gradient_contour_span_scene_searches"] = _span_scene_search_summary()
+    geometry_notes = _finalize_circle_geometry_note(
+        geometry_notes, n_fill_native_circles)
+    dst.write_text(svg_text, encoding="utf-8")
+    _checkpoint("svg_written", "候選 SVG 已寫入，等待渲染品質驗證")
 
     if grad_regions:
         geometry_notes = geometry_notes + [
-            f"{len(grad_regions)} banded color ramps rebuilt as linear gradients"]
+            f"{len(grad_regions)} continuous source colour field(s) rebuilt "
+            "as single native gradient objects with error-budgeted contours"]
     if pre_notes:
         geometry_notes = pre_notes + geometry_notes
 
@@ -2482,21 +4047,13 @@ def build_clean_base(src, dst, forced_colors=0, white_threshold=220,
                       "width": s.width, "closed": s.closed,
                       "nodes": s.n_nodes,
                       "opacity": getattr(s, "opacity", 1.0),
-                      "primitive": getattr(s, "primitive", "")}
+                      "primitive": getattr(s, "primitive", ""),
+                      "linecap": getattr(s, "linecap", "round"),
+                      "source_fit": getattr(s, "source_fit", {})}
                      for s in stroke_list],
         viewbox=[W, H],
-        n_gradients=len(grad_regions),
-        gradient_info=[{"id": g.get("id", ""),
-                        "key": "#{:02x}{:02x}{:02x}".format(*g["key"]),
-                        "x1": g["x1"], "y1": g["y1"],
-                        "x2": g["x2"], "y2": g["y2"],
-                        "opacity": g.get("opacity", 1.0),
-                        "key_distance": g.get("key_distance", 48),
-                        "validation": g.get("validation", {}),
-                        "stops": [{"offset": off,
-                                   "color": "#{:02x}{:02x}{:02x}".format(*c)}
-                                  for off, c in g["stops"]],
-                         "viewbox": [W, H]} for g in grad_regions],
+        n_gradients=len(grad_regions) + len(partial_paint_details),
+        gradient_info=[_gradient_public_info(g) for g in grad_regions] + partial_paint_details,
         palette_audit=palette_audit,
         _validation_hole_shape=validation_hole_shape,
         _validation_hole_bits=validation_hole_bits,

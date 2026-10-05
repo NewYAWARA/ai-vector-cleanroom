@@ -11,10 +11,22 @@ from quality_diagnostics import (
     _component_topology,
     compute_quality_diagnostics,
     source_ink_roi,
+    source_structure_hotspots,
 )
 
 
 class QualityDiagnosticsTests(unittest.TestCase):
+    def test_native_structure_region_accounts_for_meet_letterboxing(self):
+        audit = {'status': 'completed', 'renderer': {'width': 400, 'height': 240},
+                 'stable_defects': [{'kind': 'source_paper_unexpected_opaque_color',
+                                     'bbox_xyxy': [40, 60, 80, 80]}]}
+        spots = source_structure_hotspots(audit, [0, 0, 200, 100])
+        self.assertEqual([(s['x'], s['y'], s['w'], s['h']) for s in spots], [(20, 20, 20, 10)])
+        self.assertIsNone(spots[0]['score_percent'])
+        self.assertTrue(spots[0]['structural_defect'])
+        audit['status'] = 'unavailable'
+        self.assertEqual(source_structure_hotspots(audit, [0, 0, 200, 100]), [])
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)

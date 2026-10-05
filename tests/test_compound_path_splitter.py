@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
@@ -32,6 +33,54 @@ def _paths(text: str) -> list[ET.Element]:
 
 
 class CompoundPathSplitterTests(unittest.TestCase):
+    def test_gradient_owned_ancestor_is_retained_without_blocking_unowned_splits(self):
+        original_data = 'M0 0C3 0 7 0 10 0L10 10L0 10Z M20 0H30V10H20Z'
+        for marker in ('data-avc-gradient-object', 'data-avc-paint-only-reconstruction'):
+            with self.subTest(marker=marker):
+                source = _svg(f'<g {marker}="proof"><path id="owned" fill="#123456" d="{original_data}"/></g>'
+                    '<path id="free" fill="#654321" d="M0 40H10V50H0Z M20 40H30V50H20Z"/>')
+                result = process_compound_paths(source)
+                self.assertTrue(result.changed)
+                paths = _paths(result.svg_text)
+                self.assertEqual(next(n for n in paths if n.get('id') == 'owned').get('d'), original_data)
+                self.assertEqual(len(paths), 3)
+                self.assertEqual(result.report['protected_gradient_path_count'], 1)
+                self.assertEqual(result.report['source_paths_split'], 1)
+
+    def test_actual_partial_paint_two_islands_keeps_final_source_certificate(self):
+        import numpy as np
+        from PIL import Image
+        from gradient_paint_only import apply_partial_paint_only_gradient, final_paint_only_matches
+        from svg_renderer import render_svg_reference
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            head = '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">'
+            data = 'M8 8C16 8 32 8 40 8V88H8Z M56 8H88V88H56Z'
+            defs = '<defs><linearGradient id="g" gradientUnits="userSpaceOnUse" x1="8" y1="0" x2="88" y2="0"><stop offset="0" stop-color="#184838"/><stop offset="1" stop-color="#98a878"/></linearGradient></defs>'
+            original = head + f'<path id="compound" d="{data}" fill="#587858"/></svg>'
+            source_svg = head + defs + f'<path fill="url(#g)" d="{data}"/></svg>'
+            source_path = folder/'source.svg'; source_path.write_text(source_svg, encoding='utf8')
+            source_png = folder/'source_original.png'
+            render_svg_reference(source_path, source_png, 96, background='white')
+            with Image.open(source_png) as image:
+                rgba = np.asarray(image.convert('RGBA'))
+            mask = np.zeros((96,96), dtype=bool)
+            mask[8:88,8:40] = True; mask[8:88,56:88] = True
+            # The untouched original is opaque paper. The actual processed
+            # reference retains shape alpha and clears border-connected paper.
+            processed = rgba.copy(); processed[:, :, 3] = mask.astype(np.uint8) * 255
+            painted, geometry, proof = apply_partial_paint_only_gradient(original, source_svg,
+                {'id':'g', 'candidate_id':'field', 'proposal_id':'owner', 'mask':mask}, source_png, processed)
+            self.assertTrue(final_paint_only_matches(ET.fromstring(painted), geometry, source_png))
+            split = process_compound_paths(painted)
+            self.assertFalse(split.changed)
+            self.assertEqual(split.svg_text, painted)
+            self.assertEqual(split.report['protected_gradient_path_count'], 1)
+            self.assertTrue(final_paint_only_matches(ET.fromstring(split.svg_text), geometry, source_png))
+            self.assertTrue(proof['partial_selection'])
+            self.assertTrue(proof['manual_review_required'])
+            self.assertEqual(_paths(split.svg_text)[0].get('d'), data)
+
     def test_evenodd_hole_and_island_stay_with_root(self):
         # The first three contours are one root/hole/island containment
         # family.  Only the distant fourth contour may become a sibling path.

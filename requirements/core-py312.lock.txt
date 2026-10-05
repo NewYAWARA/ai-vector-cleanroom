@@ -1,0 +1,8 @@
+# Designer Preview 2 core runtime.
+cffi==2.1.1
+numpy==2.3.5
+pillow==12.3.0
+pycparser==3.0
+rendercanvas==2.7.2
+vtracer==0.6.15
+wgpu==0.31.1

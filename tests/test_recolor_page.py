@@ -236,6 +236,37 @@ class RecolorPageTests(unittest.TestCase):
         self.assertIn("el.hasAttribute(attr)", text)
         self.assertIn("el.style.getPropertyValue(attr)", text)
 
+    def test_optional_fixture_all_four_controls_have_exact_js_python_parity(self):
+        real_directory = (PROJECT / "tests" / "optional_fixtures" /
+                          "legacy_beta2" / "recolor_sample")
+        candidates = list(real_directory.glob("*_vector.svg"))
+        if not candidates:
+            self.skipTest("optional legacy recolor fixture is not included")
+        svg = candidates[0]
+        paint_manifest = build_paint_role_manifest(svg)
+        self.assertEqual(paint_manifest["resource_counts"]["role_controls"], 4)
+        self.assertEqual(sum(role["member_count"]
+                             for role in paint_manifest["roles"]), 18)
+        text = self.make_page(svg.read_text(encoding="utf-8"), paint_manifest)
+        target_by_role = {
+            "neutral-dark": "#ff00ff",
+            "neutral-mid": "#00ffff",
+            "neutral-light": "#050505",
+            "accent-1": "#205cff",
+        }
+        cases = [
+            {"role": role, "target": target_by_role[role["id"]]}
+            for role in paint_manifest["roles"]
+        ]
+        javascript = run_node(
+            text, "payload.map(item=>mappingFor(item.role,item.target))", cases)
+        python = [
+            _role_mapping(item["role"], item["target"], 0.5)
+            for item in cases
+        ]
+        self.assertEqual(javascript, python)
+        self.assertEqual(sum(len(mapping) for mapping in javascript), 18)
+
     def test_empty_manifest_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

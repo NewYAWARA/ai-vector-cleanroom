@@ -1,0 +1,20 @@
+# Designer Preview 2 tested runtime; CPython 3.12 x64 / Windows.
+# Exact package versions; no wheel hash claim.
+cffi==2.1.1
+charset-normalizer==3.5.1
+cssselect2==0.10.1
+freetype-py==2.5.1
+lxml==6.1.1
+numpy==2.3.5
+pillow==12.3.0
+pycairo==1.29.0
+pycparser==3.0
+rendercanvas==2.7.2
+reportlab==4.4.9
+resvg-py==0.5.0
+rlPyCairo==0.4.0
+svglib==2.0.2
+tinycss2==1.5.1
+vtracer==0.6.15
+webencodings==0.6.1
+wgpu==0.31.1

@@ -1,80 +1,46 @@
-# Publishing Guide
+# 發布來源測試版
 
-How to replace the published version of AI Vector Cleanroom on GitHub with a
-new one, while keeping the repository, its URL, stars and issue history.
+在既有 `NewYAWARA/ai-vector-cleanroom` 儲存庫更新，保留網址、提交、Issue 與星號歷史。這次版本為 `v3-designer-preview.4`，屬於 **source-only pre-release**；版本編號不是品質分數。不要重新初始化儲存庫，也不要把本機工作目錄整包上傳。
 
-## 0. Before you push
+## 檢查要發布的內容
 
-```powershell
-python preflight_check.py                 # must print "Preflight OK"
-python -m unittest discover -s tests -v   # must end with "OK"
-```
-
-`preflight_check.py` fails the build if any binary asset or private string
-would be published. Never bypass it.
-
-## 1. Replace the contents of the existing repo (preserves history)
-
-From a clone of the repo, with the new tree prepared separately:
+使用 Windows x64、CPython 3.12.x 的專用環境，依 `requirements/validated-py312.lock.txt` 安裝 18 個精確版本。沒有封裝 Python、Illustrator、客戶素材、實際客戶輸出、私有驗證報告或權杖。
 
 ```powershell
-git clone https://github.com/NewYAWARA/ai-vector-cleanroom.git
-cd ai-vector-cleanroom
-
-# remove everything that git tracks (keeps .git), then copy the new tree in
-git rm -r --quiet .
-robocopy "PATH\TO\new-tree" . /E /XD .git    # Windows; use rsync on macOS/Linux
-
-git add -A
-git commit -m "Release v0.5.0-alpha: component-repair, light-color fidelity, negative-space guardrails"
-git push origin main
+$env:VECTOR_TEST_REUSE = ''
+python -B environment_preflight.py --full --strict-versions
+python -B preflight_check.py
+python -B release/package_source_beta6.py audit
+python -B -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-This makes HEAD the new version; the old code stays reachable in history.
+`preflight_check.py` 檢查 Git 已追蹤及未被忽略的未追蹤檔案，包含 Unicode 檔名與 JSON 內容。圖片只允許發行 allowlist 中、雜湊符合 manifest 的合成測試素材；不是所有 `tests/fixtures/` 都可發布。封裝器另依明確檔案清單建立來源 ZIP，不打包整個工作目錄。兩項檢查都要通過。
 
-## 2. Tag a pre-release
+## 建立與驗證下載包
+
+將產物放在儲存庫外，例如目前使用者的暫存目錄：
 
 ```powershell
-git tag v0.5.0-alpha
-git push origin v0.5.0-alpha
+$releaseDir = Join-Path $env:TEMP 'avc-preview4-release'
+New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+$sourceZip = Join-Path $releaseDir 'AI-Vector-Cleanroom-Designer-Preview-4.zip'
+$receipt = Join-Path $releaseDir 'SOURCE_RELEASE_RECEIPT_Designer_Preview_4.json'
+python -B release/package_source_beta6.py build --zip $sourceZip --receipt $receipt
+python -B release/package_source_beta6.py verify --zip $sourceZip --receipt $receipt
 ```
 
-On GitHub, create a Release from that tag and **check "This is a
-pre-release"**. Suggested notes (accurate wording only):
+ZIP 內的 `SOURCE_MANIFEST.json` 記錄實際封裝內容。程式、文件或 allowlist 有變更時，需從新的 ZIP 取出 manifest 同步到儲存庫，再重跑 preflight、封裝與驗證，直到儲存庫 manifest 與 ZIP manifest 一致。不要手改雜湊來略過檢查。
 
-```text
-v0.5.0-alpha (technical preview). Flat bitmap logos/icons -> editable SVG:
-real strokes, native circle/line/polyline, linear gradients, safe compound
-splitting, scene grouping, offline global recolor. New since v0.3: light-color
-fidelity (conservative overlay + light-core coverage gate), negative-space
-guardrails on frames and grouped-glyph counters, a multi-metric visual gate,
-and conservative render-validated re-trace of completely-missing components.
-Every post-process stage is validated pixel-exact by an external renderer.
-Output still needs human review; the "80% time saving" claim is not yet
-verified by designer editing timings.
-```
+解壓下載包到另一個目錄，依 README 執行安裝，使用專用環境執行 `python -B environment_preflight.py --full --strict-versions` 與測試；另外以 `工作台.bat` 正常開啟介面做啟動確認。CI 也會從來源 ZIP 解壓後執行公開測試，不依賴私有素材。發布紀錄分別列出實際測試結果、跳過項目及未驗證事項，不把 CI 通過寫成 Illustrator 已驗收。
 
-## 3. Wording rules
+## 更新 GitHub
 
-Use accurate wording:
+先檢查 `git diff --stat`、完整 diff 與 `git status --short`，只提交準備好的公開來源與文件。以正常提交更新既有儲存庫，不 force-push、不刪除舊 tag。若 `v3-designer-preview.4` 已存在，改用下一個未使用的版本並同步版本常數，不移動已發布的 tag。
 
-```text
-Turns flat bitmap logos and icons into clean, editable, structured SVG
-drafts. Alpha / technical preview: output needs human review, especially for
-gradients, shadows, transparency, text, and complex multi-color artwork.
-```
+在測試完成的提交建立 tag `v3-designer-preview.4`，推送提交與該 tag；GitHub Release 勾選 **Pre-release**。說明採用 `release/RELEASE_NOTES.md`，附件使用上述已驗證來源 ZIP 與收據。CI 只做檢查，不持有發布憑證、不自動上傳 Release。
 
-Do not claim:
+發布後確認 tag 指向驗證過的提交、附件可下載、ZIP 與收據雜湊相符。README 保留目前支援環境、安裝方式、已知限制與回饋入口。
 
-```text
-lossless vector recovery
-one-click 80%/90% vectorization of any image
-production ready / designer ready without review
-```
+## 說明的界線
 
-## 4. Do not publish restricted assets
-
-Private, client-owned, trademarked, or unclear-license images — and any SVG
-generated from them — must never be committed. `input/`, `output/`,
-`tests/fixtures/`, and the portable `python/` interpreter are gitignored;
-keep them that way.
+可以說「協助產生容易接手的向量底稿」，並具體列出保留、修改、重畫的工作流程。不可宣稱無損還原、任意圖片一鍵完稿、已證實節省某個百分比工時、已達理論極限或無需設計師檢查。較少節點、局部誤差和機器測試都不等於真人省時證據。

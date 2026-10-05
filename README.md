@@ -2,381 +2,99 @@
 
 繁體中文 | [English](#english)
 
-把平面點陣圖 logo（含 AI 生成 logo）轉成「可編輯的 SVG 底稿」的清稿工具。
-
-> 目前狀態：v0.5.0-alpha 技術預覽版。
-> 適合少色、平面、邊界清楚的 logo 與 icon；其他類型的圖輸出仍需人工檢查與補修。
-> 「省工 80%」尚未經真人實際編輯計時驗證（見下方誠實聲明）。
-
-由 張進逸（Shinichi Chang）開發與維護。
-
-## 解決什麼問題
-
-AI 生成的 logo 只有 PNG，設計師拿到後常常只能整張重畫：
-顏色髒（漸層雜訊、反鋸齒邊）、圓不圓、點不齊、線條變成一堆錨點的填色外框、
-圖層全部黏在一起。
-
-這個工具**不是「無損轉向量」**。點陣圖裡沒有原始貝茲曲線、字型、圖層資訊，
-無損還原不存在。它做的是把重畫的起點從 0 分拉到高分底稿，並在每個環節
-用外部渲染器逐像素把關、低品質就明確標示或判失敗，不把爛結果偽裝成完成品。
-
-## 從 v0.1 到 v0.5（重點變更）
-
-v0.1 是「壓乾淨顏色 + 描邊 + 圓弄正 + 分色層」的底稿工具；v0.3 把它升級成
-設計師能真正接手編輯的結構化向量；v0.5 再補上淺色實體保真、負空間護欄與
-完全遺失元件的保守局部重追。逐版細節見 `CHANGELOG.md`。
-
-| 能力 | v0.1 | v0.5 |
-|---|---|---|
-| 線條（心跳線／細線） | 一堆錨點的填色外框，難改 | 真筆畫 `stroke`，可調線寬與端點 |
-| 圓與幾何 | 圓／鉚釘規則化，仍是 path | 原生 `<circle>` / `<line>` / `<polyline>`；圓環為可調線寬 stroked circle |
-| 漸層 | 壓成單色色帶 | 真 `<linearGradient>` |
-| 透明度 | 無 | `fill-opacity` / `stroke-opacity` |
-| 大路徑 | 一整塊，難單選 | 安全拆成可單選零件 + 穩定 ID + 場景群組 |
-| 換色 | 無 | 離線全域換色頁（OKLCH，一鍵改品牌色） |
-| 品質分數 | flat + source 兩分數 | 加 foreground 墨水 ROI、候選自動回退、<60 分判失敗、三軸可編輯性稽核 |
-| 介面 | 靜態疊圖頁 | 拖放工作台（1600% 縮放／物件清單／問題熱區／逐圖重跑）+ 盲測 + Stage 2 計時 |
-| 正確性保證 | 基本 | 每個後處理階段外部渲染器逐像素驗證 + rollback + 原子寫入 |
-| 淺色實體細節 | 易被整體高分掩蓋 | 保守 overlay 補回 + 獨立淺色核心保真閘門（白字／白高光不再被埋沒） |
-| 框內／字內孔洞 | 可能被填實 | 圓框／方框負空間護欄，內孔填實即撤回；成組字形內孔保持透明 |
-| 外觀閘門 | 單一前景分數 | 多指標（前景／色彩／局部細節 P10／拓撲／淺色核心覆蓋） |
-| 遺失元件 | 無偵測 | 元件拓撲 schema + 完全遺失元件的保守局部重追（另渲染驗證、框外零變動、不過即回退） |
-| 測試 | 1 個測試檔 | 222 個測試 |
-
-## 管線總覽
-
-1. **去背與主色偵測**：加權 k-means++ 抓設計主色、剪掉反鋸齒混色假色，
-   把漸層雜訊壓平成乾淨色塊。
-2. **等寬線條重建**：心跳線、細線、框線這類等寬線稿，重建成真正的筆畫
-   （中心線 path + `stroke-width` + 圓端點圓轉角），不再是高節點填色外框；
-   細的反鋸齒線也不再變灰。
-3. **漸層重建**：被壓成色帶的平滑漸層還原成真正的 `<linearGradient>`。
-4. **原生幾何**：偵測到的正圓 → `<circle>`；同心圓環 → 一個帶 `stroke-dasharray`
-   的 stroked circle；符合條件的直線／折線 → `<line>`／`<polyline>`。
-5. **compound path 安全拆分**：只在拓撲可證明安全（不破壞洞／島、互不重疊）時
-   才把大路徑拆成可單選的零件；精確有理數證明共線的 cubic 才化簡為直線。
-6. **Scene Graph 後處理**：跨色零件只有在堆疊順序與像素完全不變時才寫成實體
-   `<g>` 群組；不安全的候選只留在 manifest，不冒充可選群組。所有可見元件取得穩定 ID。
-7. **品質閘門與候選回退**：低分結果自動比較關閉筆畫／漸層／幾何的候選、取最佳者；
-   最佳仍低於 60 分直接判失敗。外觀與可編輯性分開評分。
-
-每個後處理階段都有獨立 rollback，且用外部渲染器做**逐像素**驗證：
-compound / Scene Graph / 原生線條若渲染有任何差異就撤回，只有近似的外環偵測
-會通過「雙向 1px 容忍」的近似閘門。
-
-## 已實現功能
-
-1. PNG / JPG / WebP / BMP 批次轉為可編輯 SVG（純向量元素，不內嵌點陣圖）。
-2. 真筆畫、原生 `<circle>` / `<line>` / `<polyline>`、真 `<linearGradient>`、
-   透明度（`fill-opacity` / `stroke-opacity`）。
-3. 依實際堆疊順序分層（Inkscape `groupmode="layer"`），可證明安全的跨色群組，
-   每個元件有唯一穩定 ID。
-4. **色彩調整頁**（`色彩調整.html`）：離線、按 paint-role 全域換色，OKLCH 保留
-   同角色亮度／彩度關係，匯出的是明確 SVG 色值、不依賴專用色票。
-5. **校稿工作台**（`review.html`）：100%–1600% 縮放平移、物件清單（含節點數與圖層
-   開關）、點選高亮、問題熱區點擊跳轉。
-6. **本機工作台**（`workbench.py`）：拖放轉檔、逐圖帶參數重跑（保留最多 8 版歷史）、
-   結果清單、Stage 1 盲測頁與 Stage 2 實際編輯計時頁。只綁 `127.0.0.1`、POST 需
-   session token、上傳做內容驗證。
-7. 三分數自我驗證（`flat` / `source` / `foreground` 墨水 ROI，含雙向 1px 容忍）
-   加上分層可編輯性稽核（`automation_readiness` / `redraw_complexity` /
-   `workflow_friction`），寫進 `report.json`。
-8. 批次安全：輸出名稱全域唯一、任一檔失敗 exit code 為 1、描不出東西視為失敗、
-   關鍵寫入採原子替換（磁碟失敗不會留半份 XML）。
-
-## 適用與不適用
-
-適用：AI 生成／平面 logo、徽章、icon、標籤；色數有限（約 2–8 色）、邊界清楚；
-圓形徽章元素（外圈、鉚釘、同心環、網點、速度線）。
-
-不適用（分數會偏低，輸出僅供參考）：照片、寫實插畫、複雜柔和陰影／光暈、
-極細紋理與髮絲線條、需要復原原始字型與可編輯文字、刻意手繪不規則風格
-（可用 `--geometry off`）。
-
-## 倉庫結構
-
-```text
-ai-vector-cleanroom/
-  vector_cleanroom.py         主程式（批次流程、候選閘門、報告、打包）
-  clean_base.py               核心引擎（調色、描邊、漸層、幾何規則化、分組）
-  stroke_engine.py            等寬線條中心線重建
-  trace_engine.py             去背與影像前處理
-  svg_postprocess.py          四階段後處理協調（transaction / rollback）
-  annulus_detector.py         共圓外環偵測 → 原生 circle
-  compound_path_splitter.py   compound 安全拆分 + 精確 cubic 化簡
-  exact_native_shapes.py      逐像素證明的 line / polyline 原生化
-  scene_graph_postprocess.py  實體群組 / paint-order 不變式
-  paint_roles.py              paint-role manifest
-  recolor_page.py             離線全域換色頁
-  editability_audit.py        分層可編輯性稽核
-  designer_ops_audit.py       結構化設計操作驗收
-  editing_test_page.py        Stage 2 實際編輯計時頁
-  quality_diagnostics.py      前景 / 局部墨水格網品質指標
-  workbench.py                本機拖放工作台（離線 UI）
-  preflight_check.py          發版前私隱/二進位掃描
-  tests/                      黑箱與單元測試（fixtures 由測試即時生成，不進 repo）
-  .github/workflows/          CI（Ubuntu + Windows）
-```
-
-## 如何使用
-
-需要 Python 3.10 以上。
-
-```powershell
-python -m pip install -r requirements.txt
-# 選裝：SVG 預覽圖與逐像素自我驗證（缺了核心轉檔仍可跑）
-python -m pip install -r requirements-preview.txt
-```
-
-Windows 也可直接雙擊 `install_deps.bat`。
-
-把圖放進 `input/`，然後：
-
-```powershell
-python vector_cleanroom.py     # Windows 可雙擊 clean.bat
-```
-
-本機工作台（拖放、逐圖重跑、校稿、換色、盲測、Stage 2 計時）：
-
-```powershell
-python workbench.py            # Windows 可雙擊 workbench.bat
-```
-
-結果在 `output/result_<檔名>/`：`_vector.svg`、`_preview.png`、`source_reference.png`、
-`review.html`、`色彩調整.html`、`report.json`、`OUTPUT_README.txt`，外加整包 zip。
-
-## 選項
-
-```text
---input DIR            輸入資料夾（預設 ./input）
---output DIR           輸出資料夾（預設 ./output）
---colors N             強制色數（預設 0 = 自動偵測）
---background MODE      auto | keep | transparent（預設 auto）
---white-threshold N    淺色背景判定門檻（預設 220）
---max-size N           描邊前將長邊縮到此尺寸（預設 2048；0 = 不縮）
---strokes on|off       等寬線條重建為真筆畫（預設 on）
---gradients on|off     色帶漸層重建為 linearGradient（預設 on）
---geometry LEVEL       conservative | normal | off（預設 conservative）
---debug                失敗時顯示完整 traceback
-```
-
-只有全部檔案成功，exit code 才是 0。
-
-## 品質預期（誠實聲明）
-
-- 平面少色 logo／徽章的 `source match` 通常落在 95%–99%；引用分數時務必標明
-  參照（原圖 vs 壓色版）與解析度。
-- **`foreground` 是墨水 ROI 指標**：白底不會稀釋分數；含雙向 1px 容忍，細線相位
-  偏移不歸零，但線條真的消失仍會歸零。含白色設計元素、透明邊界的圖，透明底
-  alpha ROI 會偏低（那是邊緣敏感的度量假象，不代表漏畫），對外請勿單取最漂亮的數字。
-- **可編輯性是三條分開的軸**：`automation_readiness`（常用操作的自動化準備度）、
-  `redraw_complexity`（自由手局部修形負擔）、`workflow_friction`（導航／選取摩擦）。
-  結構把手 5/5 **不等於**真人任務 5/5。
-- **「省工 80%」目前沒有真人證據**：Stage 1 盲測只驗證視覺品質與接手意願；
-  真正的省工率必須由設計師在 Illustrator／Figma／Inkscape 實際編輯並計時（Stage 2）。
-  本工具不宣稱「一鍵轉換任意圖片達 80% 以上」。
-
-## 尚未完成（不應被誤報的能力）
-
-- soft-alpha 真保留（複雜半透明／模糊／陰影仍近似）
-- 完整 junction graph（一般 T/X/Y、相接同色物件仍非完整拓撲重建）
-- 文字復原（無法可靠取回原字型與可編輯文字；目前是輪廓）
-- 通用 primitive fitting（circle 支持強；任意 ellipse／圓角 rect／規則多邊形尚未全面）
-- 真正原始設計語意的 Scene Graph（群組是可證明安全的幾何群組，非設計師原意）
-- 逐元件重跑（工作台仍是逐圖重跑，有版本歷史但無 A/B 編輯分支）
-- 跨編輯器 round-trip 尚未真人驗證
-
-## 開發與測試
-
-```powershell
-python -m pip install -r requirements.txt -r requirements-preview.txt
-python -m unittest discover -s tests -v
-python preflight_check.py
-```
-
-測試 fixtures 全部由 `tests/generate_fixtures.py` 在測試中即時生成，倉庫**不含任何
-二進位圖片**。CI 於 Ubuntu 與 Windows 上執行（見 `.github/workflows/ci.yml`）。
-
-## 不要提交什麼
-
-- 私人、客戶所有、含商標或授權不明的圖片，以及由其產出的 SVG。
-- `input/`、`output/`、`tests/fixtures/` 的實際內容（.gitignore 已擋）。
-- API 金鑰或任何憑證（本工具完全離線，不需要金鑰）。
-
-## 作者、引用、授權
-
-由 張進逸（Shinichi Chang）開發與維護。引用格式：
-
-```text
-AI Vector Cleanroom by 張進逸 (Shinichi Chang)
-```
-
-學術引用見 `CITATION.cff`。授權 MIT，見 `LICENSE`。
-依賴授權：vtracer（MIT）、Pillow（MIT-CMU）、NumPy（BSD 系）；選用預覽依賴列於
-`requirements-preview.txt`，二次散布前請自行確認授權。
-
----
-
-# English
-
-[繁體中文](#ai-vector-cleanroom) | English
-
-A cleanup tool that turns flat bitmap logos (including AI-generated ones)
-into editable SVG drafts.
-
-> Status: v0.5.0-alpha, technical preview.
-> Works well on flat, limited-palette logos and icons; everything else still
-> needs human review and touch-up.
-> The "80% time saving" claim is **not** yet backed by real designer editing
-> timings (see the honesty note below).
-
-Created and maintained by Shinichi Chang (張進逸).
-
-## What problem does this solve
-
-AI-generated logos ship as PNGs. Designers who receive them often have to
-redraw the whole mark: dirty colors, circles that are not round, dots that
-are not aligned, line work that is really a pile of filled outline anchors,
-and every shape fused into one layer.
-
-This is **not** lossless vectorization — bitmaps contain no original Bezier
-curves, fonts, or layers. What the tool does is move the starting point of
-the redraw from zero to a high-quality draft, gate every stage with an
-external pixel-exact renderer, and clearly flag or fail low-quality results
-instead of dressing them up as finished.
-
-## What changed since v0.1
-
-v0.1 was a "flatten colors + trace + snap circles + group by layer" draft
-tool; v0.3 turns that into structured vector a designer can actually take
-over and edit; v0.5 adds light-color fidelity, negative-space guardrails, and
-conservative re-trace of completely-missing components. Per-version detail is
-in `CHANGELOG.md`.
-
-| Capability | v0.1 | v0.5 |
-|---|---|---|
-| Line work | high-node filled outlines, hard to edit | real `stroke`s with adjustable width and caps |
-| Circles & geometry | circle/rivet regularization, still paths | native `<circle>` / `<line>` / `<polyline>`; rings become stroked circles |
-| Gradients | flattened to solid bands | real `<linearGradient>` |
-| Opacity | none | `fill-opacity` / `stroke-opacity` |
-| Large paths | one blob, hard to select | safely split into selectable parts + stable IDs + scene groups |
-| Recolor | none | offline global recolor page (OKLCH) |
-| Quality scores | flat + source | plus foreground ink-ROI, candidate fallback, hard-fail below 60%, three-axis editability audit |
-| UI | static overlay page | drag-drop workbench (zoom/object list/hotspots/per-image re-run) + blind test + Stage 2 timing |
-| Correctness | basic | every post-process stage pixel-exact validated, with rollback and atomic writes |
-| Light-color detail | easily masked by an overall high score | conservative overlay + a dedicated light-core fidelity gate (white text/highlights no longer buried) |
-| Frame / counter holes | could be filled in | negative-space guardrails on ring/box frames (rolled back if a hole fills); grouped-glyph counters kept transparent |
-| Appearance gate | single foreground score | multi-metric (foreground / color / local-detail P10 / topology / light-core coverage) |
-| Missing components | not detected | component topology schema + conservative local re-trace of completely-missing components (separately rendered, zero out-of-bbox change, rolled back if unsafe) |
-| Tests | 1 test file | 222 tests |
-
-## Pipeline
-
-1. **Background removal + palette detection** (weighted k-means++, AA-blend
-   pruning, flatten gradient noise into clean colors).
-2. **Monoline stroke reconstruction**: uniform-width line work becomes real
-   strokes (center-line path + `stroke-width`, round caps/joins) instead of
-   high-node filled outlines; thin AA lines keep their true color.
-3. **Gradient reconstruction**: banded ramps become real `<linearGradient>`.
-4. **Native geometry**: perfect circles → `<circle>`; concentric rings → one
-   stroked dashed circle; eligible straight runs → `<line>` / `<polyline>`.
-5. **Safe compound-path splitting**: large paths split into independently
-   selectable parts only when topology (holes/islands, non-overlap) is
-   provably safe; a cubic is rewritten to a line only when its control points
-   are provably collinear via exact rationals.
-6. **Scene Graph post-process**: cross-color parts become real `<g>` groups
-   only when stack order and pixels are unchanged; unsafe candidates stay
-   manifest-only. Every visible element gets a stable ID.
-7. **Quality gate + candidate fallback**: low-scoring results compare
-   strokes/gradients/geometry-off candidates and keep the best; below 60%
-   they FAIL. Appearance and editability are scored separately.
-
-Every post-process stage has an independent rollback and an external
-**pixel-exact** render validator (compound / scene-graph / native lines roll
-back on any render difference; only the approximate annulus stage passes a
-bidirectional-1px gate).
-
-## Implemented features
-
-Real strokes, native `<circle>`/`<line>`/`<polyline>`, real
-`<linearGradient>`, opacity; stack-order layers with unique stable IDs and
-provably-safe cross-color groups; offline **recolor page** (paint-role
-global recolor, OKLCH-preserving); **review workbench** (100–1600% zoom,
-object list, hotspots); **local workbench** (drag-drop, per-image re-run with
-up to 8 history versions, Stage 1 blind test, Stage 2 editing-time page,
-bound to 127.0.0.1 with a session token); three-score self-check
-(`flat`/`source`/`foreground` ink ROI) plus a three-axis editability audit;
-batch-safe naming, exit-code-1 on failure, atomic writes.
-
-## Good fit / poor fit
-
-Good: AI-generated / flat logos, badges, icons, labels; limited palettes
-(~2–8 colors) with clear boundaries; circular badge elements (rings, rivets,
-concentric borders, halftone dots, speed lines).
-
-Poor (expect low scores, reference only): photos, realistic illustrations,
-complex soft shadows/glows, hairline texture, anything needing font/text
-recovery, intentionally irregular hand-drawn styles (use `--geometry off`).
-
-## Usage
-
-Python 3.10+.
-
-```powershell
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-preview.txt   # optional: previews + pixel self-check
-python vector_cleanroom.py                          # or double-click clean.bat
-python workbench.py                                 # or workbench.bat — drag-drop UI
-```
-
-Results land in `output/result_<name>/`: `_vector.svg`, `_preview.png`,
-`source_reference.png`, `review.html`, `色彩調整.html` (recolor), `report.json`,
-`OUTPUT_README.txt`, plus a zip.
-
-Options: `--input --output --colors --background {auto,keep,transparent}
---white-threshold --max-size --strokes {on,off} --gradients {on,off}
---geometry {conservative,normal,off} --debug`. Exit code is 0 only when every
-file succeeded.
-
-## Quality expectations (honest)
-
-- Flat, limited-palette logos score 95–99% `source match`; always state the
-  reference (source vs flattened) and the resolution when quoting a number.
-- `foreground` is an **ink-ROI** score: an opaque background cannot dilute it;
-  bidirectional 1 px tolerance keeps thin-stroke phase shifts from zeroing it,
-  but a missing stroke still counts. Images with white design elements /
-  transparent edges score lower on the transparent-alpha ROI — that is an
-  edge-sensitive measurement artifact, not missing artwork; do not cherry-pick
-  the prettiest number.
-- Editability is **three separate axes** (`automation_readiness`,
-  `redraw_complexity`, `workflow_friction`). A 5/5 structural handle count is
-  **not** a 5/5 human task result.
-- **The "80% time saving" claim has no human evidence yet.** Stage 1 blind
-  testing only measures visual quality and willingness to take over; the real
-  saving must be measured by designers actually editing in
-  Illustrator/Figma/Inkscape and timing it (Stage 2). No claim of "one-click
-  80%+ on arbitrary images."
-
-## Not done yet (must not be over-reported)
-
-soft-alpha preservation, full T/X/Y junction graph, text/font recovery,
-general ellipse/rounded-rect/polygon primitives, true original-design scene
-semantics, per-element re-run, and cross-editor round-trip validation with
-real designers.
-
-## Development
-
-```powershell
-python -m pip install -r requirements.txt -r requirements-preview.txt
-python -m unittest discover -s tests -v
-python preflight_check.py
-```
-
-Test fixtures are generated on the fly by `tests/generate_fixtures.py`; the
-repository contains **no binary image assets**. CI runs on Ubuntu and Windows.
-
-## Author, citation, license
-
-Created and maintained by Shinichi Chang (張進逸). See `CITATION.cff`. MIT
-licensed (`LICENSE`). Dependency licenses: vtracer (MIT), Pillow (MIT-CMU),
-NumPy (BSD family); optional preview deps in `requirements-preview.txt`.
+把 PNG、JPG、WebP、BMP 整理成**設計師可以接手的 SVG 底稿**。能用的部分先留下，難修的部分保留參考，讓設計師決定修改或重畫。
+
+**目前版本：`v3-designer-preview.4`，Windows 原始碼預發布版。** 目標是減少設計師後續整理時間；目前尚無設計師對照計時，也尚未完成 Adobe Illustrator 實機匯入與完稿驗收。它不能保證一鍵完稿，沒有省工百分比承諾。
+
+由 **張進逸（Shinichi Chang）** 開發與維護。MIT 授權。
+
+## 第一次使用
+
+1. 安裝 **Windows x64 的 CPython 3.12 x64**，包含 Python Launcher，確認 `py -3.12` 可執行。
+2. 從 [Releases](https://github.com/NewYAWARA/ai-vector-cleanroom/releases) 下載此預發布版的完整原始碼並解壓縮。
+3. 雙擊 `setup_windows.bat`，第一次安裝需連網下載鎖定版本的依賴。
+4. 雙擊 **`工作台.bat`**，把圖片拖進本機瀏覽器頁面。
+5. 轉檔完成後，按 **「設計師接手」→「匯出 Illustrator 接手包」**，解壓後先開 `working.svg`。
+
+可視需要先按「自動整理整張圖」，也可以直接匯出。**不用先逐一按過所有物件的「採用」。** 複雜圖片可能需要數分鐘以上，工作台提供進度與取消；執行期間請保留啟動視窗。
+
+工作台只監聽本機 `127.0.0.1`，通常使用 8765 埠，以啟動視窗顯示網址為準。轉檔不需要 API 金鑰，也不會把圖片上傳至外部服務。
+
+## 從舊公開版改進了什麼
+
+相較於 `v0.5.0-alpha`，這次更新把重點放在「轉完之後怎麼接手」。既有的筆畫、規則形狀、漸層、分組與換色功能持續保留；它們並非本次才新增，也不保證每張圖都能恢復成這些結構。
+
+| 改進 | 對接手工作的用途 |
+|---|---|
+| 可用原圖證據重建部分輪廓、檢查假孔與白縫 | 減少把像素階梯和中間描圖錯誤當作原設計保留下來的情況 |
+| 整張整理與受限的局部減點 | 能通過檢查的部分先整理；保留未能改善的部分，另存版本供比較 |
+| 原圖與向量左右比對、物件選取與放大 | 直接找到需要處理的位置，不只看整張圖的平均分數 |
+| Preview 4 的逐物件差異提示 | 根據真正可見的部分提醒色彩、覆蓋範圍與明暗差異，移除重複通用提醒 |
+| 採用／待確認／交人工與接手包 | 可以帶著完整候選去編輯，也可以只留下已採用部分再補畫 |
+| 保存、重跑與版本衝突保護 | 減少覆寫已確認成果或把過期判斷套到新圖的風險 |
+
+提示只是待查線索，**不是必修清單**；沒有提示也不代表通過人工驗收。比對缺少原圖、超出計算上限或失敗時會明示。這次更新不宣稱所有圖片、所有區域都比舊版更好。
+
+詳細改版說明見 [本次發布說明](release/RELEASE_NOTES.md)，歷史紀錄見 [CHANGELOG.md](CHANGELOG.md)。
+
+## 接手包應該開哪個檔案
+
+| 檔案 | 用途 |
+|---|---|
+| **`working.svg`** | 先開這個。保留完整候選向量，另含預設隱藏的嵌入點陣參考。**它不是純向量完稿。** |
+| `accepted.svg` | 只保留你手動標記採用的物件。全部物件初始都是待確認，所以第一次未作判斷時，這個檔案會是空白。 |
+| `draft.svg` | 已採用部分加描圖參考、隱藏候選與提示框，適合補畫；同樣不是純向量完稿。 |
+| `handoff.json` 等 JSON | 待處理清單、物件資料與這次的判斷紀錄。 |
+| `OPEN_IN_ILLUSTRATOR.txt` | 接手與檢查步驟。 |
+
+在 Illustrator 需要描圖時，再顯示並鎖定參考圖。完成後移除參考圖、提示框與不需要的隱藏候選，檢查孔洞、透明度、漸層和遮擋，再另存 `.ai`。本工具不直接產生 `.ai`，也不會自動恢復原字型或可編輯文字。
+
+## 適用範圍與目前限制
+
+**較適合試用：** 少色、平面、邊界清楚的 icon、標籤、徽章與圖形；尤其是能接受局部人工接手的工作。
+
+**需要更多人工處理：** 低解析度文字、細光芒、漸淡尖端、複雜漸層、互相貼合或遮擋的多色圖形。仍可能出現多餘色塊、色帶、細縫、錯色或不理想的節點。原生筆畫重建不一定成功，失敗時可能保留填色輪廓。
+
+照片、寫實插畫、毛髮、紋理、複雜陰影與模糊效果，不是這版主要目標。圖形分組也不等於恢復原作者的圖層或設計意圖。
+
+更少節點、更接近原圖，以及程式檢查通過，都不等於比較好改。**是否真的省工，要看設計師完成相同任務所花的時間。**
+
+## 舊版使用者更新
+
+請把新版解壓到新目錄，執行新版的 setup，不要覆蓋還在使用的舊版環境。這版採獨立環境與資料目錄，不自動搬移舊版資料。
+
+| 項目 | 預設位置 |
+|---|---|
+| 專用 Python 環境 | `%LOCALAPPDATA%\AI-Vector-Cleanroom\venvs\v3-designer-preview.4` |
+| 圖片與轉檔結果 | `%LOCALAPPDATA%\AIVC\designer4` 下的 `input`、`output` |
+
+需要重新處理時，可將原始圖片拖進新版；舊結果與已匯出的接手包會留在原處。此版本是 source-only 發行，不內嵌 Python，也不是可直接 `pip install ai-vector-cleanroom` 的套件。其他作業系統未列入此預覽版的使用驗證範圍。
+
+自訂資料位置、批次轉檔、鍵盤操作及整理限制，見 [完整使用指南](docs/USER_GUIDE.md)。
+
+## 歡迎提供真實工作反饋
+
+請到 [Issues 回報](https://github.com/NewYAWARA/ai-vector-cleanroom/issues/new/choose)。比起只給整體分數，以下資訊更能決定下一步要改什麼：
+
+- 哪些部分直接留下、修改後留下、最後仍然重畫？
+- 最花時間的是找物件、修形、換色，還是整理碎片？
+- 若有比較，完成相同品質的任務，工具接手與原本方法各花多久？
+- 使用的版本、Windows 與 Illustrator 版本、重現步驟，以及可分享的截圖或小型合成反例。
+
+請勿上傳客戶圖、私人圖片或未取得分享授權的作品；可以改用自己製作的最小反例。
+
+## 開發、授權與驗證
+
+先完成 setup，再執行 `tests\run_tests.bat`。測試說明與可自行產生的合成基準見 [tests/README.md](tests/README.md)，貢獻方式見 [CONTRIBUTING.md](CONTRIBUTING.md)。程式與渲染測試不能替代 Illustrator 實機檢查或設計師計時。
+
+MIT 授權見 [LICENSE](LICENSE)，依賴聲明見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，作者與引用見 [AUTHORS.md](AUTHORS.md) 與 [CITATION.cff](CITATION.cff)。
+
+## English
+
+AI Vector Cleanroom turns flat bitmap graphics into editable SVG drafts for designer handoff. Created and maintained by **Shinichi Chang (張進逸)**. MIT licensed.
+
+`v3-designer-preview.4` is a **Windows source-only pre-release**, targeting CPython 3.12 x64. Run `setup_windows.bat`, then `工作台.bat`. Conversion runs locally; dependency installation requires internet access.
+
+The update adds source-aware cleanup, versioned refinement, object-level comparison and a handoff package. Open **`working.svg`** first: it includes the complete vector candidate and a hidden raster reference, so it is not vector-only final artwork. `accepted.svg` is initially empty until you explicitly accept objects.
+
+Output still needs human review. Font recovery, complex soft effects and reliable reconstruction of every thin detail are unsupported. No designer time-saving percentage or Illustrator import/finishing validation has been established. Please [report what you kept, edited or redrew](https://github.com/NewYAWARA/ai-vector-cleanroom/issues/new/choose), using assets you are allowed to share.
